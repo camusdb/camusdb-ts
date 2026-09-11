@@ -5,7 +5,15 @@ Every notable change to this package is written here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the version
 numbers follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.1.0] — Unreleased
+## [Unreleased]
+
+### Changed
+
+- The minimum Node.js version is now 20.19, or 22.12 on the 22 line. Version 0.1.0 accepted
+  20.11. The test toolchain sets this floor: Vitest 4 builds with Vite 8, which does not run
+  below it.
+
+## [0.1.0] — 2026-09-11
 
 The first release. It is a full port of the CamusDB .NET connector, with the same wire protocols
 and the same server contracts, written as an idiomatic TypeScript API.

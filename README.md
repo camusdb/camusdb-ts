@@ -12,8 +12,8 @@ The gRPC transport needs two more packages. Install them only if you use it:
 npm install @grpc/grpc-js @grpc/proto-loader
 ```
 
-**Requirements**: Node.js 20.11 or later. The package ships as ECMAScript modules with TypeScript
-declarations.
+**Requirements**: Node.js 20.19 or later, or 22.12 or later. The package ships as ECMAScript
+modules with TypeScript declarations.
 
 ---
 

@@ -1,0 +1,566 @@
+syntax = "proto3";
+
+option csharp_namespace = "CamusDB.Grpc";
+
+// ─── Enums ────────────────────────────────────────────────────────────────────
+
+// Mirrors CamusDB.Core.Catalogs.Models.ColumnType integer values exactly.
+// Do not renumber or reuse values.
+enum ColumnType {
+  COLUMN_TYPE_NULL      = 0;
+  COLUMN_TYPE_ID        = 1;
+  COLUMN_TYPE_INTEGER64 = 2;
+  COLUMN_TYPE_STRING    = 3;
+  COLUMN_TYPE_BOOL      = 4;
+  COLUMN_TYPE_FLOAT64   = 5;
+  COLUMN_TYPE_FLOAT32   = 6;
+  COLUMN_TYPE_BYTES     = 7;
+  COLUMN_TYPE_DATE      = 8;
+  COLUMN_TYPE_DATETIME  = 9;
+  COLUMN_TYPE_ARRAY     = 10;
+  COLUMN_TYPE_UUID      = 11;
+}
+
+enum IsolationLevel {
+  ISOLATION_LEVEL_UNSPECIFIED    = 0;
+  ISOLATION_LEVEL_READ_COMMITTED = 1;
+  ISOLATION_LEVEL_SERIALIZABLE   = 2;
+}
+
+enum TransactionMode {
+  TRANSACTION_MODE_UNSPECIFIED = 0;
+  TRANSACTION_MODE_READ_WRITE  = 1;
+  TRANSACTION_MODE_READ_ONLY   = 2;
+}
+
+// Locking mode: mirrors the opt-in SET TRANSACTION LOCKING / REST "locking" field.
+// Absent (UNSPECIFIED) means use the server default (Pessimistic).
+enum LockingMode {
+  LOCKING_MODE_UNSPECIFIED = 0;
+  LOCKING_MODE_PESSIMISTIC = 1;
+  LOCKING_MODE_OPTIMISTIC  = 2;
+}
+
+// Admission priority: which transaction the server starts first when the node is at its
+// configured concurrency ceiling. Ordering only — never affects isolation, locking or commit.
+//
+// Deliberately offset by one from the server-side enum so zero means UNSPECIFIED. A client built
+// before this field existed necessarily sends 0, and 0 must fall through to the server default
+// (Normal), never to BACKGROUND — otherwise upgrading the server would silently demote every old
+// client's transactions to the bottom of the queue.
+enum TransactionPriority {
+  TRANSACTION_PRIORITY_UNSPECIFIED = 0;
+  TRANSACTION_PRIORITY_BACKGROUND  = 1;
+  TRANSACTION_PRIORITY_LOW         = 2;
+  TRANSACTION_PRIORITY_NORMAL      = 3;
+  TRANSACTION_PRIORITY_HIGH        = 4;
+  TRANSACTION_PRIORITY_CRITICAL    = 5;
+}
+
+enum OrderDirection {
+  ORDER_ASCENDING  = 0;
+  ORDER_DESCENDING = 1;
+}
+
+// Typed NULL placeholder — a single value so the oneof still distinguishes
+// "null was explicitly sent" from "field absent".
+enum NullValue {
+  NULL_VALUE_UNSET = 0;
+}
+
+// ─── Value model ──────────────────────────────────────────────────────────────
+
+// Compact-raw wire encoding for every ColumnType. Date/DateTime as raw int64 ticks;
+// Uuid as 16 big-endian bytes (high-half || low-half); Id in its own field distinct
+// from string_value. An Array still carries its element type so an empty array
+// round-trips its ColumnValue.ArrayElementType.
+message Value {
+  oneof kind {
+    NullValue  null_value     = 1;   // typed NULL
+    string     id_value       = 2;   // ObjectId — 24 lowercase hex chars
+    int64      int64_value    = 3;
+    string     string_value   = 4;
+    bool       bool_value     = 5;
+    double     float64_value  = 6;
+    float      float32_value  = 7;
+    bytes      bytes_value    = 8;
+    int64      date_value     = 9;   // raw DateTime.Ticks, UTC, midnight-truncated
+    int64      datetime_value = 10;  // raw DateTime.Ticks, UTC
+    ArrayValue array_value    = 11;  // nested Values + element type
+    bytes      uuid_value     = 12;  // 16 bytes, big-endian high||low
+  }
+}
+
+// element_type is carried so an empty array still round-trips its element type.
+message ArrayValue {
+  ColumnType     element_type = 1;
+  repeated Value items        = 2;
+}
+
+// ─── Schema / row messages ────────────────────────────────────────────────────
+
+message ColumnSchema {
+  string     name = 1;
+  ColumnType type = 2;
+}
+
+// Ordered output column schema. Emitted once as the first message in every
+// query stream, even for an empty result set.
+message ResultSchema {
+  repeated ColumnSchema columns = 1;
+}
+
+// One positional row — values[i] aligns to ResultSchema.columns[i].
+message ResultRow {
+  repeated Value values = 1;
+}
+
+// Hybrid Logical Clock instant. Mirrors Kommander.Time.HLCTimestamp's (L, C) pair as the
+// response envelope surfaces it — the node dimension N is not part of the cache report.
+message HlcTimestamp {
+  int64  l = 1;
+  uint32 c = 2;
+}
+
+// Cache resolution metadata for a "{cache=name}"-hinted SELECT, mirroring the REST response
+// envelope field-for-field. It is emitted ONLY when the statement entered the cache path, so a
+// client distinguishes "query was not hinted" (message absent) from "hinted and bypassed"
+// (message present with status = "bypass" and a bypass_reason).
+message CacheMetadata {
+  // "hit" | "miss" | "bypass" | "stale-revalidated" | "evicted-before-publish".
+  string status = 1;
+  // Why the cache was bypassed or the entry was not published (e.g. "in-flight-write",
+  // "oversized-result"). Empty when the status carries no bypass reason.
+  string bypass_reason = 2;
+  // Logical cache family name from the hint; always set when this message is emitted.
+  string name = 3;
+  // Instant at which a served entry was computed. Present only on a cache hit.
+  HlcTimestamp cached_at_hlc = 4;
+  // Approximate wall-clock age of a served entry. Present only on a cache hit.
+  optional int64 age_ms = 5;
+}
+
+// Whether routing advice asks the client to remember or to forget a destination.
+enum RoutingDisposition {
+  ROUTING_DISPOSITION_UNSPECIFIED = 0;
+  // Remember the advertised node for future executions of this statement context.
+  ROUTING_DISPOSITION_PREFER      = 1;
+  // Forget any previously learned destination for this statement context.
+  ROUTING_DISPOSITION_CLEAR       = 2;
+}
+
+// How broadly a learned destination may be reused. A client MUST NOT treat an
+// unrecognized value as parameter-independent; it must ignore the advice instead.
+enum RoutingReuseScope {
+  ROUTING_REUSE_SCOPE_UNSPECIFIED = 0;
+  // The destination holds for future executions of this exact statement and binding
+  // context, across different parameter values.
+  ROUTING_REUSE_SCOPE_STATEMENT_PARAMETERS_INDEPENDENT = 1;
+}
+
+// Advisory routing metadata attached to a successful statement response, emitted only when the
+// request negotiated it (SqlRequest.routing_accept_version = 1). It is a performance hint, never
+// an instruction: the operation that carried it already executed normally, and a client that
+// ignores it loses nothing but a network hop. The server emits it only after the statement's
+// normal authorization checks, and it never carries SQL literals, row values, encoded keys,
+// credentials, or a cluster map.
+message RoutingAdvice {
+  // Metadata contract version; today always 1. A client MUST ignore versions it does not know.
+  int32 version = 1;
+  RoutingDisposition disposition = 2;
+  // Opaque node identity to prefer. The client maps it to a CONFIGURED endpoint address; it is
+  // never an address to dial directly, and an identity absent from the client's map is unusable
+  // advice, not an error.
+  string preferred_node_id = 3;
+  RoutingReuseScope reuse_scope = 4;
+  // Opaque change detector over the statement's resolved physical dependencies. It changes when
+  // the dependency set changes (schema change, TRUNCATE, materialized-view refresh, database
+  // recreation). Not sortable, not an authority, not authentication.
+  string dependency_token = 5;
+  // Maximum reuse period, measured by the client with a monotonic clock from receipt. Bounded
+  // further by client policy.
+  int32 max_age_ms = 6;
+  // How the server knows: "placementHint" = this node's local placement belief, not proof of
+  // which node executed the underlying storage operations.
+  string provenance = 7;
+  // Why this disposition: "singleTableHash", "ineligible", "placementUnknown", "cacheAffinity".
+  string reason = 8;
+}
+
+// Streamed query response: exactly one Schema first, then zero or more Rows, then — only for a
+// cache-hinted statement — one trailing CacheMetadata. The cache verdict is known only after the
+// cursor is fully drained, so it can never precede the rows. A request that negotiated routing
+// metadata may additionally receive one trailing RoutingAdvice after the rows (and after any
+// CacheMetadata); a client that did not negotiate never sees it.
+message QueryStreamMessage {
+  oneof payload {
+    ResultSchema  schema         = 1;
+    ResultRow     row            = 2;
+    CacheMetadata cache_metadata = 3;
+    RoutingAdvice routing_advice = 4;
+  }
+}
+
+// ─── Batched execution (duplex) ────────────────────────────────────────────────
+// Pipelines many ExecuteQuery / ExecuteNonQuery statements over ONE bidirectional
+// stream so an EF Core provider avoids a unary round-trip per statement. Every message
+// carries a client-monotonic request_id; responses for different ids interleave and the
+// client demultiplexes by id (mirrors Kahuna's BatchClientKeyValueRequests). Ops sharing
+// a txn_handle are executed in arrival order; autocommit ops run concurrently. Per-op
+// metadata (causal token, error) is carried IN-BAND because gRPC trailers are per-call
+// and one BatchExecute call carries many ops.
+
+enum BatchStatementKind {
+  BATCH_STATEMENT_KIND_UNSPECIFIED = 0;
+  BATCH_STATEMENT_KIND_QUERY       = 1;   // route to ExecuteQuery — streams schema + rows
+  BATCH_STATEMENT_KIND_NON_QUERY   = 2;   // route to ExecuteNonQuery — single reply
+  // Transaction lifecycle folded onto the same stream so a whole unit of work (begin, statements,
+  // commit) rides one duplex call and many concurrent transactions keep the stream busy. START reuses
+  // SqlRequest.database + isolation/mode/locking (sql ignored) and its reply carries the server-minted
+  // handle; COMMIT/ROLLBACK reference SqlRequest.txn_handle.
+  BATCH_STATEMENT_KIND_START       = 3;   // begin a transaction — reply carries the TxnHandle
+  BATCH_STATEMENT_KIND_COMMIT      = 4;   // commit request.txn_handle — reply carries the causal token
+  BATCH_STATEMENT_KIND_ROLLBACK    = 5;   // roll back request.txn_handle
+  // Prepared statements, scoped to THIS stream. PREPARE registers SqlRequest.database +
+  // SqlRequest.sql and replies with an id plus the parameter names in binding order; later QUERY /
+  // NON_QUERY ops execute by that id and send values positionally, so neither the SQL nor the
+  // parameter names travel again. CLOSE frees one id (SqlRequest.statement_id).
+  BATCH_STATEMENT_KIND_PREPARE     = 6;
+  BATCH_STATEMENT_KIND_CLOSE       = 7;
+}
+
+// PREPARE terminator. The client MUST await this reply before sending any op that references the
+// id — exactly the contract START has — so an execution can never race its own registration.
+message PrepareReply {
+  int32 statement_id = 1;
+  // Distinct placeholder names in binding order, verbatim INCLUDING the leading '@':
+  // positional_parameters[i] binds to parameter_names[i] on every execution of this statement.
+  repeated string parameter_names = 2;
+}
+
+// CLOSE terminator. Closing an unknown id succeeds — the requested end state already holds.
+message CloseReply {}
+
+message BatchExecuteRequest {
+  int32              request_id = 1;   // echoed on every response for this op
+  BatchStatementKind kind       = 2;
+  SqlRequest         request    = 3;   // same shape as the unary path
+}
+
+// In-band domain error for one batched op (mirrors the error code/message the unary calls put in
+// gRPC trailers, which are unavailable per-op on a shared call). code is the CADBxxxx string.
+message BatchError {
+  string code    = 1;
+  string message = 2;
+}
+
+// Terminates a QUERY op's result set on the shared stream and carries its trailing metadata.
+message QueryComplete {
+  int64 total          = 1;
+  int64 causal_token_l = 2;
+  int64 causal_token_c = 3;
+  int32 causal_token_n = 4;
+  // Present only for a cache-hinted statement — the batch terminator carries the verdict because
+  // it is known only once the cursor has been drained.
+  CacheMetadata cache_metadata = 5;
+  // Present only when the request negotiated routing metadata (routing_accept_version = 1) and
+  // the statement produced advice. Advisory — see RoutingAdvice.
+  RoutingAdvice routing = 6;
+}
+
+message BatchExecuteResponse {
+  int32 request_id = 1;
+  oneof payload {
+    ResultSchema  schema         = 2;   // QUERY: one, first for this request_id (even if empty)
+    ResultRow     row            = 3;   // QUERY: zero or more
+    QueryComplete query_complete = 4;   // QUERY: terminator
+    NonQueryReply non_query      = 5;   // NON_QUERY: single terminal reply
+    BatchError    error          = 6;   // terminal error for this request_id
+    TxnHandle     start_reply    = 7;   // START: terminator — the server-minted handle
+    CommitReply   commit_reply   = 8;   // COMMIT: terminator — causal token
+    RollbackReply rollback_reply = 9;   // ROLLBACK: terminator
+    PrepareReply  prepare_reply  = 10;  // PREPARE: terminator — id + parameter names
+    CloseReply    close_reply    = 11;  // CLOSE: terminator
+  }
+}
+
+// ─── Transaction handle ───────────────────────────────────────────────────────
+
+// Identifies an open explicit transaction. Mirrors the (TxnIdPT, TxnIdCounter)
+// pair that the HTTP session model uses.
+message TxnHandle {
+  int64  txn_id_pt      = 1;
+  uint32 txn_id_counter = 2;
+  // Optional causal token from the previous operation in this session. The three
+  // components mirror HLCTimestamp (N, L, C) exactly — N is the node-id dimension and
+  // is load-bearing (it participates in HLCTimestamp equality and is the CompareTo
+  // tie-breaker), so it must travel with L/C or the token is a lossy copy.
+  int32  causal_token_n = 5;
+  int64  causal_token_l = 3;
+  int64  causal_token_c = 4;
+}
+
+// ─── Filter / ordering ───────────────────────────────────────────────────────
+
+// op stays a string (mirrors QueryFilter.Op in the engine — "=", ">", "LIKE", …)
+// so the proto surface never drifts from what CommandExecutor accepts.
+message QueryFilter {
+  string column_name = 1;
+  string op          = 2;
+  Value  value       = 3;
+}
+
+message OrderBy {
+  string         column_name = 1;
+  OrderDirection direction   = 2;
+}
+
+// ─── CamusSql service ─────────────────────────────────────────────────────────
+
+// SQL request shared by ExecuteQuery, ExecuteNonQuery, and ExecuteDdl.
+message SqlRequest {
+  string database = 1;
+  string sql      = 2;
+
+  map<string, Value> parameters = 3;
+
+  // Optional explicit transaction to resume. Absent = autocommit.
+  TxnHandle txn_handle = 4;
+
+  // Optional: override isolation, mode, and locking for the autocommit txn begun
+  // by this request. Ignored when txn_handle resumes an existing transaction.
+  IsolationLevel  isolation_level   = 5;
+  TransactionMode transaction_mode  = 6;
+  LockingMode     locking           = 7;
+
+  // Optional causal token from a prior operation in the same session.
+  // (N, L, C) mirror HLCTimestamp — see TxnHandle for why N must travel with L/C.
+  int64 causal_token_l = 8;
+  int64 causal_token_c = 9;
+  int32 causal_token_n = 10;
+
+  // Prepared execution: when > 0, `sql`, `database` and `parameters` MUST be absent — the statement
+  // id already names all three, and sending both is an error rather than a precedence rule.
+  // 0 = classic inline request, unchanged semantics. Valid only on BatchExecute ops (the id is
+  // scoped to a stream); the unary RPCs reject it.
+  int32 statement_id = 11;
+
+  // Ordinal parameter values for a prepared execution; index i binds to parameter_names[i] from the
+  // PREPARE reply. The count must equal the declared parameter count exactly.
+  repeated Value positional_parameters = 12;
+
+  // Optional admission priority for the transaction begun by this request. Ignored when
+  // txn_handle resumes an existing transaction — priority is consumed when the coordinator
+  // session opens, so a resumed transaction has already spent it.
+  TransactionPriority priority = 13;
+
+  // Highest RoutingAdvice version the client accepts on this operation's response. 0 (the value
+  // every pre-routing client necessarily sends) means "do not emit routing metadata", so old
+  // clients keep their exact response shape. Today the only accepted value is 1.
+  int32 routing_accept_version = 14;
+}
+
+message NonQueryReply {
+  int32 affected_rows  = 1;
+  int64 causal_token_l = 2;
+  int64 causal_token_c = 3;
+  int32 causal_token_n = 4;
+
+  // Set when the statement succeeded but the caller should look twice — today, a time-travel copy
+  // that read no rows, which may mean the requested history had already been reclaimed. Empty
+  // otherwise. Carried here because a client cannot see the server's log.
+  string warning = 5;
+
+  // Present only when the request negotiated routing metadata (routing_accept_version = 1) and
+  // the statement produced advice. Advisory — see RoutingAdvice.
+  RoutingAdvice routing = 6;
+}
+
+message DdlReply {
+  int64 causal_token_l = 1;
+  int64 causal_token_c = 2;
+  int32 causal_token_n = 3;
+
+  // Rows written by a DDL statement that also loads data — today only CREATE TABLE ... AS SELECT.
+  // Zero for every other DDL statement, which writes no rows.
+  int32 affected_rows = 4;
+
+  // See NonQueryReply.warning.
+  string warning = 5;
+}
+
+message StartTxnRequest {
+  string              database         = 1;
+  IsolationLevel      isolation_level  = 2;
+  TransactionMode     transaction_mode = 3;
+  LockingMode         locking          = 4;
+  TransactionPriority priority         = 5;
+}
+
+message CommitReply {
+  int64 causal_token_l = 1;
+  int64 causal_token_c = 2;
+  int32 causal_token_n = 3;
+}
+
+message RollbackReply {}
+
+message PingRequest {}
+
+message PingReply {
+  string message = 1;
+}
+
+// SQL-centric service: mirrors /execute-sql-query, /execute-sql-non-query,
+// /execute-sql-ddl, and the transaction lifecycle endpoints.
+service CamusSql {
+  // Server-streaming: first message is the output-column schema (even for an
+  // empty result), followed by one message per row from the cursor.
+  rpc ExecuteQuery      (SqlRequest)       returns (stream QueryStreamMessage);
+  rpc ExecuteNonQuery   (SqlRequest)       returns (NonQueryReply);
+  rpc ExecuteDdl        (SqlRequest)       returns (DdlReply);
+  // Duplex batching of ExecuteQuery / ExecuteNonQuery over one stream. Responses are correlated by
+  // request_id and interleave/arrive out of order across ops; same-txn ops run in arrival order.
+  rpc BatchExecute      (stream BatchExecuteRequest) returns (stream BatchExecuteResponse);
+  rpc StartTransaction  (StartTxnRequest)  returns (TxnHandle);
+  rpc CommitTransaction (TxnHandle)        returns (CommitReply);
+  rpc RollbackTransaction(TxnHandle)       returns (RollbackReply);
+  rpc Ping              (PingRequest)      returns (PingReply);
+}
+
+// ─── CamusAuth service ────────────────────────────────────────────────────────
+// Credential exchange, mirroring the REST /login and /logout routes. Deliberately a service of its
+// own rather than two more RPCs on CamusSql: these are the ONLY calls that must be reachable without
+// a bearer token (a client has none until Login returns one), so keeping them separate makes the
+// unauthenticated surface explicit instead of hiding an exemption inside the data-plane service.
+
+message LoginRequest {
+  string user     = 1;
+  string password = 2;
+}
+
+message LoginReply {
+  // Opaque bearer token; present it as "Bearer <token>" in the `authorization` call metadata.
+  string token = 1;
+  // Absolute deadline after which the token is rejected — Unix epoch milliseconds, UTC.
+  int64  expires_at_unix_ms = 2;
+  // Whole seconds until that deadline as the SERVER measured it when replying. Redundant with the
+  // absolute value on purpose: a client whose clock disagrees can renew on a monotonic timer.
+  int64  expires_in_seconds = 3;
+}
+
+// The token is taken from the `authorization` metadata, exactly as on every other authenticated call,
+// so it is never duplicated in the message body.
+message LogoutRequest {}
+
+message LogoutReply {}
+
+service CamusAuth {
+  // Exchanges a password for a short-lived bearer token. Refused over a plaintext connection when
+  // authentication requires TLS — a password must never travel in the clear.
+  rpc Login  (LoginRequest)  returns (LoginReply);
+  // Revokes the token presented in the `authorization` metadata. Idempotent.
+  rpc Logout (LogoutRequest) returns (LogoutReply);
+}
+
+// ─── CamusRows service ────────────────────────────────────────────────────────
+
+message InsertRowRequest {
+  string database = 1;
+  string table    = 2;
+
+  map<string, Value> values = 3;
+
+  TxnHandle txn_handle    = 4;
+  int64     causal_token_l = 5;
+  int64     causal_token_c = 6;
+  LockingMode locking      = 7;
+  int32     causal_token_n = 8;
+  TransactionPriority priority = 9;
+}
+
+message RowQueryRequest {
+  string database   = 1;
+  string table      = 2;
+  string index_name = 3;   // optional; empty = primary scan
+
+  repeated QueryFilter filters  = 4;
+  repeated OrderBy     order_by = 5;
+
+  TxnHandle txn_handle    = 6;
+  int64     causal_token_l = 7;
+  int64     causal_token_c = 8;
+  LockingMode locking      = 9;
+  int32     causal_token_n = 10;
+  TransactionPriority priority = 11;
+}
+
+message RowByIdRequest {
+  string database = 1;
+  string table    = 2;
+  string id       = 3;
+
+  TxnHandle txn_handle    = 4;
+  int64     causal_token_l = 5;
+  int64     causal_token_c = 6;
+  LockingMode locking      = 7;
+  int32     causal_token_n = 8;
+  TransactionPriority priority = 9;
+}
+
+message UpdateRowsRequest {
+  string database = 1;
+  string table    = 2;
+
+  map<string, Value>   values  = 3;
+  repeated QueryFilter filters = 4;
+
+  TxnHandle txn_handle    = 5;
+  int64     causal_token_l = 6;
+  int64     causal_token_c = 7;
+  LockingMode locking      = 8;
+  int32     causal_token_n = 9;
+  TransactionPriority priority = 10;
+}
+
+message UpdateByIdRequest {
+  string database = 1;
+  string table    = 2;
+  string id       = 3;
+
+  map<string, Value> values = 4;
+
+  TxnHandle txn_handle    = 5;
+  int64     causal_token_l = 6;
+  int64     causal_token_c = 7;
+  LockingMode locking      = 8;
+  int32     causal_token_n = 9;
+  TransactionPriority priority = 10;
+}
+
+message DeleteRowsRequest {
+  string database = 1;
+  string table    = 2;
+
+  repeated QueryFilter filters = 3;
+
+  TxnHandle txn_handle    = 4;
+  int64     causal_token_l = 5;
+  int64     causal_token_c = 6;
+  LockingMode locking      = 7;
+  int32     causal_token_n = 8;
+  TransactionPriority priority = 9;
+}
+
+// Typed row-level service: mirrors InsertController / QueryController /
+// UpdateController / DeleteController for hot-path CRUD without composing SQL.
+service CamusRows {
+  rpc InsertRow  (InsertRowRequest)  returns (NonQueryReply);
+  // Server-streaming, schema-first — same QueryStreamMessage shape as CamusSql.ExecuteQuery.
+  rpc Query      (RowQueryRequest)   returns (stream QueryStreamMessage);
+  rpc QueryById  (RowByIdRequest)    returns (stream QueryStreamMessage);
+  rpc UpdateRows (UpdateRowsRequest) returns (NonQueryReply);
+  rpc UpdateById (UpdateByIdRequest) returns (NonQueryReply);
+  rpc DeleteRows (DeleteRowsRequest) returns (NonQueryReply);
+  rpc DeleteById (RowByIdRequest)    returns (NonQueryReply);
+}

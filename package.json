@@ -1,0 +1,86 @@
+{
+  "name": "camusdb",
+  "version": "0.1.0",
+  "description": "CamusDB connector for Node.js \u2014 REST and gRPC transports, transactions, prepared statements, learned routing, and online backups.",
+  "license": "MIT",
+  "author": "CamusDB",
+  "homepage": "https://github.com/camusdb/camusdb-ts",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/camusdb/camusdb-ts.git"
+  },
+  "bugs": {
+    "url": "https://github.com/camusdb/camusdb-ts/issues"
+  },
+  "keywords": [
+    "camusdb",
+    "database",
+    "sql",
+    "driver",
+    "connector",
+    "grpc"
+  ],
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "proto",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=20.11.0"
+  },
+  "sideEffects": false,
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "clean": "rm -rf dist coverage",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "lint": "eslint .",
+    "lint:fix": "eslint . --fix",
+    "format": "prettier --write \"{src,test,examples}/**/*.ts\"",
+    "format:check": "prettier --check \"{src,test,examples}/**/*.ts\"",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage",
+    "test:live": "vitest run --config vitest.live.config.ts",
+    "prepublishOnly": "npm run lint && npm run format:check && npm run typecheck && npm test",
+    "prepack": "npm run clean && npm run build"
+  },
+  "peerDependencies": {
+    "@grpc/grpc-js": "^1.12.0",
+    "@grpc/proto-loader": "^0.7.13"
+  },
+  "peerDependenciesMeta": {
+    "@grpc/grpc-js": {
+      "optional": true
+    },
+    "@grpc/proto-loader": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.15.0",
+    "@grpc/grpc-js": "^1.12.2",
+    "@grpc/proto-loader": "^0.7.13",
+    "@types/node": "^22.9.0",
+    "@vitest/coverage-v8": "^2.1.5",
+    "eslint": "^9.15.0",
+    "prettier": "^3.3.3",
+    "typescript": "^5.6.3",
+    "typescript-eslint": "^8.15.0",
+    "vitest": "^2.1.5"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

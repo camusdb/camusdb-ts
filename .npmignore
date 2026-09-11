@@ -1,0 +1,11 @@
+# Everything the package publishes is listed in package.json "files"; this file only guards against
+# a stray addition reaching npm.
+src/
+test/
+examples/
+coverage/
+*.tsbuildinfo
+eslint.config.mjs
+vitest.config.ts
+tsconfig*.json
+.prettierrc.json

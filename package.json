@@ -1,7 +1,7 @@
 {
   "name": "camusdb",
   "version": "0.1.0",
-  "description": "CamusDB connector for Node.js \u2014 REST and gRPC transports, transactions, prepared statements, learned routing, and online backups.",
+  "description": "CamusDB connector for Node.js — REST and gRPC transports, transactions, prepared statements, learned routing, and online backups.",
   "license": "MIT",
   "author": "CamusDB",
   "homepage": "https://github.com/camusdb/camusdb-ts",
@@ -73,12 +73,12 @@
     "@grpc/grpc-js": "^1.12.2",
     "@grpc/proto-loader": "^0.7.13",
     "@types/node": "^22.9.0",
-    "@vitest/coverage-v8": "^2.1.5",
+    "@vitest/coverage-v8": "^4.1.11",
     "eslint": "^9.15.0",
     "prettier": "^3.3.3",
     "typescript": "^5.6.3",
     "typescript-eslint": "^8.15.0",
-    "vitest": "^2.1.5"
+    "vitest": "^4.1.11"
   },
   "publishConfig": {
     "access": "public"

@@ -1,6 +1,6 @@
 {
   "name": "camusdb",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "CamusDB connector for Node.js — REST and gRPC transports, transactions, prepared statements, learned routing, and online backups.",
   "license": "MIT",
   "author": "CamusDB",

@@ -12,6 +12,7 @@ import type { GrpcBatchOptions } from '../../config.js';
 import { CamusProtocol } from '../../config.js';
 import { CamusError } from '../../errors.js';
 import { CamusErrorCode } from '../../error-codes.js';
+import type { CamusEndpointPool } from '../../endpoint-pool.js';
 import type { CamusTransactionOptions } from '../../options.js';
 import { CamusIsolationLevel, CamusLocking, CamusTransactionMode } from '../../options.js';
 import { bindPositional } from '../../prepared/binder.js';
@@ -41,6 +42,7 @@ import { hasTransaction } from '../transport.js';
 import type { BatchCausalToken, BatchStream, PreparedSlotEntry } from './batcher.js';
 import { EMPTY_CAUSAL_TOKEN, GrpcBatcher, PreparedStatementStaleError } from './batcher.js';
 import { buildResultSet, encodeValue, fromWire, toWire } from './codec.js';
+import { indicatesEndpointDown, isEndpointUnreachable } from './endpoint-health.js';
 import type {
   GrpcBatchExecuteRequest,
   GrpcBatchExecuteResponse,
@@ -95,6 +97,12 @@ export class GrpcTransport implements CamusTransport, CamusLoginClient {
 
   private readonly batchOptions: GrpcBatchOptions;
 
+  /**
+   * The deployment's endpoint rotation, so a failure to reach a node sets it aside for every
+   * caller that shares this transport. The REST transport always did this; gRPC did not.
+   */
+  private readonly pool: CamusEndpointPool | undefined;
+
   private readonly channels = new Map<string, ChannelEntry>();
 
   private runtime: GrpcRuntime | undefined;
@@ -103,7 +111,8 @@ export class GrpcTransport implements CamusTransport, CamusLoginClient {
 
   private closed = false;
 
-  constructor(auth: CamusTokenProvider, batchOptions: GrpcBatchOptions) {
+  constructor(pool: CamusEndpointPool | undefined, auth: CamusTokenProvider, batchOptions: GrpcBatchOptions) {
+    this.pool = pool;
     this.auth = auth;
     this.batchOptions = batchOptions;
   }
@@ -518,7 +527,9 @@ export class GrpcTransport implements CamusTransport, CamusLoginClient {
   private async batcherFor(endpoint: string): Promise<GrpcBatcher> {
     const entry = await this.entryFor(endpoint);
 
-    entry.batcher ??= new GrpcBatcher(this.batchOptions, (id) => this.createBatchStream(id, entry.sql));
+    entry.batcher ??= new GrpcBatcher(this.batchOptions, (id) =>
+      this.createBatchStream(id, entry.sql, endpoint),
+    );
 
     return entry.batcher;
   }
@@ -529,7 +540,11 @@ export class GrpcTransport implements CamusTransport, CamusLoginClient {
    * The batcher rebuilds a faulted stream on its own, so the token is read here, at open time,
    * rather than captured once. A stream re-opened after a token refresh carries the new token.
    */
-  private createBatchStream(id: number, client: GrpcServiceClient): BatchStream {
+  private createBatchStream(id: number, client: GrpcServiceClient, endpoint: string): BatchStream {
+    // Captured, because `listen` below is a method on the returned object and `this` is not the
+    // transport inside it.
+    const pool = this.pool;
+
     const method = client.batchExecute as (
       metadata?: GrpcMetadata,
     ) => GrpcDuplexCall<GrpcBatchExecuteRequest, GrpcBatchExecuteResponse>;
@@ -553,8 +568,12 @@ export class GrpcTransport implements CamusTransport, CamusLoginClient {
         };
 
         call.on('data', onMessage);
-        call.on('error', (error: GrpcStatusError) => finish(translateStatus(error)));
-        call.on('end', () => finish(new CamusError(CamusErrorCode.Generic, 'The gRPC batch stream closed.')));
+        call.on('error', (error: GrpcStatusError) => finish(translateGrpcFailure(pool, endpoint, error)));
+        call.on('end', () =>
+          finish(
+            new CamusError(CamusErrorCode.Generic, `Endpoint ${endpoint}: the gRPC batch stream closed.`),
+          ),
+        );
       },
 
       close() {
@@ -603,7 +622,7 @@ export class GrpcTransport implements CamusTransport, CamusLoginClient {
         signal?.removeEventListener('abort', onAbort);
 
         if (error !== null && error !== undefined) {
-          reject(translateStatus(error));
+          reject(this.translate(endpoint, error));
           return;
         }
 
@@ -624,6 +643,14 @@ export class GrpcTransport implements CamusTransport, CamusLoginClient {
         signal.addEventListener('abort', onAbort, { once: true });
       }
     });
+  }
+
+  /**
+   * Translates a gRPC failure on `endpoint`, and sets the endpoint aside first when the failure
+   * says the node stopped answering.
+   */
+  private translate(endpoint: string, error: GrpcStatusError): CamusError {
+    return translateGrpcFailure(this.pool, endpoint, error);
   }
 
   /**
@@ -838,6 +865,52 @@ function channelTarget(runtime: GrpcRuntime, endpoint: string): { address: strin
     address: `${url.hostname}:${port}`,
     credentials: secure ? runtime.credentials.createSsl() : runtime.credentials.createInsecure(),
   };
+}
+
+/**
+ * Turns a gRPC failure on one endpoint into a `CamusError`, and reports what it says about the
+ * endpoint to the pool.
+ *
+ * Two decisions come out of one failure, and they do not have the same answer:
+ *
+ * 1. The pool learns from every shape that says the node stopped answering, a connection that died
+ *    under a call in flight included.
+ * 2. Only the shape that says the request never left the client changes the code the caller sees.
+ *    A call whose outcome is unknown keeps the generic code, so a commit is never written off.
+ *
+ * Exported for the tests, which pin both decisions against a real pool.
+ */
+export function translateGrpcFailure(
+  pool: CamusEndpointPool | undefined,
+  endpoint: string,
+  error: GrpcStatusError,
+): CamusError {
+  // A domain code from the server is the server's own answer. The node is up, and the code stands.
+  const domainCode = readMetadata(error, 'camus-error-code');
+
+  if (domainCode !== undefined && domainCode.length > 0) return translateStatus(error);
+
+  if (pool !== undefined && endpoint.length > 0 && indicatesEndpointDown(error)) {
+    pool.markUnreachable(endpoint);
+  }
+
+  if (isEndpointUnreachable(error)) {
+    const reason = sanitizeErrorText(error.details ?? error.message);
+
+    return new CamusError(
+      CamusErrorCode.EndpointUnreachable,
+      `Endpoint ${endpoint} could not be reached: ${reason}`,
+      { cause: error },
+    );
+  }
+
+  const translated = translateStatus(error);
+
+  // Name the endpoint on the generic transport code too. Neither the code nor the message carried
+  // it before, so a burst of unknown-outcome failures did not say where it went.
+  if (translated.code !== CamusErrorCode.Generic) return translated;
+
+  return new CamusError(translated.code, `Endpoint ${endpoint}: ${translated.message}`, { cause: error });
 }
 
 /**

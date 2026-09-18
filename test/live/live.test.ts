@@ -13,6 +13,8 @@
  *   CAMUS_LIVE_DATABASE       the database to work in, default camusdb_ts_live
  *   CAMUS_LIVE_USER           the user, when the server has authentication on
  *   CAMUS_LIVE_PASSWORD       that user's password
+ *   CAMUS_LIVE_LARGE_VALUES   set to true to run the large-value cases, which need a server with
+ *                             large-value storage: an older server refuses the STORAGE clause
  *
  * Every case creates its own table and drops it afterwards, so the suite leaves nothing behind and
  * two runs never collide.
@@ -23,17 +25,20 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import type { CamusClientOptions } from '../../src/config.js';
 import {
   CamusClient,
+  CamusColumnStorage,
   CamusError,
   CamusObjectId,
   CamusVector,
   camus,
   cacheHint,
   ColumnType,
+  setColumnStorageStatement,
 } from '../../src/index.js';
 
 const REST_ENDPOINT = process.env.CAMUS_LIVE_ENDPOINT ?? 'http://localhost:5095';
 const GRPC_ENDPOINT = process.env.CAMUS_LIVE_GRPC_ENDPOINT ?? 'http://localhost:5096';
 const DATABASE = process.env.CAMUS_LIVE_DATABASE ?? 'camusdb_ts_live';
+const LARGE_VALUES = process.env.CAMUS_LIVE_LARGE_VALUES?.toLowerCase() === 'true';
 
 const CREDENTIALS =
   process.env.CAMUS_LIVE_USER === undefined
@@ -750,6 +755,155 @@ describe('the backup admin API', () => {
       expect(CamusError.is(error) && error.code).toBe('CADB0700');
     }
   });
+});
+
+/** Deterministic bytes that do not compress. */
+function noiseBytes(length: number, seed: number): Uint8Array {
+  const bytes = new Uint8Array(length);
+  let state = seed >>> 0;
+
+  for (let i = 0; i < length; i++) {
+    // xorshift32
+    state ^= state << 13;
+    state ^= state >>> 17;
+    state ^= state << 5;
+    bytes[i] = state & 0xff;
+  }
+
+  return bytes;
+}
+
+describe.runIf(LARGE_VALUES)('large-value storage', () => {
+  for (const [name, options] of [
+    ['REST transport', { protocol: 'rest', endpoint: REST_ENDPOINT }],
+    ['gRPC transport', { protocol: 'grpc', endpoint: GRPC_ENDPOINT }],
+  ] as const) {
+    describe(name, () => {
+      let client: CamusClient;
+      const tables: string[] = [];
+
+      beforeAll(async () => {
+        const provisioner = new CamusClient({
+          endpoint: REST_ENDPOINT,
+          database: DATABASE,
+          timeoutSeconds: 30,
+          ...CREDENTIALS,
+        });
+
+        await provisioner.createDatabase(undefined, { ifNotExists: true });
+        await provisioner.close();
+
+        client = new CamusClient({ database: DATABASE, timeoutSeconds: 120, ...CREDENTIALS, ...options });
+      });
+
+      afterAll(async () => {
+        for (const table of tables) {
+          try {
+            await client.executeDdl(`DROP TABLE ${table}`);
+          } catch {
+            // A case may have dropped it already.
+          }
+        }
+
+        await client.close();
+      });
+
+      async function showCreateTable(table: string): Promise<string> {
+        const result = await client.query<Record<string, unknown>>(`SHOW CREATE TABLE ${table}`);
+        const column = result.columns[1]?.name;
+
+        expect(column).toBeDefined();
+        return String(result.rows[0]?.[column!]);
+      }
+
+      it('round-trips large values through every storage form', async () => {
+        const table = uniqueName('lv');
+
+        await client.executeDdl(
+          `CREATE TABLE ${table} (` +
+            ' id OID PRIMARY KEY NOT NULL,' +
+            ' title STRING,' +
+            ` body STRING STORAGE ${CamusColumnStorage.Extended},` +
+            ` image BYTES STORAGE ${CamusColumnStorage.External},` +
+            ` embedding BYTES(3072) STORAGE ${CamusColumnStorage.Plain},` +
+            ` tags ARRAY(STRING) STORAGE ${CamusColumnStorage.Main})`,
+        );
+        tables.push(table);
+
+        // A compressible body far above the out-of-line threshold, an incompressible image, an
+        // embedding above the threshold that PLAIN keeps inline, and a compressible array.
+        const id = CamusObjectId.generateAsString();
+        const body = 'CamusDB stores large values compressed or out of line. '.repeat(4000);
+        const image = noiseBytes(100_000, 1);
+        const embedding = noiseBytes(3072, 2);
+        const tags = Array.from({ length: 400 }, (_, i) => `tag-${String(i % 7)}-${'a'.repeat(36)}`);
+
+        await client.execute(
+          `INSERT INTO ${table} (id, title, body, image, embedding, tags)
+           VALUES (@id, @title, @body, @image, @embedding, @tags)`,
+          { id: camus.id(id), title: 'first', body, image, embedding, tags },
+        );
+
+        async function expectRow(title: string): Promise<void> {
+          // A narrow read never names a column stored out of line.
+          const narrow = await client.queryOne<{ title: string }>(
+            `SELECT title FROM ${table} WHERE id = @id`,
+            {
+              id: camus.id(id),
+            },
+          );
+
+          expect(narrow?.title).toBe(title);
+
+          const row = await client.queryOne<Record<string, unknown>>(
+            `SELECT title, body, image, embedding, tags FROM ${table} WHERE id = @id`,
+            { id: camus.id(id) },
+          );
+
+          expect(row?.title).toBe(title);
+          expect(row?.body).toBe(body);
+          expect(Buffer.from(row?.image as Uint8Array).equals(image)).toBe(true);
+          expect(Buffer.from(row?.embedding as Uint8Array).equals(embedding)).toBe(true);
+          expect(row?.tags).toEqual(tags);
+        }
+
+        await expectRow('first');
+
+        // An update of a small column carries the out-of-line pointers; the large values must survive.
+        await client.execute(`UPDATE ${table} SET title = @title WHERE id = @id`, {
+          title: 'second',
+          id: camus.id(id),
+        });
+
+        await expectRow('second');
+
+        const created = await showCreateTable(table);
+
+        for (const storage of Object.values(CamusColumnStorage)) {
+          expect(created).toContain(`STORAGE ${storage}`);
+        }
+
+        // SET STORAGE changes future writes only; REWRITE STORAGE converts the stored rows. Neither
+        // may change a value.
+        await client.executeDdl(setColumnStorageStatement(table, 'image', CamusColumnStorage.Plain));
+        expect(await showCreateTable(table)).toContain('`image` BYTES NULL STORAGE PLAIN');
+
+        await client.rewriteStorage(table);
+        await expectRow('second');
+
+        await client.rewriteStorage(table, { inline: true });
+        await expectRow('second');
+      });
+
+      it('refuses a storage strategy on a fixed-width column', async () => {
+        await expect(
+          client.executeDdl(
+            `CREATE TABLE ${uniqueName('lv_bad')} (id OID PRIMARY KEY NOT NULL, year INT64 STORAGE PLAIN)`,
+          ),
+        ).rejects.toMatchObject({ code: 'CADB0414' });
+      });
+    });
+  }
 });
 
 describe('unsupported column types', () => {

@@ -381,6 +381,81 @@ Column names carry no `@` here, because they bind to columns rather than to plac
 `TRUNCATE` commits a replicated schema entry that a rollback cannot undo, so the server refuses it
 inside an explicit transaction. The driver refuses it before the round trip, with `CADB0538`.
 
+### Large values
+
+A server with large-value storage can store a large `string`, `bytes`, or `ARRAY(T)` value
+compressed (LZ4), or under its own key outside the row. The form never changes a query result and
+never changes the wire format, so reads and parameters work as before. It changes the I/O a query
+does and the size of each stored version: a query that does not name a column stored out of line
+never fetches it, and an update of another column does not rewrite it.
+
+Each such column has a storage strategy. The names follow PostgreSQL:
+
+| Strategy | Compresses | Moves out of the row | Use it for |
+| --- | --- | --- | --- |
+| `EXTENDED` (default) | When it pays | At or above `large_value_threshold_bytes` (2048) | Text, JSON, documents |
+| `MAIN` | When it pays | Never | Compressible values that a typical query reads |
+| `EXTERNAL` | Never | At or above the threshold | Images, archives, and other large values that do not compress and that queries often skip |
+| `PLAIN` | Never | Never | Embeddings that a KNN query reads on every row |
+
+Set the strategy in the column definition, and change it later with `SET STORAGE`. The
+`CamusColumnStorage` members are the SQL keywords, so a member goes into DDL as it is:
+
+```ts
+import { CamusColumnStorage, setColumnStorageStatement } from 'camusdb';
+
+await client.executeDdl(
+  `CREATE TABLE docs (
+     id         OID PRIMARY KEY NOT NULL,
+     title      STRING,
+     body       STRING,
+     thumbnail  BYTES STORAGE ${CamusColumnStorage.External},
+     embedding  BYTES(3072) STORAGE ${CamusColumnStorage.Plain}
+   )`,
+);
+
+await client.executeDdl(setColumnStorageStatement('docs', 'thumbnail', CamusColumnStorage.Plain));
+```
+
+`SET STORAGE` changes the form of future writes only, and returns at once. To convert the rows that
+already exist, call `rewriteStorage`. Give a large table a sufficient timeout, because the time is
+proportional to the table:
+
+```ts
+await client.rewriteStorage('docs', { timeoutSeconds: 3600 });
+```
+
+`rewriteStorage('docs', { inline: true })` runs `REWRITE STORAGE INLINE` instead. That stores every
+value inside its row and uncompressed, which is the form a server without large-value storage can
+read. Run it on every such table before you downgrade a server.
+
+The server runs the rewrite in its own bounded transactions, never in a caller's transaction, so the
+method takes none and a rollback cannot undo the batches that committed. The rewrite is idempotent
+and resumable: when a run stops, a second run continues after the last committed batch. It never
+overwrites a user write, but a concurrent write to a row in a committing batch can fail with the
+retryable `CADB0502`.
+
+Keep two costs in mind:
+
+- **Embeddings.** A 768-dimension float32 embedding is 3072 bytes, which is above the default
+  threshold. Under `EXTENDED`, each embedding moves out of its row, and a KNN query pays one more
+  batched fetch per scanned batch. Declare an embedding column that a KNN query scans with
+  `STORAGE PLAIN`.
+- **Mutation budget.** Each out-of-line value is one more key, so an insert or a delete of a row
+  with `k` out-of-line values costs `k` more mutations. A bulk insert of rows with several large
+  columns fits fewer rows in one transaction.
+
+Three codes belong to this feature:
+
+| Code | Name | Meaning |
+| --- | --- | --- |
+| `CADB0414` | `ColumnStorageNotApplicable` | A storage strategy on a column type with no variable-length value. |
+| `CADB0540` | `LargeValueCorrupt` | A stored value failed to decompress, or did not match its checksum. |
+| `CADB0541` | `LargeValueNotResolved` | A server defect: a read path decoded a value it did not fetch. Report it. |
+
+A read without a snapshot that keeps seeing a row change under it fails with the retryable
+`CADB0504`, which `withRetry` and `client.transaction` already retry.
+
 ---
 
 ## Streaming
@@ -638,6 +713,16 @@ When a request fails because an endpoint is unreachable, that endpoint is set as
 and skipped meanwhile. A node that is still down is set aside again by the next request that draws
 it, at a cost of one failed request per period.
 
+Both transports do this. On REST it is a request that never reached the node. On gRPC it is a
+connection that was refused, a name that did not resolve, or a connection that failed under a call.
+
+The code tells you whether the request left the client:
+
+- `CADB0001` — the request was never sent. Run the same work again on another endpoint.
+- `CADB0000` — the connection failed under a call that was already sent. The endpoint is set aside
+  all the same, because the node stopped answering. The outcome of that one call is unknown, so do
+  not replay a commit from `BEGIN`.
+
 When every endpoint is set aside, the one closest to leaving is used anyway. The deployment is
 evidently down, and letting the request fail against the real node reports why, where a synthetic
 "no endpoints" would replace the server's diagnosis with the driver's bookkeeping.
@@ -834,7 +919,8 @@ try {
 ```
 
 Switch on `code`. The message is human text and is not a stable contract. `CADB0000` is the generic
-code the driver uses when the far end supplied none.
+code the driver uses when the far end supplied none. `CADB0001` is the driver's own code for a
+request that never reached a server — see [Endpoint pools](#endpoint-pools).
 
 The codes the driver itself reacts to are named in `CamusErrorCode`; every other code reaches you
 unchanged.

@@ -2,6 +2,8 @@ import { describe, expect, it } from 'vitest';
 
 import { ColumnType } from '../src/column-type.js';
 import { DEFAULT_BATCH_OPTIONS } from '../src/config.js';
+import { CamusEndpointPool } from '../src/endpoint-pool.js';
+import { CamusErrorCode } from '../src/error-codes.js';
 import { CamusError } from '../src/errors.js';
 import { GrpcBatcher, PreparedStatementStaleError } from '../src/transport/grpc/batcher.js';
 import type { BatchStream } from '../src/transport/grpc/batcher.js';
@@ -14,8 +16,11 @@ import {
   fromWire,
   toWire,
 } from '../src/transport/grpc/codec.js';
+import { indicatesEndpointDown, isEndpointUnreachable } from '../src/transport/grpc/endpoint-health.js';
+import { translateGrpcFailure } from '../src/transport/grpc/grpc-transport.js';
 import type { GrpcBatchExecuteRequest, GrpcBatchExecuteResponse } from '../src/transport/grpc/messages.js';
 import { GrpcBatchStatementKind } from '../src/transport/grpc/messages.js';
+import type { GrpcMetadata, GrpcStatusError } from '../src/transport/grpc/proto.js';
 import { loadGrpc, serviceConstructor } from '../src/transport/grpc/proto.js';
 import { dateToTicks } from '../src/values/ticks.js';
 import { uuidToHalves } from '../src/values/uuid.js';
@@ -537,4 +542,127 @@ describe('the proto definitions', () => {
 
     sql.close?.();
   });
+});
+
+/**
+ * Pins the gRPC path's handling of an endpoint that stopped answering — the case behind the
+ * connection-refused storm the .NET driver measured after a leader kill (2026-09-15, runs lk1-lk3).
+ * The REST transport set such an endpoint aside; the gRPC transport translated the failure and drew
+ * the same endpoint again, and learned routing kept preferring it.
+ */
+describe('gRPC endpoint health', () => {
+  /** grpc-js reports `UNAVAILABLE` as status code 14. */
+  const GRPC_UNAVAILABLE = 14;
+
+  /** A failure as grpc-js raises it: a status code, a detail, and no trailers. */
+  function status(code: number, details: string): GrpcStatusError {
+    return Object.assign(new Error(`${String(code)} ${details}`), { code, details });
+  }
+
+  /** The picker had no ready connection, and the socket was refused. The call never left. */
+  const connectionRefused = (): GrpcStatusError =>
+    status(
+      GRPC_UNAVAILABLE,
+      'No connection established. Last error: connect ECONNREFUSED 10.0.0.2:16095. Resolution note: ',
+    );
+
+  /** The name did not resolve. The call never left either. */
+  const nameResolutionFailed = (): GrpcStatusError =>
+    status(GRPC_UNAVAILABLE, 'Name resolution failed for target dns:camus2:16095');
+
+  /** One node reports that a peer did not answer. This node answered, so it is up. */
+  const serverSaidPeerUnavailable = (): GrpcStatusError =>
+    status(GRPC_UNAVAILABLE, 'The remote node did not answer within the inter-node request deadline.');
+
+  /** The connection died under a call that was already sent. The outcome is unknown. */
+  const connectionDropped = (): GrpcStatusError => status(GRPC_UNAVAILABLE, 'Connection dropped');
+
+  /** The same, raised from the write side. */
+  const writeFailed = (): GrpcStatusError =>
+    status(GRPC_UNAVAILABLE, 'Write error: Connection reset by peer');
+
+  it('classifies a failed connection as never sent', () => {
+    expect(isEndpointUnreachable(connectionRefused())).toBe(true);
+    expect(isEndpointUnreachable(nameResolutionFailed())).toBe(true);
+    expect(isEndpointUnreachable(status(GRPC_UNAVAILABLE, 'Subchannel not ready'))).toBe(true);
+  });
+
+  it('refuses to call a lost connection "never sent"', () => {
+    // The node is gone, so the pool must learn it. This call may still have reached the node, so
+    // the caller must never be told the request was never sent: a commit could already be durable.
+    expect(isEndpointUnreachable(connectionDropped())).toBe(false);
+    expect(indicatesEndpointDown(connectionDropped())).toBe(true);
+
+    expect(isEndpointUnreachable(writeFailed())).toBe(false);
+    expect(indicatesEndpointDown(writeFailed())).toBe(true);
+  });
+
+  it('leaves a server that answered alone', () => {
+    expect(isEndpointUnreachable(serverSaidPeerUnavailable())).toBe(false);
+    expect(indicatesEndpointDown(serverSaidPeerUnavailable())).toBe(false);
+    expect(isEndpointUnreachable(status(13, 'boom'))).toBe(false);
+    expect(isEndpointUnreachable(status(4, 'slow'))).toBe(false);
+    expect(indicatesEndpointDown(status(4, 'slow'))).toBe(false);
+  });
+
+  it('quarantines an unreachable endpoint and reports it as never sent', () => {
+    const pool = new CamusEndpointPool('http://a:9005,http://b:9005');
+
+    const error = translateGrpcFailure(pool, 'http://b:9005', connectionRefused());
+
+    expect(error.code).toBe(CamusErrorCode.EndpointUnreachable);
+    expect(error.message).toContain('http://b:9005');
+    expect(pool.isQuarantined('http://b:9005')).toBe(true);
+    expect(pool.isQuarantined('http://a:9005')).toBe(false);
+    expect(pool.next()).toBe('http://a:9005');
+    expect(pool.next()).toBe('http://a:9005');
+  });
+
+  it('quarantines a lost connection but keeps the unknown-outcome code', () => {
+    const pool = new CamusEndpointPool('http://a:9005,http://b:9005');
+
+    const error = translateGrpcFailure(pool, 'http://b:9005', connectionDropped());
+
+    expect(error.code).toBe(CamusErrorCode.Generic);
+    expect(error.message).toContain('http://b:9005');
+    expect(pool.isQuarantined('http://b:9005')).toBe(true);
+  });
+
+  it('leaves the pool alone on a server failure and keeps the generic code', () => {
+    const pool = new CamusEndpointPool('http://a:9005,http://b:9005');
+
+    const error = translateGrpcFailure(pool, 'http://b:9005', serverSaidPeerUnavailable());
+
+    expect(error.code).toBe(CamusErrorCode.Generic);
+    expect(pool.isQuarantined('http://b:9005')).toBe(false);
+  });
+
+  it('still lets a domain code from the trailers win', () => {
+    const pool = new CamusEndpointPool('http://a:9005');
+
+    const withTrailers: GrpcStatusError = Object.assign(
+      status(GRPC_UNAVAILABLE, 'No connection established. Last error: connect ECONNREFUSED'),
+      { metadata: fakeMetadata({ 'camus-error-code': 'CADB0504', 'camus-error-message': 'retry' }) },
+    );
+
+    const error = translateGrpcFailure(pool, 'http://a:9005', withTrailers);
+
+    expect(error.code).toBe('CADB0504');
+    expect(error.message).toBe('retry');
+    expect(pool.isQuarantined('http://a:9005')).toBe(false);
+  });
+
+  it('works without a pool, for a transport that was built without one', () => {
+    const error = translateGrpcFailure(undefined, 'http://a:9005', connectionRefused());
+
+    expect(error.code).toBe(CamusErrorCode.EndpointUnreachable);
+  });
+
+  /** Enough of a grpc-js `Metadata` for the translation to read trailers from it. */
+  function fakeMetadata(values: Record<string, string>): GrpcMetadata {
+    return {
+      set: () => undefined,
+      get: (key: string) => (values[key] === undefined ? [] : [values[key]]),
+    };
+  }
 });

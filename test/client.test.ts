@@ -274,6 +274,29 @@ describe('execute', () => {
 
     expect(server.callCount('execute-sql-ddl')).toBe(0);
   });
+
+  it("rewrites a table's storage through the DDL route, with no transaction", async () => {
+    server.json('execute-sql-ddl', { status: 'ok' });
+
+    const subject = client();
+
+    await subject.rewriteStorage('docs');
+    await subject.rewriteStorage('docs', { inline: true, timeoutSeconds: 3600 });
+
+    const bodies = server.requestsTo('execute-sql-ddl').map((r) => r.body as Record<string, unknown>);
+
+    expect(bodies.map((body) => body.sql)).toEqual([
+      'ALTER TABLE `docs` REWRITE STORAGE',
+      'ALTER TABLE `docs` REWRITE STORAGE INLINE',
+    ]);
+    expect(bodies[0]!.txnIdPT).toBeUndefined();
+  });
+
+  it('refuses a table name that cannot be delimited, before any round trip', async () => {
+    await expect(client().rewriteStorage('do`cs')).rejects.toThrow(TypeError);
+
+    expect(server.callCount('execute-sql-ddl')).toBe(0);
+  });
 });
 
 describe('queryStream', () => {

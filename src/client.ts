@@ -8,6 +8,7 @@
 import { CamusBackupClient } from './backup.js';
 import { evictAllCacheStatement, evictCacheStatement } from './cache.js';
 import type { CamusCacheMetadata } from './cache.js';
+import { rewriteStorageStatement } from './column-storage.js';
 import type { ColumnValue } from './column-value.js';
 import type { CamusClientOptions, CamusProtocol, ResolvedConfig } from './config.js';
 import { describeConfig, resolveConnectionString, resolveOptions } from './config.js';
@@ -726,6 +727,38 @@ export class CamusClient implements AsyncDisposable {
       this.runtime.timeoutSeconds,
       options.signal,
     );
+  }
+
+  // ─── Large values ─────────────────────────────────────────────────────────
+
+  /**
+   * Converts the rows a table already stores to its current large-value storage rules, with
+   * `ALTER TABLE … REWRITE STORAGE`.
+   *
+   * ```ts
+   * await client.rewriteStorage('docs', { timeoutSeconds: 3600 });
+   * ```
+   *
+   * With `inline`, it runs `REWRITE STORAGE INLINE` instead, which stores every value inside its row
+   * and uncompressed. That is the form a server without large-value storage can read. No value
+   * changes, so no query result changes. Only the physical form of each row, and the I/O a query
+   * does, change.
+   *
+   * The server runs the rewrite in its own bounded transactions, never in a caller's transaction, so
+   * this method takes none. A rollback cannot undo the batches that committed. The time is
+   * proportional to the table, so give a large table a sufficient `timeoutSeconds`. The rewrite is
+   * idempotent and resumable: when a run stops, a second run continues after the last committed
+   * batch. It never overwrites a user write, but a concurrent write to a row in a committing batch
+   * can fail with the retryable `CADB0502`.
+   */
+  async rewriteStorage(
+    table: string,
+    options: { inline?: boolean; signal?: AbortSignal; timeoutSeconds?: number } = {},
+  ): Promise<void> {
+    await this.executeDdl(rewriteStorageStatement(table, { inline: options.inline ?? false }), {
+      signal: options.signal,
+      timeoutSeconds: options.timeoutSeconds,
+    });
   }
 
   // ─── Query result cache ───────────────────────────────────────────────────

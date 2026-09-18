@@ -24,6 +24,12 @@ import {
   evictCacheStatement,
   makeCacheMetadata,
 } from '../src/cache.js';
+import {
+  CamusColumnStorage,
+  isColumnStorage,
+  rewriteStorageStatement,
+  setColumnStorageStatement,
+} from '../src/column-storage.js';
 import { delimitIdentifier, sqlLiteral, validateBareName } from '../src/sql-syntax.js';
 
 beforeEach(() => {
@@ -593,6 +599,60 @@ describe('statement classification', () => {
   it('recognizes a statement that owns its transaction', () => {
     expect(runsInOwnTransaction('TRUNCATE robots')).toBe(true);
     expect(runsInOwnTransaction('DELETE FROM robots')).toBe(false);
+  });
+
+  it('routes the storage statements to the DDL route, outside the own-transaction list', () => {
+    // The server runs REWRITE STORAGE in its own batches but does not refuse it inside a
+    // transaction, so the driver must not refuse it either.
+    for (const sql of [
+      'ALTER TABLE docs REWRITE STORAGE',
+      'ALTER TABLE docs ALTER COLUMN body SET STORAGE MAIN',
+    ]) {
+      expect(isDdlStatement(sql)).toBe(true);
+      expect(runsInOwnTransaction(sql)).toBe(false);
+    }
+  });
+});
+
+describe('column storage helpers', () => {
+  it('uses the SQL keywords as member values', () => {
+    expect(Object.values(CamusColumnStorage)).toEqual(['EXTENDED', 'PLAIN', 'MAIN', 'EXTERNAL']);
+  });
+
+  it('recognizes a strategy in its exact spelling only', () => {
+    expect(isColumnStorage('PLAIN')).toBe(true);
+    expect(isColumnStorage('plain')).toBe(false);
+    expect(isColumnStorage('PLAIN, MAIN')).toBe(false);
+    expect(isColumnStorage(1)).toBe(false);
+    expect(isColumnStorage(undefined)).toBe(false);
+  });
+
+  it('builds a SET STORAGE statement', () => {
+    expect(setColumnStorageStatement('docs', 'thumbnail', CamusColumnStorage.External)).toBe(
+      'ALTER TABLE `docs` ALTER COLUMN `thumbnail` SET STORAGE EXTERNAL',
+    );
+  });
+
+  it('refuses a strategy that is not a keyword', () => {
+    expect(() => setColumnStorageStatement('docs', 'body', 'COMPRESSED' as CamusColumnStorage)).toThrow(
+      TypeError,
+    );
+    expect(() =>
+      setColumnStorageStatement('docs', 'body', 'MAIN; DROP TABLE docs' as CamusColumnStorage),
+    ).toThrow(TypeError);
+  });
+
+  it('builds a REWRITE STORAGE statement, with and without INLINE', () => {
+    expect(rewriteStorageStatement('docs')).toBe('ALTER TABLE `docs` REWRITE STORAGE');
+    expect(rewriteStorageStatement('docs', { inline: false })).toBe('ALTER TABLE `docs` REWRITE STORAGE');
+    expect(rewriteStorageStatement('docs', { inline: true })).toBe(
+      'ALTER TABLE `docs` REWRITE STORAGE INLINE',
+    );
+  });
+
+  it('refuses a name that cannot be delimited', () => {
+    expect(() => rewriteStorageStatement('do`cs')).toThrow(TypeError);
+    expect(() => setColumnStorageStatement('docs', ' ', CamusColumnStorage.Plain)).toThrow(TypeError);
   });
 });
 

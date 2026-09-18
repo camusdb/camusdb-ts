@@ -72,6 +72,13 @@ export type { Parameters, ParameterValue } from './values/encode.js';
 export type { DecodeOptions, Int64Mode } from './values/decode.js';
 export { decodeValue } from './values/decode.js';
 
+export {
+  CamusColumnStorage,
+  isColumnStorage,
+  rewriteStorageStatement,
+  setColumnStorageStatement,
+} from './column-storage.js';
+
 export { CamusObjectId } from './object-id.js';
 export { CamusVector } from './vector.js';
 

@@ -7,6 +7,27 @@ numbers follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- Large-value storage. `CamusColumnStorage` names the four column storage strategies as the SQL
+  keywords the server accepts, `setColumnStorageStatement` and `rewriteStorageStatement` compose the
+  two statements, and `client.rewriteStorage` converts the rows a table already stores. A strategy
+  decides the form of future writes only, so it never changes a query result. Three server codes
+  come with the feature: `ColumnStorageNotApplicable` (`CADB0414`), `LargeValueCorrupt`
+  (`CADB0540`), and `LargeValueNotResolved` (`CADB0541`). A server that predates large-value storage
+  refuses the `STORAGE` clause as a parse error, so the live cases for it are opt-in with
+  `CAMUS_LIVE_LARGE_VALUES=true`.
+- `CamusErrorCode.EndpointUnreachable` (`CADB0001`). The driver raises it when a request never
+  reached a server, so the same work is safe to run again on another endpoint.
+
+### Fixed
+
+- The gRPC transport now sets an endpoint aside when it stops answering. Only the REST transport
+  did this before, so a gRPC client kept every statement pointed at a node that was gone, and
+  learned routing kept preferring it. A gRPC failure that never left the client now reports
+  `CADB0001`. A connection that failed under a call that was already sent still reports `CADB0000`,
+  because that call's outcome is unknown, but the endpoint is set aside all the same.
+
 ### Changed
 
 - The minimum Node.js version is now 20.19, or 22.12 on the 22 line. Version 0.1.0 accepted

@@ -70,7 +70,7 @@ export class ClientRuntime {
     this.transport = CamusTransportPool.forKey(transportKey(config, deployment), () => {
       const inner: CamusTransport =
         config.protocol === CamusProtocol.Grpc
-          ? new GrpcTransport(this.auth, config.batch)
+          ? new GrpcTransport(this.pool, this.auth, config.batch)
           : new RestTransport(this.pool, this.auth);
 
       // Wrapped unconditionally. With no credentials configured the wrapper is inert, and wrapping

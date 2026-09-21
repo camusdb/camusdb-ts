@@ -17,6 +17,7 @@ import { CamusErrorCode } from '../error-codes.js';
 import type { CamusHlcTimestamp } from '../hlc.js';
 import { asBigInt, asNumber, parseLossless } from '../json.js';
 import type { CamusTransactionOptions } from '../options.js';
+import { setOwn } from '../own-record.js';
 import { bindPositional } from '../prepared/binder.js';
 import { CamusResultSet } from '../result-set.js';
 import { routingAdviceFromJson } from '../routing/advice.js';
@@ -181,7 +182,9 @@ export class RestTransport implements CamusTransport {
     try {
       body = parseLossless(text);
     } catch (error) {
-      throw new CamusError(CamusErrorCode.Generic, 'Empty result returned', { cause: error });
+      throw new CamusError(CamusErrorCode.Generic, 'The server returned a body that is not valid JSON.', {
+        cause: error,
+      });
     }
 
     if (typeof body !== 'object' || body === null || Array.isArray(body)) {
@@ -649,7 +652,7 @@ function parametersToJson(
 
   const json: Record<string, ColumnValueJson> = {};
 
-  for (const [name, value] of parameters) json[name] = columnValueToJson(value);
+  for (const [name, value] of parameters) setOwn(json, name, columnValueToJson(value));
 
   return json;
 }

@@ -80,6 +80,13 @@ describe('uuid', () => {
   it('refuses the wrong byte count', () => {
     expect(() => bytesToUuid(new Uint8Array(15))).toThrow(TypeError);
     expect(() => uuidToBytes('abc')).toThrow(TypeError);
+    expect(() => uuidToHalves('550e8400-e29b-41d4-a716-4466554400')).toThrow(TypeError);
+  });
+
+  it('refuses a digit that is not hexadecimal', () => {
+    // parseInt reads '0g' as 0, so a per-pair test would put a wrong byte on the wire.
+    expect(() => uuidToBytes('550e8400-e29b-41d4-a716-44665544000g')).toThrow(TypeError);
+    expect(() => uuidToBytes('550e8400-e29b-41d4-a716-4466554400 1')).toThrow(TypeError);
   });
 });
 

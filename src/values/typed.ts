@@ -14,6 +14,8 @@ import { isUuid, uuidToHalves } from './uuid.js';
 
 const TYPED = Symbol.for('camusdb.typedParameter');
 
+const OBJECT_ID = /^[0-9a-fA-F]{24}$/;
+
 /**
  * A parameter whose column type the caller stated, rather than one the driver inferred from the
  * JavaScript value. Build one with a helper from `camus` below and pass it as a parameter value.
@@ -47,6 +49,10 @@ function invalid(message: string): never {
 export const camus = {
   /** An `id` column value: an ObjectId as its 24-character string. */
   id(value: string): TypedParameter {
+    if (!OBJECT_ID.test(value)) {
+      invalid(`'${value}' is not an ObjectId: an ObjectId is 24 hexadecimal digits.`);
+    }
+
     return typed({ type: ColumnType.Id, strValue: value });
   },
 

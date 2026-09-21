@@ -97,6 +97,12 @@ export class CamusTokenProvider {
   /** The single login in flight, if any. Every racing caller awaits this same promise. */
   private inFlight: Promise<string> | undefined;
 
+  /**
+   * Which credential set a login belongs to. `login()` raises it, so a login started with the
+   * credentials that call replaced cannot publish its token over the new ones.
+   */
+  private generation = 0;
+
   /** @internal Test hook: the wall clock this provider reads. */
   clock: () => number = () => Date.now();
 
@@ -150,9 +156,7 @@ export class CamusTokenProvider {
     if (!this.isEnabled) return undefined;
 
     // A caller that arrives during a login awaits that login rather than issuing its own.
-    this.inFlight ??= this.loginOnce(signal).finally(() => {
-      this.inFlight = undefined;
-    });
+    this.inFlight ??= this.startLogin(signal);
 
     return this.inFlight;
   }
@@ -182,12 +186,12 @@ export class CamusTokenProvider {
     this.token = undefined;
     this.renewAfter = 0;
 
-    const pending = this.loginOnce(signal).finally(() => {
-      this.inFlight = undefined;
-    });
+    // A login already in flight carries the credentials this call replaces. The new generation
+    // stops it from publishing its token, and it is no longer the flight a queued caller joins.
+    this.generation++;
+    this.inFlight = undefined;
 
-    this.inFlight = pending;
-    return pending;
+    return this.startLogin(signal);
   }
 
   /**
@@ -214,6 +218,23 @@ export class CamusTokenProvider {
     return this.clock() < this.renewAfter ? this.token : undefined;
   }
 
+  /**
+   * Starts the one login every racing caller joins.
+   *
+   * The finally clause clears `inFlight` only when it still points at this login. A login that
+   * `login()` superseded therefore leaves the newer flight in place, and a caller that arrives
+   * after it settles joins that flight rather than starting a third login against a rate-limited
+   * endpoint.
+   */
+  private startLogin(signal: AbortSignal | undefined): Promise<string> {
+    const pending: Promise<string> = this.loginOnce(signal).finally(() => {
+      if (this.inFlight === pending) this.inFlight = undefined;
+    });
+
+    this.inFlight = pending;
+    return pending;
+  }
+
   private async loginOnce(signal: AbortSignal | undefined): Promise<string> {
     // Re-checked inside the single-flight gate: the caller that queued behind the winner finds the
     // token it minted.
@@ -227,18 +248,28 @@ export class CamusTokenProvider {
       );
     }
 
+    // Both are read before the first await. A `login()` call during the round trip must not change
+    // which identity this flight authenticates as, and it must not let this flight publish a token
+    // over the credentials that call installed.
+    const credentials = this.credentials;
+    const generation = this.generation;
+
     const client = await this.resolveLoginClient();
 
     const minted: CamusLoginResult = await client.login(
       this.resolveEndpoint(),
-      this.credentials.user!,
-      this.credentials.password!,
+      credentials.user!,
+      credentials.password!,
       this.resolveTimeoutSeconds(),
       signal,
     );
 
-    this.token = minted.token;
-    this.renewAfter = this.clock() + this.renewalDelayMs(minted.expiresInMs);
+    // A `login()` call during the round trip replaced the credentials this token was minted with.
+    // The caller that asked for it still receives it; it does not become the cached token.
+    if (generation === this.generation) {
+      this.token = minted.token;
+      this.renewAfter = this.clock() + this.renewalDelayMs(minted.expiresInMs);
+    }
 
     return minted.token;
   }

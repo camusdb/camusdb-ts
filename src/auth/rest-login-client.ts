@@ -46,7 +46,26 @@ export class RestLoginClient implements CamusLoginClient {
 
     if (!response.ok) throw translateErrorBody(response.status, text);
 
-    const body = (text.length > 0 ? parseLossless(text) : null) as LoginResponseBody | null;
+    if (text.length === 0) {
+      // A 200 with nothing in it is a broken reply, not a rejected credential. Reporting it as
+      // `AuthenticationFailed` would make the provider throw away a token the server never
+      // refused.
+      throw new CamusError(CamusErrorCode.Generic, 'The login endpoint returned an empty body.');
+    }
+
+    let body: LoginResponseBody | null;
+
+    try {
+      body = parseLossless(text) as LoginResponseBody | null;
+    } catch (error) {
+      throw new CamusError(
+        CamusErrorCode.Generic,
+        'The login endpoint returned a body that is not valid JSON.',
+        {
+          cause: error,
+        },
+      );
+    }
 
     if (body === null || body.status !== 'ok' || body.token === undefined || body.token.length === 0) {
       throw new CamusError(

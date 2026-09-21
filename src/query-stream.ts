@@ -28,10 +28,10 @@ import { columnTypeName } from './column-type.js';
  *
  * The schema is known before the first row, so `columns` can be read straight away.
  *
- * The streaming path gives up the buffered path's transparent retry of a serializable conflict.
- * Rows can reach this side before the statement's own short transaction commits, so a conflict
- * that surfaces late is raised from the iteration rather than retried. Use `query` — or drive an
- * explicit transaction and retry it yourself — when you need that retry.
+ * A serializable conflict is reported to the caller, not retried. No autocommit statement is
+ * retried by the driver, the buffered `query` path included; only `client.transaction` and
+ * `withRetry` run a unit of work again. Rows can reach this side before the statement's own short
+ * transaction commits, so a late conflict surfaces from the iteration rather than from the call.
  */
 export class CamusQueryStream<T = Record<string, unknown>> implements AsyncIterable<T>, AsyncDisposable {
   private readonly source: CamusRowSource;

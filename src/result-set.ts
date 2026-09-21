@@ -8,6 +8,7 @@
 import { ColumnType, columnTypeName } from './column-type.js';
 import type { ColumnValue } from './column-value.js';
 import { NULL_VALUE } from './column-value.js';
+import { setOwn } from './own-record.js';
 import type { DecodeOptions } from './values/decode.js';
 import { decodeValue } from './values/decode.js';
 
@@ -85,8 +86,10 @@ export class CamusResultSet {
  * Turns positional cells into a plain object, keyed by column name.
  *
  * A duplicate column name — which a join projection can produce — keeps the leftmost column, and
- * the ones after it are reachable at `name_2`, `name_3`, and so on. Silently dropping a column
- * would lose data the query asked for.
+ * the ones after it are reachable at `name_2`, `name_3`, and so on. A deduped key that a real
+ * column already claims is stepped past, so `SELECT id, id_2, id` keys the last column `id_3`
+ * rather than overwriting the genuine `id_2`. Silently dropping a column would lose data the
+ * query asked for.
  */
 export class RowMapper {
   private readonly keys: string[];
@@ -97,14 +100,32 @@ export class RowMapper {
     this.options = options;
     this.keys = new Array<string>(columnNames.length);
 
-    const used = new Map<string, number>();
+    const counts = new Map<string, number>();
+    const taken = new Set<string>(columnNames);
 
     for (let i = 0; i < columnNames.length; i++) {
       const name = columnNames[i] ?? `column_${String(i + 1)}`;
-      const seen = used.get(name) ?? 0;
+      const seen = counts.get(name) ?? 0;
 
-      used.set(name, seen + 1);
-      this.keys[i] = seen === 0 ? name : `${name}_${String(seen + 1)}`;
+      counts.set(name, seen + 1);
+
+      if (seen === 0) {
+        this.keys[i] = name;
+        taken.add(name);
+        continue;
+      }
+
+      let suffix = seen + 1;
+      let candidate = `${name}_${String(suffix)}`;
+
+      while (taken.has(candidate)) {
+        suffix++;
+        candidate = `${name}_${String(suffix)}`;
+      }
+
+      counts.set(name, suffix);
+      taken.add(candidate);
+      this.keys[i] = candidate;
     }
   }
 
@@ -118,7 +139,7 @@ export class RowMapper {
     const row: Record<string, unknown> = {};
 
     for (let i = 0; i < this.keys.length; i++) {
-      row[this.keys[i]!] = decodeValue(cells[i] ?? NULL_VALUE, this.options);
+      setOwn(row, this.keys[i]!, decodeValue(cells[i] ?? NULL_VALUE, this.options));
     }
 
     return row as T;
@@ -133,7 +154,7 @@ export class RowMapper {
       const row: Record<string, unknown> = {};
 
       for (let c = 0; c < columnCount; c++) {
-        row[this.keys[c]!] = decodeValue(resultSet.cell(r, c), this.options);
+        setOwn(row, this.keys[c]!, decodeValue(resultSet.cell(r, c), this.options));
       }
 
       rows[r] = row as T;

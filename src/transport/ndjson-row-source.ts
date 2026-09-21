@@ -115,7 +115,20 @@ export class NdjsonRowSource implements CamusRowSource {
       return undefined;
     }
 
-    const parsed = parseLossless(line);
+    let parsed: unknown;
+
+    try {
+      parsed = parseLossless(line);
+    } catch (error) {
+      // The header's parse is wrapped the same way. A row that escaped unwrapped would break the
+      // `CamusError` contract the caller reads the stream under.
+      await this.close();
+      throw new CamusError(
+        CamusErrorCode.Generic,
+        'The streaming query response holds a line that is not valid JSON.',
+        { cause: error },
+      );
+    }
 
     if (Array.isArray(parsed)) {
       const cells: ColumnValue[] = new Array<ColumnValue>(this.columnTypes.length).fill(NULL_VALUE);
@@ -132,9 +145,17 @@ export class NdjsonRowSource implements CamusRowSource {
     // reported in band.
     this.finished = true;
 
-    if (typeof parsed === 'object' && parsed !== null) {
-      throwIfFailed(parsed as Record<string, unknown>);
+    if (typeof parsed !== 'object' || parsed === null) {
+      // Neither a row nor a trailer. Reading it as the end of the stream would report a truncated
+      // result as a complete one.
+      await this.close();
+      throw new CamusError(
+        CamusErrorCode.Generic,
+        'The streaming query response holds a line that is neither a row nor a trailer.',
+      );
     }
+
+    throwIfFailed(parsed as Record<string, unknown>);
 
     return undefined;
   }

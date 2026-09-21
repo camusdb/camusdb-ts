@@ -118,7 +118,11 @@ export async function sendJson<T>(pool: CamusEndpointPool | undefined, init: Htt
   try {
     return parseLossless(text) as T;
   } catch (error) {
-    throw new CamusError(CamusErrorCode.Generic, 'Empty result returned', { cause: error });
+    // Distinct from the empty body above: something arrived, and it is not JSON. A caller that
+    // sees this is looking at a proxy page or a truncated reply, not at a missing result.
+    throw new CamusError(CamusErrorCode.Generic, 'The server returned a body that is not valid JSON.', {
+      cause: error,
+    });
   }
 }
 

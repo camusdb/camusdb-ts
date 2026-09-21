@@ -108,14 +108,21 @@ describe('resolveConnectionString', () => {
     const config = resolveConnectionString(
       'Endpoint=http://localhost:8082;Database=test;Timeout=30;Protocol=grpc;' +
         'MaxAutoPrepare=8;AutoPrepareMinUsages=1;ChannelPoolSize=4;CoalescingThreshold=20;' +
-        'CoalescingDelay=3;BackupTimeout=60;RoutingMaxHintAge=1500;Int64=bigint',
+        'CoalescingDelay=3;RequestFrames=false;StreamDrainTimeout=1000;BackupTimeout=60;' +
+        'RoutingMaxHintAge=1500;Int64=bigint',
     );
 
     expect(config.timeoutSeconds).toBe(30);
     expect(config.protocol).toBe(CamusProtocol.Grpc);
     expect(config.maxAutoPrepare).toBe(8);
     expect(config.autoPrepareMinUsages).toBe(1);
-    expect(config.batch).toEqual({ channelPoolSize: 4, coalescingThreshold: 20, coalescingDelayMs: 3 });
+    expect(config.batch).toEqual({
+      channelPoolSize: 4,
+      coalescingThreshold: 20,
+      coalescingDelayMs: 3,
+      streamDrainTimeoutMs: 1000,
+      requestFrames: false,
+    });
     expect(config.backupTimeoutSeconds).toBe(60);
     expect(config.routingMaxHintAgeMs).toBe(1500);
     expect(config.decode.int64).toBe('bigint');

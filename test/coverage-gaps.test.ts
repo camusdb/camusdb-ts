@@ -19,12 +19,19 @@ import { FakeCamusServer, respondJson } from './support/fake-server.js';
 
 describe('typed parameter helpers', () => {
   it('states every column type', () => {
-    expect(encodeParameter(camus.id('abc'))).toEqual({ type: ColumnType.Id, strValue: 'abc' });
+    const id = '65f0c4a1b2c3d4e5f60718a9';
+
+    expect(encodeParameter(camus.id(id))).toEqual({ type: ColumnType.Id, strValue: id });
     expect(encodeParameter(camus.int64(9007199254740993n)).longValue).toBe(9007199254740993n);
     expect(encodeParameter(camus.float64(1.5))).toEqual({ type: ColumnType.Float64, floatValue: 1.5 });
     expect(encodeParameter(camus.bool(false))).toEqual({ type: ColumnType.Bool, boolValue: false });
     expect(encodeParameter(camus.string('x'))).toEqual({ type: ColumnType.String, strValue: 'x' });
     expect(encodeParameter(camus.null())).toEqual({ type: ColumnType.Null });
+  });
+
+  it('refuses an id that is not 24 hexadecimal digits', () => {
+    expect(() => camus.id('abc')).toThrow(/ObjectId/);
+    expect(() => camus.id('65f0c4a1b2c3d4e5f60718az')).toThrow(/ObjectId/);
   });
 
   it('states a bytes column from either buffer form', () => {
@@ -151,6 +158,21 @@ describe('RowMapper', () => {
     const mapper = new RowMapper(['a', 'b'], { int64: 'auto' });
 
     expect(mapper.map([{ type: ColumnType.String, strValue: 'x' }])).toEqual({ a: 'x', b: null });
+  });
+
+  it('steps a deduped key past a column that already claims it', () => {
+    const mapper = new RowMapper(['id', 'id_2', 'id'], { int64: 'auto' });
+
+    expect(mapper.columnKeys).toEqual(['id', 'id_2', 'id_3']);
+  });
+
+  it('keeps a column named __proto__ as a property of its own', () => {
+    const mapper = new RowMapper(['__proto__'], { int64: 'auto' });
+    const row = mapper.map<Record<string, unknown>>([{ type: ColumnType.String, strValue: 'x' }]);
+
+    expect(Object.hasOwn(row, '__proto__')).toBe(true);
+    expect(row['__proto__']).toBe('x');
+    expect(Object.getPrototypeOf(row)).toBe(Object.prototype);
   });
 });
 

@@ -1,10 +1,17 @@
 import { describe, expect, it } from 'vitest';
 
 import { ColumnType } from '../src/column-type.js';
+import type { GrpcBatchOptions } from '../src/config.js';
 import { DEFAULT_BATCH_OPTIONS } from '../src/config.js';
 import { CamusEndpointPool } from '../src/endpoint-pool.js';
 import { CamusErrorCode } from '../src/error-codes.js';
 import { CamusError } from '../src/errors.js';
+import {
+  announcesFrames,
+  FRAME_MAX_BYTES,
+  FRAME_MAX_ITEMS,
+  frameCost,
+} from '../src/transport/grpc/batch-frames.js';
 import { GrpcBatcher, PreparedStatementStaleError } from '../src/transport/grpc/batcher.js';
 import type { BatchStream } from '../src/transport/grpc/batcher.js';
 import {
@@ -164,6 +171,9 @@ describe('the value codec', () => {
 class FakeStream implements BatchStream {
   readonly sent: GrpcBatchExecuteRequest[] = [];
 
+  /** Set before the batcher writes to it, to play a server that announced frames. */
+  framesAnnounced = false;
+
   private handlers:
     { onMessage: (response: GrpcBatchExecuteResponse) => void; onClose: (error: Error) => void } | undefined;
 
@@ -197,6 +207,14 @@ class FakeStream implements BatchStream {
   close(): void {
     this.closed = true;
   }
+}
+
+function nonQueryReply(requestId: number, affectedRows = 1): GrpcBatchExecuteResponse {
+  return {
+    requestId,
+    payload: 'nonQuery',
+    nonQuery: { affectedRows, causalTokenL: '0', causalTokenC: '0', causalTokenN: 0, warning: '' },
+  };
 }
 
 describe('GrpcBatcher', () => {
@@ -252,7 +270,7 @@ describe('GrpcBatcher', () => {
 
   it('reports an in-band error for one operation only', async () => {
     const { subject } = batcher((request, stream) => {
-      if (request.request.sql === 'BAD') {
+      if (request.request?.sql === 'BAD') {
         stream.reply({
           requestId: request.requestId,
           payload: 'error',
@@ -665,4 +683,553 @@ describe('gRPC endpoint health', () => {
       get: (key: string) => (values[key] === undefined ? [] : [values[key]]),
     };
   }
+});
+
+/**
+ * Stream frames: one stream message that carries several operations, so the fixed cost of a
+ * message is paid once per frame rather than once per operation. Ported from the .NET client.
+ */
+describe('the batch stream frames', () => {
+  function framed(
+    answer: (request: GrpcBatchExecuteRequest, stream: FakeStream) => void,
+    overrides: Partial<GrpcBatchOptions> = {},
+    announced = true,
+  ): { subject: GrpcBatcher; streams: FakeStream[] } {
+    const streams: FakeStream[] = [];
+
+    const subject = new GrpcBatcher({ ...DEFAULT_BATCH_OPTIONS, channelPoolSize: 1, ...overrides }, (id) => {
+      const stream = new FakeStream(id, answer);
+      stream.framesAnnounced = announced;
+      streams.push(stream);
+      return stream;
+    });
+
+    return { subject, streams };
+  }
+
+  /** Answers every operation, and unpacks a frame exactly as the server does. */
+  function answerAll(request: GrpcBatchExecuteRequest, stream: FakeStream): void {
+    if (request.kind === GrpcBatchStatementKind.Frame) {
+      for (const item of request.items ?? []) answerAll(item, stream);
+      return;
+    }
+
+    stream.reply(nonQueryReply(request.requestId));
+  }
+
+  it('packs the operations that waited together into one frame', async () => {
+    const { subject, streams } = framed(answerAll);
+
+    const results = await Promise.all([
+      subject.enqueueNonQuery({ sql: 'A' }, undefined, undefined),
+      subject.enqueueNonQuery({ sql: 'B' }, undefined, undefined),
+      subject.enqueueNonQuery({ sql: 'C' }, undefined, undefined),
+    ]);
+
+    expect(results.map((result) => result.affectedRows)).toEqual([1, 1, 1]);
+
+    const sent = streams[0]!.sent;
+
+    expect(sent).toHaveLength(1);
+    expect(sent[0]!.kind).toBe(GrpcBatchStatementKind.Frame);
+    expect(sent[0]!.requestId).toBe(0);
+    expect(sent[0]!.request).toBeUndefined();
+    expect(sent[0]!.items?.map((item) => item.request?.sql)).toEqual(['A', 'B', 'C']);
+
+    await subject.dispose();
+  });
+
+  it('sends a lone operation as the plain single message', async () => {
+    const { subject, streams } = framed(answerAll);
+
+    await subject.enqueueNonQuery({ sql: 'A' }, undefined, undefined);
+
+    const sent = streams[0]!.sent;
+
+    expect(sent).toHaveLength(1);
+    expect(sent[0]!.kind).toBe(GrpcBatchStatementKind.NonQuery);
+    expect(sent[0]!.items).toBeUndefined();
+
+    await subject.dispose();
+  });
+
+  it('writes one message per operation to a server that announced nothing', async () => {
+    const { subject, streams } = framed(answerAll, {}, false);
+
+    await Promise.all([
+      subject.enqueueNonQuery({ sql: 'A' }, undefined, undefined),
+      subject.enqueueNonQuery({ sql: 'B' }, undefined, undefined),
+    ]);
+
+    expect(streams[0]!.sent.map((request) => request.kind)).toEqual([
+      GrpcBatchStatementKind.NonQuery,
+      GrpcBatchStatementKind.NonQuery,
+    ]);
+
+    await subject.dispose();
+  });
+
+  it('writes one message per operation when frames are turned off', async () => {
+    const { subject, streams } = framed(answerAll, { requestFrames: false });
+
+    await Promise.all([
+      subject.enqueueNonQuery({ sql: 'A' }, undefined, undefined),
+      subject.enqueueNonQuery({ sql: 'B' }, undefined, undefined),
+    ]);
+
+    expect(streams[0]!.sent).toHaveLength(2);
+    expect(streams[0]!.sent.every((request) => request.kind === GrpcBatchStatementKind.NonQuery)).toBe(true);
+
+    await subject.dispose();
+  });
+
+  it('starts a new frame at the item limit', async () => {
+    const { subject, streams } = framed(answerAll);
+    const count = FRAME_MAX_ITEMS + 10;
+    const pending = [];
+
+    for (let i = 0; i < count; i++) {
+      pending.push(subject.enqueueNonQuery({ sql: `S${i}` }, undefined, undefined));
+    }
+
+    await Promise.all(pending);
+
+    const sent = streams[0]!.sent;
+
+    expect(sent).toHaveLength(2);
+    expect(sent[0]!.items).toHaveLength(FRAME_MAX_ITEMS);
+    expect(sent[1]!.items).toHaveLength(10);
+
+    await subject.dispose();
+  });
+
+  it('starts a new frame at the byte budget', async () => {
+    const { subject, streams } = framed(answerAll);
+    const sql = 'x'.repeat(Math.floor(FRAME_MAX_BYTES / 2.5));
+
+    await Promise.all([
+      subject.enqueueNonQuery({ sql }, undefined, undefined),
+      subject.enqueueNonQuery({ sql }, undefined, undefined),
+      subject.enqueueNonQuery({ sql }, undefined, undefined),
+    ]);
+
+    const sent = streams[0]!.sent;
+
+    expect(sent).toHaveLength(2);
+    expect(sent[0]!.kind).toBe(GrpcBatchStatementKind.Frame);
+    expect(sent[0]!.items).toHaveLength(2);
+
+    // The third is alone in its run, so it travels as the plain single message.
+    expect(sent[1]!.kind).toBe(GrpcBatchStatementKind.NonQuery);
+
+    await subject.dispose();
+  });
+
+  it('sends an operation above the whole budget on its own', async () => {
+    const { subject, streams } = framed(answerAll);
+
+    await Promise.all([
+      subject.enqueueNonQuery({ sql: 'x'.repeat(FRAME_MAX_BYTES * 2) }, undefined, undefined),
+      subject.enqueueNonQuery({ sql: 'small' }, undefined, undefined),
+    ]);
+
+    const sent = streams[0]!.sent;
+
+    expect(sent).toHaveLength(2);
+    expect(sent.every((request) => request.kind === GrpcBatchStatementKind.NonQuery)).toBe(true);
+
+    await subject.dispose();
+  });
+
+  it('follows a response frame, item by item', async () => {
+    const { subject } = framed((request, stream) => {
+      if (request.kind !== GrpcBatchStatementKind.Frame) {
+        stream.reply(nonQueryReply(request.requestId));
+        return;
+      }
+
+      stream.reply({
+        requestId: 0,
+        payload: 'frame',
+        frame: { items: (request.items ?? []).map((item) => nonQueryReply(item.requestId)) },
+      });
+    });
+
+    const results = await Promise.all([
+      subject.enqueueNonQuery({ sql: 'A' }, undefined, undefined),
+      subject.enqueueNonQuery({ sql: 'B' }, undefined, undefined),
+    ]);
+
+    expect(results.map((result) => result.affectedRows)).toEqual([1, 1]);
+
+    await subject.dispose();
+  });
+
+  it('drops a frame inside a frame rather than following it', async () => {
+    const { subject } = framed((request, stream) => {
+      const first = request.kind === GrpcBatchStatementKind.Frame ? request.items![0]! : request;
+
+      // A nested frame that carries its own answer, marked so the two cannot be confused. A client
+      // that followed it would settle the operation with 99; one that drops it leaves the operation
+      // waiting for the plain answer below.
+      stream.reply({
+        requestId: 0,
+        payload: 'frame',
+        frame: {
+          items: [{ requestId: 0, payload: 'frame', frame: { items: [nonQueryReply(first.requestId, 99)] } }],
+        },
+      });
+
+      setTimeout(() => stream.reply(nonQueryReply(first.requestId, 1)), 0);
+    });
+
+    const result = await subject.enqueueNonQuery({ sql: 'A' }, undefined, undefined);
+
+    expect(result.affectedRows).toBe(1);
+
+    await subject.dispose();
+  });
+
+  it('faults every operation of a frame whose write failed', async () => {
+    const { subject } = framed(() => {
+      throw new Error('the stream broke');
+    });
+
+    const first = subject.enqueueNonQuery({ sql: 'A' }, undefined, undefined);
+    const second = subject.enqueueNonQuery({ sql: 'B' }, undefined, undefined);
+
+    await expect(first).rejects.toThrow('the stream broke');
+    await expect(second).rejects.toThrow('the stream broke');
+
+    await subject.dispose();
+  });
+
+  it('leaves out an operation the caller cancelled before it was written', async () => {
+    const { subject, streams } = framed(answerAll);
+    const controller = new AbortController();
+
+    const cancelled = subject.enqueueQuery({ sql: 'A' }, undefined, controller.signal);
+    const kept = subject.enqueueNonQuery({ sql: 'B' }, undefined, undefined);
+
+    controller.abort(new Error('caller stopped'));
+
+    await expect(cancelled).rejects.toThrow('caller stopped');
+    await kept;
+
+    const sent = streams[0]!.sent;
+
+    expect(sent).toHaveLength(1);
+    expect(sent[0]!.kind).toBe(GrpcBatchStatementKind.NonQuery);
+    expect(sent[0]!.request?.sql).toBe('B');
+
+    await subject.dispose();
+  });
+
+  it('writes a rollback the caller no longer waits for', async () => {
+    const { subject, streams } = framed(() => {
+      // Never answers, so only the cancellation settles the operation.
+    });
+
+    const controller = new AbortController();
+    const pending = subject.enqueueRollback({ database: 'db' }, 0, controller.signal);
+
+    controller.abort(new Error('caller stopped'));
+
+    await expect(pending).rejects.toThrow('caller stopped');
+    await Promise.resolve();
+
+    expect(streams[0]!.sent.map((request) => request.kind)).toEqual([GrpcBatchStatementKind.Rollback]);
+
+    await subject.dispose();
+  });
+
+  it('reads an announcement only from a version it writes', () => {
+    expect(announcesFrames('1')).toBe(true);
+    expect(announcesFrames('2')).toBe(true);
+    expect(announcesFrames('0')).toBe(false);
+    expect(announcesFrames('')).toBe(false);
+    expect(announcesFrames('yes')).toBe(false);
+    expect(announcesFrames('1x')).toBe(false);
+    expect(announcesFrames(undefined)).toBe(false);
+  });
+
+  it('estimates a cost above the bytes an operation really carries', () => {
+    const sql = 'SELECT * FROM robots WHERE id = @id';
+
+    const cost = frameCost({
+      requestId: 1,
+      kind: GrpcBatchStatementKind.Query,
+      request: { database: 'test', sql, parameters: { '@id': { kind: 'stringValue', stringValue: 'x' } } },
+    });
+
+    expect(cost).toBeGreaterThan(sql.length);
+    expect(cost).toBeLessThan(FRAME_MAX_BYTES);
+  });
+});
+
+/**
+ * Stream rotation: a stream presents its bearer token once, when it opens, and then outlives it.
+ * When the provider renews the token, the slot opens a fresh stream and retires the old one, which
+ * keeps serving the transactions that began on it. Ported from the .NET client.
+ */
+describe('the batch stream rotation', () => {
+  let handleSeq = 0;
+
+  /** Answers a start, a commit, a rollback, and anything else, and unpacks a frame. */
+  function answerLifecycle(request: GrpcBatchExecuteRequest, stream: FakeStream): void {
+    if (request.kind === GrpcBatchStatementKind.Frame) {
+      for (const item of request.items ?? []) answerLifecycle(item, stream);
+      return;
+    }
+
+    const requestId = request.requestId;
+
+    switch (request.kind) {
+      case GrpcBatchStatementKind.Start:
+        stream.reply({
+          requestId,
+          payload: 'startReply',
+          startReply: {
+            txnIdPt: String(++handleSeq),
+            txnIdCounter: 1,
+            causalTokenN: 0,
+            causalTokenL: '0',
+            causalTokenC: '0',
+          },
+        });
+        return;
+
+      case GrpcBatchStatementKind.Commit:
+        stream.reply({
+          requestId,
+          payload: 'commitReply',
+          commitReply: { causalTokenL: '0', causalTokenC: '0', causalTokenN: 0 },
+        });
+        return;
+
+      case GrpcBatchStatementKind.Rollback:
+        stream.reply({ requestId, payload: 'rollbackReply', rollbackReply: {} });
+        return;
+
+      default:
+        stream.reply(nonQueryReply(requestId));
+    }
+  }
+
+  function rotating(
+    stamp: () => unknown,
+    overrides: Partial<GrpcBatchOptions> = {},
+  ): { subject: GrpcBatcher; streams: FakeStream[] } {
+    const streams: FakeStream[] = [];
+
+    const subject = new GrpcBatcher(
+      { ...DEFAULT_BATCH_OPTIONS, channelPoolSize: 1, ...overrides },
+      (id) => {
+        const stream = new FakeStream(id, answerLifecycle);
+        streams.push(stream);
+        return stream;
+      },
+      stamp,
+    );
+
+    return { subject, streams };
+  }
+
+  it('opens a fresh stream once the credential it opened under was replaced', async () => {
+    let token: string | undefined = 'first';
+    const { subject, streams } = rotating(() => token);
+
+    await subject.enqueueNonQuery({ sql: 'A' }, undefined, undefined);
+    expect(streams).toHaveLength(1);
+
+    token = 'second';
+
+    await subject.enqueueNonQuery({ sql: 'B' }, undefined, undefined);
+
+    expect(streams).toHaveLength(2);
+    expect(streams[0]!.closed).toBe(true);
+    expect(streams[1]!.sent).toHaveLength(1);
+
+    await subject.dispose();
+  });
+
+  it('keeps the stream while the credential is unchanged', async () => {
+    const { subject, streams } = rotating(() => 'first');
+
+    await subject.enqueueNonQuery({ sql: 'A' }, undefined, undefined);
+    await subject.enqueueNonQuery({ sql: 'B' }, undefined, undefined);
+
+    expect(streams).toHaveLength(1);
+    expect(streams[0]!.sent).toHaveLength(2);
+
+    await subject.dispose();
+  });
+
+  it('keeps the stream when no credential is minted yet', async () => {
+    let token: string | undefined = 'first';
+    const { subject, streams } = rotating(() => token);
+
+    await subject.enqueueNonQuery({ sql: 'A' }, undefined, undefined);
+
+    // The token was invalidated and its replacement is not minted yet. That is no reason to trade
+    // a working stream for one opened with no credential at all.
+    token = undefined;
+
+    await subject.enqueueNonQuery({ sql: 'B' }, undefined, undefined);
+
+    expect(streams).toHaveLength(1);
+
+    await subject.dispose();
+  });
+
+  it('never rotates a batcher that was given no credential stamp', async () => {
+    const streams: FakeStream[] = [];
+
+    const subject = new GrpcBatcher({ ...DEFAULT_BATCH_OPTIONS, channelPoolSize: 1 }, (id) => {
+      const stream = new FakeStream(id, answerLifecycle);
+      streams.push(stream);
+      return stream;
+    });
+
+    await subject.enqueueNonQuery({ sql: 'A' }, undefined, undefined);
+    await subject.enqueueNonQuery({ sql: 'B' }, undefined, undefined);
+
+    expect(streams).toHaveLength(1);
+
+    await subject.dispose();
+  });
+
+  it('pins a transaction to the stream it began on, across a rotation', async () => {
+    let token: string | undefined = 'first';
+    const { subject, streams } = rotating(() => token);
+
+    const slot = subject.reserveSlot();
+    const handle = await subject.enqueueStart({ database: 'db' }, slot, undefined);
+
+    token = 'second';
+
+    // An autocommit operation is what notices the new credential and rotates the slot.
+    await subject.enqueueNonQuery({ sql: 'outside' }, slot, undefined);
+
+    expect(streams).toHaveLength(2);
+
+    await subject.enqueueNonQuery({ sql: 'inside', txnHandle: handle }, slot, undefined);
+
+    const onFirst = streams[0]!.sent.map((request) => request.request?.sql);
+    const onSecond = streams[1]!.sent.map((request) => request.request?.sql);
+
+    expect(onFirst).toContain('inside');
+    expect(onSecond).toEqual(['outside']);
+
+    await subject.dispose();
+  });
+
+  it('closes a retired stream once its last transaction ends', async () => {
+    let token: string | undefined = 'first';
+    const { subject, streams } = rotating(() => token);
+
+    const slot = subject.reserveSlot();
+    const handle = await subject.enqueueStart({ database: 'db' }, slot, undefined);
+
+    token = 'second';
+    await subject.enqueueNonQuery({ sql: 'outside' }, slot, undefined);
+
+    // It is retired, and it still carries one open transaction, so it stays open.
+    expect(streams[0]!.closed).toBe(false);
+    expect(subject.isBoundToRetiredStream(BigInt(handle.txnIdPt), handle.txnIdCounter)).toBe(true);
+
+    await subject.enqueueCommit({ database: 'db', txnHandle: handle }, slot, undefined);
+
+    expect(streams[0]!.closed).toBe(true);
+    expect(subject.isBoundToRetiredStream(BigInt(handle.txnIdPt), handle.txnIdCounter)).toBe(false);
+
+    await subject.dispose();
+  });
+
+  it('closes a retired stream at once when nothing rides on it', async () => {
+    let token: string | undefined = 'first';
+    const { subject, streams } = rotating(() => token);
+
+    await subject.enqueueNonQuery({ sql: 'A' }, undefined, undefined);
+
+    token = 'second';
+    await subject.enqueueNonQuery({ sql: 'B' }, undefined, undefined);
+
+    expect(streams[0]!.closed).toBe(true);
+
+    await subject.dispose();
+  });
+
+  it('closes a retired stream whose transaction was abandoned', async () => {
+    let token: string | undefined = 'first';
+    const { subject, streams } = rotating(() => token, { streamDrainTimeoutMs: 10 });
+
+    const slot = subject.reserveSlot();
+    const handle = await subject.enqueueStart({ database: 'db' }, slot, undefined);
+
+    token = 'second';
+    await subject.enqueueNonQuery({ sql: 'outside' }, slot, undefined);
+
+    expect(streams[0]!.closed).toBe(false);
+
+    // Nobody commits it. The drain timeout is what makes the server roll it back and release its
+    // locks, because closing the stream is the only thing that reaches an abandoned transaction.
+    await new Promise((resolve) => setTimeout(resolve, 40));
+
+    expect(streams[0]!.closed).toBe(true);
+    expect(subject.isBoundToRetiredStream(BigInt(handle.txnIdPt), handle.txnIdCounter)).toBe(false);
+
+    await subject.dispose();
+  });
+
+  it('fails an operation that was in flight on a stream the drain timeout closed', async () => {
+    let token: string | undefined = 'first';
+
+    const streams: FakeStream[] = [];
+
+    const subject = new GrpcBatcher(
+      { ...DEFAULT_BATCH_OPTIONS, channelPoolSize: 1, streamDrainTimeoutMs: 10 },
+      (id) => {
+        const stream = new FakeStream(id, (request, target) => {
+          // A start is answered; nothing else ever is.
+          if (request.kind === GrpcBatchStatementKind.Start) answerLifecycle(request, target);
+        });
+
+        streams.push(stream);
+        return stream;
+      },
+      () => token,
+    );
+
+    const slot = subject.reserveSlot();
+    const handle = await subject.enqueueStart({ database: 'db' }, slot, undefined);
+
+    token = 'second';
+
+    // An autocommit operation rotates the slot. It is never answered, and disposal ends it.
+    const outside = subject.enqueueNonQuery({ sql: 'outside' }, slot, undefined);
+    outside.catch(() => undefined);
+
+    await Promise.resolve();
+
+    // This one belongs to the transaction, so it goes to the retired stream and waits there. The
+    // drain timeout closes that stream under it, and a closed stream fails what it still carries.
+    const pending = subject.enqueueNonQuery({ sql: 'inside', txnHandle: handle }, slot, undefined);
+
+    await expect(pending).rejects.toThrow(CamusError);
+
+    await subject.dispose();
+  });
+
+  it('reports a transaction on a live stream as unbound', async () => {
+    const { subject } = rotating(() => 'first');
+
+    const slot = subject.reserveSlot();
+    const handle = await subject.enqueueStart({ database: 'db' }, slot, undefined);
+
+    expect(subject.isBoundToRetiredStream(BigInt(handle.txnIdPt), handle.txnIdCounter)).toBe(false);
+    expect(subject.isBoundToRetiredStream(9999n, 1)).toBe(false);
+
+    await subject.dispose();
+  });
 });

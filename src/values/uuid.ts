@@ -24,7 +24,15 @@ export function isUuid(value: string): boolean {
   return UUID_PATTERN.test(value);
 }
 
-/** The 16 big-endian bytes of a canonical UUID string. */
+const HEX_PAIR = /^[0-9a-fA-F]{32}$/;
+
+/**
+ * The 16 big-endian bytes of a canonical UUID string.
+ *
+ * The whole run of digits is tested before any of it is read. `Number.parseInt` stops at the first
+ * character it cannot read, so `parseInt('1g', 16)` reports 1 rather than `NaN`: a per-pair test
+ * would let a malformed pair put a wrong byte on the wire.
+ */
 export function uuidToBytes(uuid: string): Uint8Array {
   const hex = uuid.replaceAll('-', '');
 
@@ -32,16 +40,14 @@ export function uuidToBytes(uuid: string): Uint8Array {
     throw new TypeError(`'${uuid}' is not a UUID: a UUID has 32 hexadecimal digits.`);
   }
 
+  if (!HEX_PAIR.test(hex)) {
+    throw new TypeError(`'${uuid}' is not a UUID: it holds a character that is not hexadecimal.`);
+  }
+
   const bytes = new Uint8Array(16);
 
   for (let i = 0; i < 16; i++) {
-    const byte = Number.parseInt(hex.slice(i * 2, i * 2 + 2), 16);
-
-    if (Number.isNaN(byte)) {
-      throw new TypeError(`'${uuid}' is not a UUID: it holds a character that is not hexadecimal.`);
-    }
-
-    bytes[i] = byte;
+    bytes[i] = Number.parseInt(hex.slice(i * 2, i * 2 + 2), 16);
   }
 
   return bytes;
@@ -71,6 +77,10 @@ export function uuidToHalves(uuid: string): { high: bigint; low: bigint } {
 
 /** The two big-endian 64-bit halves of 16 bytes. */
 export function bytesToHalves(bytes: Uint8Array): { high: bigint; low: bigint } {
+  if (bytes.length !== 16) {
+    throw new TypeError(`A UUID is 16 bytes; got ${String(bytes.length)}.`);
+  }
+
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   return {
     high: view.getBigInt64(0, false),

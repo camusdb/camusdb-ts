@@ -906,6 +906,175 @@ describe.runIf(LARGE_VALUES)('large-value storage', () => {
   }
 });
 
+/**
+ * Stream frames, end to end. The gRPC transport packs the statements that were issued in one turn
+ * into one stream message, for a server that announces frames. A server that announces none still
+ * answers every case here, one message per statement, so the suite holds against both.
+ */
+describe('gRPC batch stream frames', () => {
+  // The suites above create the database in their own setup, and this block runs on its own when
+  // the cases are filtered by name, so it provisions the database itself.
+  beforeAll(async () => {
+    const provisioner = new CamusClient({
+      endpoint: REST_ENDPOINT,
+      database: DATABASE,
+      timeoutSeconds: 30,
+      ...CREDENTIALS,
+    });
+
+    await provisioner.createDatabase(undefined, { ifNotExists: true });
+    await provisioner.close();
+  });
+
+  function grpcClient(requestFrames: boolean): CamusClient {
+    return new CamusClient({
+      endpoint: GRPC_ENDPOINT,
+      backupEndpoint: REST_ENDPOINT,
+      database: DATABASE,
+      protocol: 'grpc',
+      timeoutSeconds: 30,
+      requestFrames,
+      // One stream, so the warm-up below and the burst that follows it share it. Autocommit work
+      // otherwise rotates over the pool, and half of a burst would open a stream of its own.
+      channelPoolSize: 1,
+      ...CREDENTIALS,
+    });
+  }
+
+  async function withTable(client: CamusClient, body: (table: string) => Promise<void>): Promise<void> {
+    const table = uniqueName('frames');
+
+    await client.executeDdl(
+      `CREATE TABLE ${table} (id OID PRIMARY KEY NOT NULL, n INT64 NOT NULL, name STRING NOT NULL)`,
+    );
+
+    // One statement, awaited, before the burst. The server announces frames in the response headers
+    // of the batch stream, and a client never waits for that announcement, so the first statements
+    // on a fresh stream go out one per message. DDL travels by its own unary call, so this is what
+    // opens the stream and settles the negotiation.
+    await client.scalar<number>(`SELECT COUNT(*) FROM ${table}`);
+
+    try {
+      await body(table);
+    } finally {
+      await client.executeDdl(`DROP TABLE ${table}`);
+    }
+  }
+
+  it('runs every statement of one frame, in order', async () => {
+    const client = grpcClient(true);
+
+    try {
+      await withTable(client, async (table) => {
+        // One turn, so the transport writes them as one frame.
+        await Promise.all(
+          Array.from({ length: 12 }, (_ignored, n) =>
+            client.execute(`INSERT INTO ${table} (id, n, name) VALUES (@id, @n, @name)`, {
+              id: camus.id(CamusObjectId.generateAsString()),
+              n,
+              name: `row-${n}`,
+            }),
+          ),
+        );
+
+        const rows = await client.query<{ n: number }>(`SELECT n FROM ${table} ORDER BY n`);
+
+        expect(rows.rows.map((row) => row.n)).toEqual([...Array(12).keys()]);
+      });
+    } finally {
+      await client.close();
+    }
+  });
+
+  it('fails one statement of a frame without touching its neighbours', async () => {
+    const client = grpcClient(true);
+
+    try {
+      await withTable(client, async (table) => {
+        const good = (n: number): Promise<unknown> =>
+          client.execute(`INSERT INTO ${table} (id, n, name) VALUES (@id, @n, @name)`, {
+            id: camus.id(CamusObjectId.generateAsString()),
+            n,
+            name: `row-${n}`,
+          });
+
+        const results = await Promise.allSettled([
+          good(1),
+          client.execute(`INSERT INTO ${table} (id, n) VALUES (@id, @n)`, {
+            id: camus.id(CamusObjectId.generateAsString()),
+            n: 2,
+          }),
+          good(3),
+        ]);
+
+        expect(results.map((result) => result.status)).toEqual(['fulfilled', 'rejected', 'fulfilled']);
+
+        expect(await client.scalar<number>(`SELECT COUNT(*) FROM ${table}`)).toBe(2);
+      });
+    } finally {
+      await client.close();
+    }
+  });
+
+  it('gives the same answers with frames turned off', async () => {
+    const client = grpcClient(false);
+
+    try {
+      await withTable(client, async (table) => {
+        await Promise.all(
+          Array.from({ length: 6 }, (_ignored, n) =>
+            client.execute(`INSERT INTO ${table} (id, n, name) VALUES (@id, @n, @name)`, {
+              id: camus.id(CamusObjectId.generateAsString()),
+              n,
+              name: `row-${n}`,
+            }),
+          ),
+        );
+
+        expect(await client.scalar<number>(`SELECT COUNT(*) FROM ${table}`)).toBe(6);
+      });
+    } finally {
+      await client.close();
+    }
+  });
+
+  it('keeps the statements of one transaction in their own chain', async () => {
+    const client = grpcClient(true);
+
+    try {
+      await withTable(client, async (table) => {
+        // Autocommit work is issued in the same turn as the transaction's own statements, so the
+        // two kinds meet in one drain. The transaction must still commit as a unit.
+        const outside = client.execute(`INSERT INTO ${table} (id, n, name) VALUES (@id, @n, @name)`, {
+          id: camus.id(CamusObjectId.generateAsString()),
+          n: 100,
+          name: 'outside',
+        });
+
+        const inside = client.transaction(async (txn) => {
+          for (const n of [1, 2, 3]) {
+            await client.execute(
+              `INSERT INTO ${table} (id, n, name) VALUES (@id, @n, @name)`,
+              {
+                id: camus.id(CamusObjectId.generateAsString()),
+                n,
+                name: `inside-${n}`,
+              },
+              { transaction: txn },
+            );
+          }
+        });
+
+        await Promise.all([outside, inside]);
+
+        expect(await client.scalar<number>(`SELECT COUNT(*) FROM ${table}`)).toBe(4);
+      });
+    } finally {
+      await client.close();
+    }
+  });
+});
+
 describe('unsupported column types', () => {
   it('reports the server error rather than sending nonsense', async () => {
     const client = new CamusClient({

@@ -175,9 +175,10 @@ export interface CamusTransport {
    * that decode a whole result before returning, so it buffers and replays through the same
    * interface: correct, and uniform for the caller, but not incremental.
    *
-   * The streaming path gives up the buffered path's transparent retry of a serializable conflict.
-   * Rows can reach the caller before the autocommit transaction commits, so a late conflict is
-   * reported while reading rather than retried.
+   * A serializable conflict is reported to the caller. No transport path retries an autocommit
+   * statement on its own; the buffered path does not either. Rows can reach the caller before the
+   * autocommit transaction commits, so a late conflict is reported while reading rather than from
+   * the call.
    */
   executeQueryStream(request: TransportSqlRequest): Promise<CamusRowSource>;
 

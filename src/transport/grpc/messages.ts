@@ -214,6 +214,12 @@ export const GrpcBatchStatementKind = {
   Rollback: 5,
   Prepare: 6,
   Close: 7,
+  /**
+   * A frame: one stream message that carries several complete requests in `items`. It runs
+   * nothing itself. Never send one to a stream whose server did not announce frames — a server
+   * built before them runs an unknown kind as a non-query, and would execute the probe as SQL.
+   */
+  Frame: 8,
 } as const;
 
 export type GrpcBatchStatementKind = (typeof GrpcBatchStatementKind)[keyof typeof GrpcBatchStatementKind];
@@ -221,7 +227,13 @@ export type GrpcBatchStatementKind = (typeof GrpcBatchStatementKind)[keyof typeo
 export interface GrpcBatchExecuteRequest {
   requestId: number;
   kind: GrpcBatchStatementKind;
-  request: GrpcSqlRequest;
+  request?: GrpcSqlRequest;
+
+  /**
+   * The requests of a frame, in order, and only on a `Frame`. `kind` decides which field is
+   * read: a frame reads `items` alone, every other kind reads `request` alone.
+   */
+  items?: GrpcBatchExecuteRequest[];
 }
 
 /** Which branch of `BatchExecuteResponse.payload` is set. */
@@ -235,7 +247,8 @@ export type BatchPayloadCase =
   | 'commitReply'
   | 'rollbackReply'
   | 'prepareReply'
-  | 'closeReply';
+  | 'closeReply'
+  | 'frame';
 
 export interface GrpcBatchExecuteResponse {
   requestId: number;
@@ -250,6 +263,12 @@ export interface GrpcBatchExecuteResponse {
   rollbackReply?: Record<string, never>;
   prepareReply?: GrpcPrepareReply;
   closeReply?: Record<string, never>;
+  frame?: GrpcBatchResponseFrame;
+}
+
+/** Several responses in one stream message. A wrapper, because a `oneof` holds no repeated field. */
+export interface GrpcBatchResponseFrame {
+  items: GrpcBatchExecuteResponse[];
 }
 
 export interface GrpcLoginReply {

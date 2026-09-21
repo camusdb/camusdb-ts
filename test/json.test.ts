@@ -70,6 +70,42 @@ describe('parseLossless', () => {
   });
 });
 
+describe('LosslessParser', () => {
+  // A 16-digit run routes the text to the driver's own parser rather than to JSON.parse.
+  const longRun = ',"n":1234567890123456';
+
+  it('refuses a raw control character in a string, as JSON.parse does', () => {
+    const text = `{"a":"x\u0001y"${longRun}}`;
+
+    expect(() => {
+      JSON.parse(text);
+    }).toThrow(SyntaxError);
+    expect(() => parseLossless(text)).toThrow(SyntaxError);
+  });
+
+  it('refuses a number with a leading zero, as JSON.parse does', () => {
+    const text = `{"a":01${longRun}}`;
+
+    expect(() => {
+      JSON.parse(text);
+    }).toThrow(SyntaxError);
+    expect(() => parseLossless(text)).toThrow(SyntaxError);
+  });
+
+  it('refuses a fraction with no digits, as JSON.parse does', () => {
+    const text = `{"a":1.${longRun}}`;
+
+    expect(() => {
+      JSON.parse(text);
+    }).toThrow(SyntaxError);
+    expect(() => parseLossless(text)).toThrow(SyntaxError);
+  });
+
+  it('still reads the numbers JSON allows', () => {
+    expect(parseLossless(`{"a":-0.5e-3${longRun}}`)).toEqual({ a: -0.0005, n: 1234567890123456 });
+  });
+});
+
 describe('stringifyLossless', () => {
   it('writes a bigint as a JSON number', () => {
     expect(stringifyLossless({ a: 9223372036854775807n })).toBe('{"a":9223372036854775807}');
@@ -114,6 +150,26 @@ describe('stringifyLossless', () => {
 
   it('escapes control characters', () => {
     expect(stringifyLossless('')).toBe('"\\u0001"');
+  });
+
+  it('escapes an unpaired surrogate, as JSON.stringify does', () => {
+    const lone = 'a\ud800b';
+
+    expect(stringifyLossless(lone)).toBe(JSON.stringify(lone));
+    expect(stringifyLossless(lone)).toBe('"a\\ud800b"');
+  });
+
+  it('keeps a matched surrogate pair as it is', () => {
+    const pair = 'a\u{1f600}b';
+
+    expect(stringifyLossless(pair)).toBe(JSON.stringify(pair));
+  });
+
+  it('omits a property whose toJSON reports undefined', () => {
+    const value = { a: 1, b: { toJSON: () => undefined } };
+
+    expect(stringifyLossless(value)).toBe(JSON.stringify(value));
+    expect(stringifyLossless(value)).toBe('{"a":1}');
   });
 
   it('refuses a value nested past the depth limit', () => {

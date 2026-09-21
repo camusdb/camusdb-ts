@@ -113,13 +113,24 @@ function writeValue(value: unknown, out: string[], depth: number): void {
   writeEntries(Object.entries(value as Record<string, unknown>).values(), out, depth);
 }
 
+/**
+ * Writes the properties of an object or the entries of a `Map`.
+ *
+ * A `Map` entry whose key is not a string is skipped: JSON names a property with a string, and no
+ * coercion of an arbitrary key would round-trip. `JSON.stringify` has no `Map` support at all, so
+ * this is an addition of this module rather than a difference from the built-in function.
+ */
 function writeEntries(entries: IterableIterator<[unknown, unknown]>, out: string[], depth: number): void {
   out.push('{');
   let first = true;
 
-  for (const [key, entryValue] of entries) {
-    if (isOmitted(entryValue)) continue;
+  for (const [key, rawValue] of entries) {
     if (typeof key !== 'string') continue;
+
+    // `toJSON` is resolved before the test, because `JSON.stringify` omits a property whose
+    // `toJSON` reports `undefined` rather than writing null for it.
+    const entryValue = toJsonValue(rawValue);
+    if (isOmitted(entryValue)) continue;
 
     if (!first) out.push(',');
     first = false;
@@ -135,6 +146,15 @@ function isOmitted(value: unknown): boolean {
   return value === undefined || typeof value === 'function' || typeof value === 'symbol';
 }
 
+/** The result of a value's own `toJSON`, or the value itself when it has none. */
+function toJsonValue(value: unknown): unknown {
+  if (value === null || typeof value !== 'object') return value;
+
+  const object = value as { toJSON?: () => unknown };
+
+  return typeof object.toJSON === 'function' ? object.toJSON() : value;
+}
+
 const ESCAPES: Record<string, string> = {
   '"': '\\"',
   '\\': '\\\\',
@@ -145,11 +165,22 @@ const ESCAPES: Record<string, string> = {
   '\t': '\\t',
 };
 
-// eslint-disable-next-line no-control-regex -- JSON requires these characters to be escaped.
-const NEEDS_ESCAPE = /["\\\u0000-\u001f\u007f-\u009f]/;
+/**
+ * An unpaired surrogate matches the last two branches.
+ *
+ * A JavaScript string can hold one half of a surrogate pair, and a UTF-8 encoder replaces such a
+ * half with U+FFFD. Written raw, the server would therefore store a different string than the
+ * caller bound. Escaped as `\uXXXX`, the half survives the encoding, which is what
+ * `JSON.stringify` does. A matched pair is left as it is, so ordinary text outside the basic
+ * plane is not inflated.
+ */
+/* eslint-disable no-control-regex -- JSON requires these characters to be escaped. */
+const NEEDS_ESCAPE =
+  /["\\\u0000-\u001f\u007f-\u009f]|[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/;
 
-// eslint-disable-next-line no-control-regex -- JSON requires these characters to be escaped.
-const ESCAPE_ALL = /["\\\u0000-\u001f\u007f-\u009f]/g;
+const ESCAPE_ALL =
+  /["\\\u0000-\u001f\u007f-\u009f]|[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/g;
+/* eslint-enable no-control-regex */
 
 function quote(value: string): string {
   if (!NEEDS_ESCAPE.test(value)) return `"${value}"`;
@@ -161,6 +192,8 @@ function quote(value: string): string {
     return `\\u${character.charCodeAt(0).toString(16).padStart(4, '0')}`;
   })}"`;
 }
+
+const JSON_NUMBER = /^-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?$/;
 
 const MIN_SAFE = BigInt(Number.MIN_SAFE_INTEGER);
 const MAX_SAFE = BigInt(Number.MAX_SAFE_INTEGER);
@@ -296,6 +329,15 @@ class LosslessParser {
         continue;
       }
 
+      // JSON requires a control character inside a string to be escaped, and `JSON.parse` refuses
+      // a raw one. The slow path must refuse it too, or the same text would decode differently
+      // depending on which path a long digit run sent it down.
+      if (this.text.charCodeAt(this.position) < 0x20) {
+        throw new SyntaxError(
+          `Unescaped control character in a string at position ${String(this.position)}.`,
+        );
+      }
+
       if (character === '"') {
         const raw = this.text.slice(start, this.position + 1);
         this.position++;
@@ -338,7 +380,8 @@ class LosslessParser {
 
     const raw = this.text.slice(start, this.position);
 
-    if (raw.length === 0 || raw === '-') {
+    // The same grammar `JSON.parse` reads: no leading zero, no empty fraction, no bare exponent.
+    if (!JSON_NUMBER.test(raw)) {
       throw new SyntaxError(`Expected a value at position ${String(start)}.`);
     }
 

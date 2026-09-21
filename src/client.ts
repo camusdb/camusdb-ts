@@ -23,6 +23,7 @@ import type { CamusColumn } from './result-set.js';
 import { RowMapper } from './result-set.js';
 import { delay, isRetryable, withRetry } from './retry.js';
 import type { RetryOptions } from './retry.js';
+import { isValidDatabaseName } from './sql-syntax.js';
 import { ClientRuntime } from './runtime.js';
 import type { CamusRoutingAdvice } from './routing/advice.js';
 import { ROUTING_ACCEPT_VERSION } from './routing/advice.js';
@@ -192,6 +193,14 @@ export class CamusClient implements AsyncDisposable {
       throw new CamusError(CamusErrorCode.Generic, 'A database name cannot be empty.');
     }
 
+    if (!isValidDatabaseName(database)) {
+      throw new CamusError(
+        CamusErrorCode.Generic,
+        'A database name cannot hold a control character. The name is part of a cache key that a ' +
+          'newline separates.',
+      );
+    }
+
     this.runtime.database = database;
   }
 
@@ -295,8 +304,10 @@ export class CamusClient implements AsyncDisposable {
    * shared streams that decode a whole result before returning, so this buffers and replays: the
    * caller's code is the same, but the memory saving is not there.
    *
-   * The streaming path gives up the transparent retry of a serializable conflict that `query` has;
-   * see `CamusQueryStream`.
+   * A serializable conflict is reported to the caller here, as it is on the buffered `query` path:
+   * neither path retries a statement on its own. Rows can reach this side before the statement's
+   * own short transaction commits, so a late conflict surfaces from the iteration. Run the work in
+   * `client.transaction`, or wrap the call in `withRetry`, when you need a retry.
    */
   async queryStream<T = Record<string, unknown>>(
     sql: string,
@@ -941,7 +952,9 @@ export class CamusClient implements AsyncDisposable {
    * does decide is whether to ask again. A refusal specific to this statement stops asking for that
    * statement; anything that says the node has no prepared-statement support at all stops asking
    * for every statement, because one round trip per distinct SQL to relearn that is worse than not
-   * trying.
+   * trying. A failure that never reached a verdict — a timeout, an unreachable node — drops the
+   * entry instead, so one network blip does not cost this statement its registration for the life
+   * of the process.
    */
   private async register(
     endpoint: string,
@@ -970,12 +983,16 @@ export class CamusClient implements AsyncDisposable {
         throw error;
       }
 
-      // Deliberately broad. Whatever went wrong, the statement is about to run inline and will
-      // report any real problem itself; the only decision left here is whether asking again is
-      // worth a round trip, and for this statement it is not.
-      policy.markRefused(database, sql);
+      // The statement is about to run inline and will report any real problem itself. The only
+      // decision left here is whether asking again is worth a round trip.
+      if (CamusError.is(error) && isUnsupported(error)) {
+        policy.markRefused(database, sql);
+        policy.disable();
+        return false;
+      }
 
-      if (CamusError.is(error) && isUnsupported(error)) policy.disable();
+      if (declinesStatement(error)) policy.markRefused(database, sql);
+      else policy.forget(database, sql);
 
       return false;
     }
@@ -1026,6 +1043,35 @@ export class CamusClient implements AsyncDisposable {
       }
     }
   }
+}
+
+/**
+ * The codes that say nothing about the statement itself.
+ *
+ * `Generic` covers a call that was sent and then lost, and every failure the driver could not
+ * classify. The rest name the connection or the principal. A statement that meets one of these is
+ * left reconsiderable: the next call site asks again.
+ */
+const UNINFORMATIVE_CODES = new Set<string>([
+  CamusErrorCode.Generic,
+  CamusErrorCode.EndpointUnreachable,
+  CamusErrorCode.AuthenticationFailed,
+  CamusErrorCode.InsufficientPrivilege,
+  CamusErrorCode.TooManyAuthAttempts,
+  CamusErrorCode.InsecureTransport,
+]);
+
+/**
+ * True when the server gave a verdict on this statement, rather than the round trip failing.
+ *
+ * Only a verdict is terminal. A retryable condition, a transport failure, and an error the driver
+ * did not raise itself all leave the question open.
+ */
+function declinesStatement(error: unknown): boolean {
+  if (!CamusError.is(error)) return false;
+  if (isRetryable(error)) return false;
+
+  return !UNINFORMATIVE_CODES.has(error.code);
 }
 
 /**

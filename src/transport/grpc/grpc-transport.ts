@@ -14,6 +14,7 @@ import { CamusError } from '../../errors.js';
 import { CamusErrorCode } from '../../error-codes.js';
 import type { CamusEndpointPool } from '../../endpoint-pool.js';
 import type { CamusTransactionOptions } from '../../options.js';
+import { setOwn } from '../../own-record.js';
 import { CamusIsolationLevel, CamusLocking, CamusTransactionMode } from '../../options.js';
 import { bindPositional } from '../../prepared/binder.js';
 import type { CamusResultSet } from '../../result-set.js';
@@ -39,6 +40,7 @@ import type {
   TransportSqlRequest,
 } from '../transport.js';
 import { hasTransaction } from '../transport.js';
+import { announcesFrames, FRAME_ACCEPT_HEADER, FRAME_HEADER, FRAME_VERSION } from './batch-frames.js';
 import type { BatchCausalToken, BatchStream, PreparedSlotEntry } from './batcher.js';
 import { EMPTY_CAUSAL_TOKEN, GrpcBatcher, PreparedStatementStaleError } from './batcher.js';
 import { buildResultSet, encodeValue, fromWire, toWire } from './codec.js';
@@ -274,6 +276,12 @@ export class GrpcTransport implements CamusTransport, CamusLoginClient {
       return send(this.buildSqlRequest(request), request.streamSlot, undefined);
     }
 
+    // A transaction that finishes on a stream that was rotated out cannot use the slot's
+    // registration, which lives on the stream that replaced it. See `isBoundToRetiredStream`.
+    if (hasTransaction(request) && batcher.isBoundToRetiredStream(request.txnIdPT, request.txnIdCounter)) {
+      return send(this.buildSqlRequest(request), request.streamSlot, undefined);
+    }
+
     const slot = request.streamSlot ?? batcher.reserveSlot();
 
     for (let attempt = 0; ; attempt++) {
@@ -292,9 +300,21 @@ export class GrpcTransport implements CamusTransport, CamusLoginClient {
       try {
         return await send(wire, slot, entry.transportId);
       } catch (error) {
-        if (attempt > 0 || !isStaleRegistration(error)) throw error;
+        if (!isStaleRegistration(error)) throw error;
 
         batcher.invalidatePrepared(slot, request.database, request.sql, entry);
+
+        if (attempt === 0) continue;
+
+        // Stale twice running: the stream this operation is bound for keeps differing from the one
+        // the registration is on, because a rotation landed between the check and the write. The
+        // refusal is raised before anything is written, so nothing ran, and to run inline is safe.
+        // Preparing is an optimization. It must never be the reason a statement fails.
+        if (error instanceof PreparedStatementStaleError) {
+          return send(this.buildSqlRequest(request), slot, undefined);
+        }
+
+        throw error;
       }
     }
   }
@@ -527,8 +547,14 @@ export class GrpcTransport implements CamusTransport, CamusLoginClient {
   private async batcherFor(endpoint: string): Promise<GrpcBatcher> {
     const entry = await this.entryFor(endpoint);
 
-    entry.batcher ??= new GrpcBatcher(this.batchOptions, (id) =>
-      this.createBatchStream(id, entry.sql, endpoint),
+    // The factory reads the current token on every call rather than closing over one, so a stream
+    // that is rebuilt after a fault carries the new token. The stamp is that same token, handed
+    // over separately, so the batcher can tell that a live stream was opened under a token that
+    // has since been replaced, and rotate it.
+    entry.batcher ??= new GrpcBatcher(
+      this.batchOptions,
+      (id) => this.createBatchStream(id, entry.sql, endpoint),
+      () => this.auth.currentToken,
     );
 
     return entry.batcher;
@@ -539,6 +565,11 @@ export class GrpcTransport implements CamusTransport, CamusLoginClient {
    *
    * The batcher rebuilds a faulted stream on its own, so the token is read here, at open time,
    * rather than captured once. A stream re-opened after a token refresh carries the new token.
+   *
+   * Frames are negotiated per stream. The opening metadata says which contract version this client
+   * reads, and the server's response headers say whether it reads one in turn. The announcement is
+   * watched off the operation path: every operation is its own message until it arrives, and for
+   * good against a server that makes none.
    */
   private createBatchStream(id: number, client: GrpcServiceClient, endpoint: string): BatchStream {
     // Captured, because `listen` below is a method on the returned object and `this` is not the
@@ -549,12 +580,29 @@ export class GrpcTransport implements CamusTransport, CamusLoginClient {
       metadata?: GrpcMetadata,
     ) => GrpcDuplexCall<GrpcBatchExecuteRequest, GrpcBatchExecuteResponse>;
 
-    const call = method.call(client, this.buildMetadata(this.auth.currentToken));
+    const metadata = this.buildMetadata(this.auth.currentToken);
+
+    // Sent only when frames are enabled, so a stream that opted out is a stream without frames in
+    // both directions. A server built before frames ignores the header.
+    if (this.batchOptions.requestFrames) {
+      metadata.set(FRAME_ACCEPT_HEADER, String(FRAME_VERSION));
+    }
+
+    const call = method.call(client, metadata);
 
     let closed = false;
+    let announced = false;
+
+    call.on('metadata', (headers: GrpcMetadata) => {
+      if (announcesFrames(headerValue(headers, FRAME_HEADER))) announced = true;
+    });
 
     return {
       id,
+
+      get framesAnnounced() {
+        return announced;
+      },
 
       send(request) {
         call.write(request);
@@ -733,14 +781,21 @@ export class GrpcTransport implements CamusTransport, CamusLoginClient {
 
   /**
    * Merges a reply's token, keeping the clock maximum — physical component first, then the logical
-   * counter — so the token this session threads advances whatever order replies arrive in.
+   * counter, then the node id — so the token this session threads advances whatever order replies
+   * arrive in. The node id is the tie-breaker `buildHandle` documents, so it decides a merge that
+   * the first two components leave equal.
    */
   private observeToken(token: BatchCausalToken): void {
     if (token.l === 0n && token.c === 0n) return;
 
     const current = this.causalToken;
 
-    if (token.l < current.l || (token.l === current.l && token.c <= current.c)) return;
+    if (token.l < current.l) return;
+
+    if (token.l === current.l) {
+      if (token.c < current.c) return;
+      if (token.c === current.c && token.n <= current.n) return;
+    }
 
     this.causalToken = token;
   }
@@ -811,7 +866,7 @@ function encodeParameters(
   const encoded: Record<string, GrpcValue> = {};
 
   if (parameters !== undefined) {
-    for (const [name, value] of parameters) encoded[name] = encodeValue(value);
+    for (const [name, value] of parameters) setOwn(encoded, name, encodeValue(value));
   }
 
   return encoded;
@@ -947,8 +1002,12 @@ const GRPC_STATUS_UNAUTHENTICATED = 16;
 const GRPC_STATUS_PERMISSION_DENIED = 7;
 
 function readMetadata(error: GrpcStatusError, key: string): string | undefined {
-  const values = error.metadata?.get(key);
-  const first = values?.[0];
+  return headerValue(error.metadata, key);
+}
+
+/** The first value of one header, as a string. gRPC returns a list, and may return bytes. */
+function headerValue(metadata: GrpcMetadata | undefined, key: string): string | undefined {
+  const first = metadata?.get(key)[0];
 
   if (first === undefined) return undefined;
 

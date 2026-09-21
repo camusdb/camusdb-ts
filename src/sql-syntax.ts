@@ -65,7 +65,13 @@ export function delimitIdentifier(identifier: string, parameterName: string): st
   return `\`${identifier}\``;
 }
 
-/** Refuses an identifier that cannot be delimited. */
+/**
+ * Refuses an identifier that cannot be delimited.
+ *
+ * A trailing backslash is refused for the reason `validateSqlLiteral` refuses one: CamusDB's lexer
+ * reads a backslash and the character after it as one unit, so the backslash would consume the
+ * closing backtick and the identifier would run into the text after it.
+ */
 export function validateIdentifier(identifier: string, parameterName: string): void {
   if (identifier.trim().length === 0) {
     throw new TypeError(`An identifier cannot be empty (${parameterName}).`);
@@ -76,6 +82,33 @@ export function validateIdentifier(identifier: string, parameterName: string): v
       `The identifier '${identifier}' holds a backtick, which CamusDB cannot quote (${parameterName}).`,
     );
   }
+
+  if (identifier.endsWith('\\')) {
+    throw new TypeError(
+      `The identifier '${identifier}' ends with a backslash (${parameterName}). CamusDB's lexer reads a ` +
+        'backslash and the character after it as one unit, so the backslash would consume the closing backtick.',
+    );
+  }
+}
+
+/**
+ * True when a string can serve as a database name.
+ *
+ * The name travels as a request field rather than as SQL text, so there is no injection to close
+ * here. What the test protects is the cache keys: the prepared-statement policy, the gRPC batcher,
+ * and the REST prepared-statement cache each join a database name and a statement with a newline,
+ * and each states that a database name holds no newline. A name that held one would make two
+ * distinct pairs collide on one key. Every control character is refused, not the newline alone,
+ * because none of them names a database.
+ *
+ * It reports a verdict rather than throwing, because the two call sites raise different error
+ * types: a configuration failure is a `CamusError`, and a bad argument is a `TypeError`.
+ */
+export function isValidDatabaseName(database: string): boolean {
+  if (database.trim().length === 0) return false;
+
+  // eslint-disable-next-line no-control-regex -- the point of the test is to find these characters.
+  return !/[\u0000-\u001f\u007f]/.test(database);
 }
 
 /**

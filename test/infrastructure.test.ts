@@ -30,7 +30,7 @@ import {
   rewriteStorageStatement,
   setColumnStorageStatement,
 } from '../src/column-storage.js';
-import { delimitIdentifier, sqlLiteral, validateBareName } from '../src/sql-syntax.js';
+import { delimitIdentifier, isValidDatabaseName, sqlLiteral, validateBareName } from '../src/sql-syntax.js';
 
 beforeEach(() => {
   CamusEndpointPool.resetShared();
@@ -545,6 +545,20 @@ describe('retry', () => {
       expect(delay).toBeLessThanOrEqual(500);
     }
   });
+
+  it('starts the back-off at the documented 20 ms base', () => {
+    const delay = computeDelayMs(1);
+
+    expect(delay).toBeGreaterThanOrEqual(15);
+    expect(delay).toBeLessThanOrEqual(25);
+  });
+
+  it('stops walking a cause chain that points at itself', () => {
+    const looping: { cause?: unknown } = new Error('outer');
+    looping.cause = looping;
+
+    expect(isRetryable(looping)).toBe(false);
+  });
 });
 
 describe('sanitizeErrorText', () => {
@@ -727,6 +741,21 @@ describe('sql syntax', () => {
     expect(delimitIdentifier('robots', 'name')).toBe('`robots`');
     expect(() => delimitIdentifier('ro`bots', 'name')).toThrow(TypeError);
     expect(() => delimitIdentifier('  ', 'name')).toThrow(TypeError);
+  });
+
+  it('refuses an identifier the lexer would read differently', () => {
+    expect(() => delimitIdentifier('robots\\', 'name')).toThrow(TypeError);
+    expect(() => delimitIdentifier('a\\', 'name')).toThrow(/backslash/);
+  });
+
+  it('allows a backslash inside an identifier', () => {
+    expect(delimitIdentifier('ro\\bots', 'name')).toBe('`ro\\bots`');
+  });
+
+  it('reports which strings can name a database', () => {
+    expect(isValidDatabaseName('robots')).toBe(true);
+    expect(isValidDatabaseName('robots\nSELECT 1')).toBe(false);
+    expect(isValidDatabaseName('  ')).toBe(false);
   });
 
   it('validates a bare name', () => {

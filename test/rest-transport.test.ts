@@ -586,6 +586,25 @@ describe('prepared statements', () => {
     expect((server.requestsTo('execute-sql-query')[0]!.body as Record<string, unknown>).sql).toBe('SELECT 1');
   });
 
+  it('sends a parameter named __proto__ as a parameter of its own', async () => {
+    server.json('execute-sql-query', { status: 'ok', columns: [], rows: [] });
+
+    const { transport } = unauthenticated();
+
+    await transport.executeQuery(
+      sqlRequest({
+        sql: 'INSERT INTO t (__proto__) VALUES (@a)',
+        parameters: new Map([['__proto__', { type: ColumnType.String, strValue: 'x' }]]),
+      }),
+    );
+
+    const body = server.requestsTo('execute-sql-query')[0]!.body as Record<string, unknown>;
+    const parameters = body.parameters as Record<string, unknown>;
+
+    // Plain assignment would have set the record's prototype and dropped the column.
+    expect(Object.hasOwn(parameters, '__proto__')).toBe(true);
+  });
+
   it('registers again and replays once when the handle is gone', async () => {
     let statementNumber = 0;
 
@@ -742,6 +761,43 @@ describe('executeQueryStream', () => {
     const { transport } = unauthenticated();
 
     await expect(transport.executeQueryStream(sqlRequest())).rejects.toThrow(CamusError);
+  });
+
+  it('wraps a row line that is not valid JSON', async () => {
+    server.on('execute-sql-query-stream', (_request, response) => {
+      response.writeHead(200, { 'Content-Type': 'application/x-ndjson' });
+      response.write('{"status":"ok","columns":[{"name":"s","type":3}]}\n');
+      response.write('["abc"]\n');
+      response.write('[not json]\n');
+      response.end();
+    });
+
+    const { transport } = unauthenticated();
+    const source = await transport.executeQueryStream(sqlRequest());
+
+    expect((await source.next())![0]!.strValue).toBe('abc');
+
+    // The header's parse is wrapped the same way; a row must not escape as a raw SyntaxError.
+    await expect(source.next()).rejects.toThrow(CamusError);
+
+    await source.close();
+  });
+
+  it('refuses a line that is neither a row nor a trailer', async () => {
+    server.on('execute-sql-query-stream', (_request, response) => {
+      response.writeHead(200, { 'Content-Type': 'application/x-ndjson' });
+      response.write('{"status":"ok","columns":[{"name":"s","type":3}]}\n');
+      response.write('42\n');
+      response.end();
+    });
+
+    const { transport } = unauthenticated();
+    const source = await transport.executeQueryStream(sqlRequest());
+
+    // Reading it as the end of the stream would report a truncated result as a complete one.
+    await expect(source.next()).rejects.toThrow(CamusError);
+
+    await source.close();
   });
 
   it('reads a row that arrived split across several network reads', async () => {

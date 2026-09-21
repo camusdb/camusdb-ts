@@ -618,6 +618,20 @@ describe('automatic prepared statements', () => {
     expect(server.callCount('execute-sql-query')).toBe(2);
   });
 
+  it('asks again after a registration that failed without a verdict', async () => {
+    // A gateway failure says nothing about the statement, so it must not be terminal.
+    server.json('prepare-sql-statement', { status: 'failed', code: 'CADB0000', message: 'gateway' }, 504);
+    queryRoute([], []);
+
+    const subject = client({ autoPrepareMinUsages: 1 });
+
+    await subject.query('SELECT 1');
+    await subject.query('SELECT 1');
+
+    expect(server.callCount('prepare-sql-statement')).toBe(2);
+    expect(server.callCount('execute-sql-query')).toBe(2);
+  });
+
   it('prepares on request, and treats a statement it cannot prepare as no error', async () => {
     server.json('prepare-sql-statement', { status: 'ok', statementId: 'stmt-1', parameterNames: [] });
 
@@ -742,6 +756,9 @@ describe('the client surface', () => {
 
     expect(subject.database).toBe('other');
     expect(() => subject.changeDatabase('  ')).toThrow(CamusError);
+
+    // A newline would make two distinct (database, sql) pairs collide on one cache key.
+    expect(() => subject.changeDatabase('a\nb')).toThrow(CamusError);
   });
 
   it('ends a statement when the caller cancels it', async () => {

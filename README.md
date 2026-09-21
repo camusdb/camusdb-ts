@@ -117,6 +117,8 @@ const b = CamusClient.fromConnectionString('Endpoint=http://localhost:8082;Datab
 | `channelPoolSize` | `ChannelPoolSize` | No | gRPC only: streams per endpoint. Default `2`. |
 | `coalescingThreshold` | `CoalescingThreshold` | No | gRPC only. Default `10`. `1` turns coalescing off. |
 | `coalescingDelayMs` | `CoalescingDelay` | No | gRPC only: milliseconds. Default `0`, which is off. |
+| `requestFrames` | `RequestFrames` | No | gRPC only: pack the operations that wait together into one stream message. Default `true`. |
+| `streamDrainTimeoutMs` | `StreamDrainTimeout` | No | gRPC only: milliseconds a rotated-out stream stays open for its transactions. Default `300000`. |
 | `backupEndpoint` | `BackupEndpoint` | No | The HTTP endpoint for the backup admin API. Required with `grpc`. |
 | `backupTimeoutSeconds` | `BackupTimeout` | No | The backup request timeout in seconds. Default `300`. |
 | `allowInsecureCredentials` | `AllowInsecureCredentials` | No | Waives the refusal to send credentials to a remote plaintext endpoint. |
@@ -266,6 +268,10 @@ await client.query('SELECT * FROM robots WHERE key = @key AND made = @made AND t
 | `camus.raw(columnValue)` | Whatever the value holds |
 
 An empty array needs `camus.array`: there is no element to read a type from.
+
+Each helper validates its argument, so a bad value is reported at the call site rather than by the
+server. `camus.id` takes the 24 hexadecimal characters of an ObjectId, and `camus.uuid` takes the
+canonical hyphenated string.
 
 ---
 
@@ -482,10 +488,10 @@ Two limits are worth knowing:
 - **It is incremental over REST only.** The gRPC data plane multiplexes results over shared streams
   that decode a whole result before returning, so gRPC buffers and replays. Your code is the same;
   the memory saving is not there.
-- **It gives up the transparent retry of a lost conflict.** Rows can reach you before the
-  statement's own short transaction commits, so a conflict that surfaces late is raised from the
-  iteration rather than retried. Use `query`, or drive an explicit transaction and retry it
-  yourself, when you need that.
+- **A lost conflict surfaces while you read.** Rows can reach you before the statement's own short
+  transaction commits, so a conflict that surfaces late is raised from the iteration rather than
+  from the call. The driver retries no autocommit statement, `query` included: run the work in
+  `client.transaction`, or wrap it in `withRetry`, when you need a retry.
 
 ---
 
@@ -689,6 +695,23 @@ order, so the server sees them in the order you wrote them.
 It also carries the session's causal token. Every reply reports a hybrid-logical-clock instant, the
 transport keeps the greatest one it has seen, and every request carries it back. That is what makes
 a read see this session's own earlier writes even when it lands on a different node.
+
+Statements that wait together travel together. When several statements are issued in one turn — one
+`Promise.all` over six of them — the transport writes them as a single stream message, called a
+frame, and the fixed cost of a message is paid once instead of six times. A frame never waits for
+more statements. A lone statement stays a plain single message, and a server that does not announce
+frames never receives one. Set `requestFrames` to `false` to turn frames off.
+
+A stream carries its bearer token once, in the metadata it opens with, and gRPC gives no way to
+change it later. The token provider renews the token every few minutes, so a long-lived stream
+outlives the token it presented. Whether a server tolerates that is the server's decision. The
+driver does not rely on it: when the token changes, the next statement on a stream opens a fresh
+one under the new token, and the old stream is retired.
+
+A retired stream takes no new work. It keeps serving the transactions that began on it, because a
+transaction cannot change streams and the server rolls one back when its stream closes. It closes
+as soon as the last of those transactions ends, or after `streamDrainTimeoutMs`, which bounds the
+wait for a transaction its caller abandoned.
 
 Tune the stream pool with `channelPoolSize`. It is **not** a cap on in-flight transactions — many
 transactions hash onto the same streams and interleave — so the default of 2 suits most workloads.

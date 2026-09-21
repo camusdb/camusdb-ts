@@ -41,6 +41,25 @@ class ScriptedLoginClient implements CamusLoginClient {
   }
 }
 
+/** A login client whose token names the user, and whose round trip takes that user's own time. */
+class PerUserLoginClient implements CamusLoginClient {
+  logins = 0;
+
+  constructor(private readonly delaysMs: Record<string, number>) {}
+
+  async login(_endpoint: string, user: string): Promise<CamusLoginResult> {
+    this.logins++;
+
+    await new Promise((resolve) => setTimeout(resolve, this.delaysMs[user] ?? 1));
+
+    return { token: `token-for-${user}` };
+  }
+
+  async logout(): Promise<void> {
+    // The race tests never revoke a token.
+  }
+}
+
 function provider(
   client: CamusLoginClient,
   credentials = credentialsFromPassword('app', 'secret'),
@@ -181,6 +200,40 @@ describe('CamusTokenProvider', () => {
     expect(await auth.login('app', 'secret')).toBe('token-1');
     expect(auth.isEnabled).toBe(true);
     expect(await auth.getToken()).toBe('token-1');
+  });
+
+  it('does not cache a token minted with the credentials a login replaced', async () => {
+    // The first login is the slow one, so it finishes after the login that replaced it.
+    const client = new PerUserLoginClient({ app: 20, other: 1 });
+    const auth = provider(client);
+
+    const first = auth.getToken();
+    const second = auth.login('other', 'secret');
+
+    await expect(second).resolves.toBe('token-for-other');
+    await expect(first).resolves.toBe('token-for-app');
+
+    // The caller that asked for the first token still receives it. It is not the cached one.
+    expect(auth.currentToken).toBe('token-for-other');
+    expect(await auth.getToken()).toBe('token-for-other');
+    expect(client.logins).toBe(2);
+  });
+
+  it('joins the newer login rather than starting a third', async () => {
+    // Here the first login is the fast one: it settles while the login that replaced it runs.
+    const client = new PerUserLoginClient({ app: 1, other: 20 });
+    const auth = provider(client);
+
+    const first = auth.getToken();
+    const second = auth.login('other', 'secret');
+
+    await expect(first).resolves.toBe('token-for-app');
+
+    const third = auth.getToken();
+
+    await expect(second).resolves.toBe('token-for-other');
+    await expect(third).resolves.toBe('token-for-other');
+    expect(client.logins).toBe(2);
   });
 
   it('revokes the token it holds and keeps the credentials', async () => {

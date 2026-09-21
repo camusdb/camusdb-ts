@@ -169,6 +169,8 @@ function transportKey(config: ResolvedConfig, deployment: string): string {
     String(config.batch.channelPoolSize),
     String(config.batch.coalescingThreshold),
     String(config.batch.coalescingDelayMs),
+    String(config.batch.requestFrames),
+    String(config.batch.streamDrainTimeoutMs),
   ].join('|');
 }
 

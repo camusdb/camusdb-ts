@@ -27,6 +27,9 @@ const RETRYABLE_CODES = new Set(['CADB0502', 'CADB0504', 'CADB0505']);
  */
 const RETRYABLE_MESSAGE_MARKERS = ['MustRetry', 'AlreadyLocked', 'commit returned Aborted'];
 
+/** How far `isRetryable` walks a `cause` chain before it stops. */
+const MAX_CAUSE_DEPTH = 16;
+
 /**
  * True when running the same work again may succeed.
  *
@@ -36,8 +39,17 @@ const RETRYABLE_MESSAGE_MARKERS = ['MustRetry', 'AlreadyLocked', 'commit returne
  * the same handle, which `CamusTransaction` does on its own.
  */
 export function isRetryable(error: unknown): boolean {
-  for (let current: unknown = error; current != null; current = (current as { cause?: unknown }).cause) {
-    if (!CamusError.is(current)) continue;
+  let current: unknown = error;
+
+  // A cause chain comes from outside the driver and can hold a cycle. The cap bounds the walk
+  // without a visited set; no real chain is anywhere near this deep.
+  for (let depth = 0; current != null && depth < MAX_CAUSE_DEPTH; depth++) {
+    const next: unknown = (current as { cause?: unknown }).cause;
+
+    if (!CamusError.is(current)) {
+      current = next;
+      continue;
+    }
 
     if (current.code === CamusErrorCode.FinalizeUnresolved) return false;
     if (RETRYABLE_CODES.has(current.code)) return true;
@@ -45,6 +57,8 @@ export function isRetryable(error: unknown): boolean {
     for (const marker of RETRYABLE_MESSAGE_MARKERS) {
       if (current.message.includes(marker)) return true;
     }
+
+    current = next;
   }
 
   return false;
@@ -86,9 +100,12 @@ export async function withRetry<T>(
   }
 }
 
-/** The back-off for one attempt, in milliseconds. Exported so a caller can mirror the schedule. */
+/**
+ * The back-off after attempt number `attempt`, in milliseconds. Exported so a caller can mirror the
+ * schedule. The first retry waits the documented 20 ms base, the second 40 ms, and so on.
+ */
 export function computeDelayMs(attempt: number): number {
-  const base = Math.min(20 * 2 ** attempt, 400);
+  const base = Math.min(20 * 2 ** (attempt - 1), 400);
   const jitter = base * 0.25 * (2 * Math.random() - 1);
 
   return Math.max(1, base + jitter);

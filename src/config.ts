@@ -19,6 +19,7 @@ import { CamusError } from './errors.js';
 import { CamusErrorCode } from './error-codes.js';
 import type { CamusTransactionOptions } from './options.js';
 import { CamusIsolationLevel, CamusLocking, CamusTransactionMode } from './options.js';
+import { isValidDatabaseName } from './sql-syntax.js';
 import type { DecodeOptions, Int64Mode } from './values/decode.js';
 
 /** The wire protocol a client speaks. */
@@ -68,12 +69,35 @@ export interface GrpcBatchOptions {
    * milliseconds. Zero, the default, turns coalescing off. A single-operation drain never waits.
    */
   readonly coalescingDelayMs: number;
+
+  /**
+   * How long a stream that was rotated out stays open for the transactions that began on it, in
+   * milliseconds.
+   *
+   * A transaction cannot change streams, so a retired stream stays until its last one ends. This
+   * bounds that wait, because a transaction whose caller abandoned it never ends by itself, and to
+   * close its stream is what makes the server roll it back and release its locks. The default of
+   * five minutes is longer than any transaction that still makes progress should need.
+   */
+  readonly streamDrainTimeoutMs: number;
+
+  /**
+   * Whether the operations that wait together are written as one stream message — a frame — to a
+   * server that announced it reads one. It is on by default.
+   *
+   * A frame never waits for more operations, a lone operation stays a plain single message, and a
+   * server that made no announcement never receives one. Turn it off for an A/B measurement, or as
+   * a kill switch.
+   */
+  readonly requestFrames: boolean;
 }
 
 export const DEFAULT_BATCH_OPTIONS: GrpcBatchOptions = Object.freeze({
   channelPoolSize: 2,
   coalescingThreshold: 10,
   coalescingDelayMs: 0,
+  streamDrainTimeoutMs: 300_000,
+  requestFrames: true,
 });
 
 /** How many statements a client keeps prepared, and how hot a statement must be first. */
@@ -137,6 +161,18 @@ export interface CamusClientOptions {
 
   /** gRPC only: milliseconds the pump waits after a multi-operation drain. Default 0. */
   readonly coalescingDelayMs?: number;
+
+  /**
+   * gRPC only: milliseconds a stream that was rotated out stays open for the transactions that
+   * began on it. Default 300000.
+   */
+  readonly streamDrainTimeoutMs?: number;
+
+  /**
+   * gRPC only: whether the operations that wait together are written as one stream message, to a
+   * server that announced it reads one. Default true.
+   */
+  readonly requestFrames?: boolean;
 
   /** The HTTP endpoint for the backup admin API. It is required when `protocol` is `grpc`. */
   readonly backupEndpoint?: string;
@@ -205,6 +241,14 @@ export function resolveOptions(options: CamusClientOptions): ResolvedConfig {
     throw new CamusError(CamusErrorCode.Generic, 'Database is required.');
   }
 
+  if (!isValidDatabaseName(options.database)) {
+    throw new CamusError(
+      CamusErrorCode.Generic,
+      'Database holds a control character. A database name is part of a cache key that a newline ' +
+        'separates, so a control character cannot appear in one.',
+    );
+  }
+
   const config: ResolvedConfig = {
     endpointList,
     database: options.database,
@@ -222,6 +266,12 @@ export function resolveOptions(options: CamusClientOptions): ResolvedConfig {
         DEFAULT_BATCH_OPTIONS.coalescingThreshold,
       ),
       coalescingDelayMs: atLeastOr(options.coalescingDelayMs, 0, DEFAULT_BATCH_OPTIONS.coalescingDelayMs),
+      streamDrainTimeoutMs: atLeastOr(
+        options.streamDrainTimeoutMs,
+        0,
+        DEFAULT_BATCH_OPTIONS.streamDrainTimeoutMs,
+      ),
+      requestFrames: options.requestFrames ?? DEFAULT_BATCH_OPTIONS.requestFrames,
     },
     backupEndpoint: options.backupEndpoint,
     backupTimeoutSeconds: positiveOr(options.backupTimeoutSeconds, DEFAULT_BACKUP_TIMEOUT_SECONDS),
@@ -283,6 +333,12 @@ export function resolveConnectionString(connectionString: string): ResolvedConfi
         0,
         DEFAULT_BATCH_OPTIONS.coalescingDelayMs,
       ),
+      streamDrainTimeoutMs: parseIntAtLeast(
+        settings.get('StreamDrainTimeout'),
+        0,
+        DEFAULT_BATCH_OPTIONS.streamDrainTimeoutMs,
+      ),
+      requestFrames: parseBool(settings.get('RequestFrames'), DEFAULT_BATCH_OPTIONS.requestFrames),
     },
     backupEndpoint: settings.first('BackupEndpoint'),
     backupTimeoutSeconds: parsePositiveInt(settings.get('BackupTimeout'), DEFAULT_BACKUP_TIMEOUT_SECONDS),
@@ -511,6 +567,16 @@ function parsePositiveInt(raw: string | undefined, fallback: number): number {
 function parseNonNegativeInt(raw: string | undefined, fallback: number): number {
   const parsed = Number.parseInt(raw ?? '', 10);
   return Number.isInteger(parsed) && parsed >= 0 ? parsed : fallback;
+}
+
+/** Reads `true` or `false`, in any case. Anything else keeps the fallback. */
+function parseBool(raw: string | undefined, fallback: boolean): boolean {
+  const text = raw?.trim().toLowerCase();
+
+  if (text === 'true') return true;
+  if (text === 'false') return false;
+
+  return fallback;
 }
 
 function parseIntAtLeast(raw: string | undefined, minimum: number, fallback: number): number {

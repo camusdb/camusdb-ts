@@ -57,6 +57,7 @@ export interface GrpcDuplexCall<TRequest, TResponse> {
   cancel: () => void;
   on: ((event: 'data', listener: (message: TResponse) => void) => void) &
     ((event: 'error', listener: (error: GrpcStatusError) => void) => void) &
+    ((event: 'metadata', listener: (metadata: GrpcMetadata) => void) => void) &
     ((event: 'end' | 'close', listener: () => void) => void);
   once: (event: string, listener: (...args: never[]) => void) => void;
   removeAllListeners: () => void;

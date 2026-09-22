@@ -15,6 +15,7 @@
  *   CAMUS_LIVE_PASSWORD       that user's password
  *   CAMUS_LIVE_LARGE_VALUES   set to true to run the large-value cases, which need a server with
  *                             large-value storage: an older server refuses the STORAGE clause
+ *   CAMUS_LIVE_SEQUENCES      set to true to run the sequence cases, which need a server from 0.13.2
  *
  * Every case creates its own table and drops it afterwards, so the suite leaves nothing behind and
  * two runs never collide.
@@ -32,6 +33,9 @@ import {
   camus,
   cacheHint,
   ColumnType,
+  createSequenceStatement,
+  dropSequenceStatement,
+  nextValueExpression,
   setColumnStorageStatement,
 } from '../../src/index.js';
 
@@ -39,6 +43,7 @@ const REST_ENDPOINT = process.env.CAMUS_LIVE_ENDPOINT ?? 'http://localhost:5095'
 const GRPC_ENDPOINT = process.env.CAMUS_LIVE_GRPC_ENDPOINT ?? 'http://localhost:5096';
 const DATABASE = process.env.CAMUS_LIVE_DATABASE ?? 'camusdb_ts_live';
 const LARGE_VALUES = process.env.CAMUS_LIVE_LARGE_VALUES?.toLowerCase() === 'true';
+const SEQUENCES = process.env.CAMUS_LIVE_SEQUENCES?.toLowerCase() === 'true';
 
 const CREDENTIALS =
   process.env.CAMUS_LIVE_USER === undefined
@@ -1073,6 +1078,104 @@ describe('gRPC batch stream frames', () => {
       await client.close();
     }
   });
+});
+
+describe('UUIDs declared as object ids', () => {
+  it('matches a uuid column with an array declared as ColumnType.Id', async () => {
+    const client = new CamusClient({
+      endpoint: REST_ENDPOINT,
+      database: DATABASE,
+      timeoutSeconds: 30,
+      ...CREDENTIALS,
+    });
+    const table = uniqueName('uuid_ids');
+
+    try {
+      await client.createDatabase(undefined, { ifNotExists: true });
+      await client.executeDdl(`CREATE TABLE ${table} (id OID PRIMARY KEY NOT NULL, ref UUID)`);
+
+      const refs = [crypto.randomUUID(), crypto.randomUUID(), crypto.randomUUID()];
+
+      for (const ref of refs) {
+        await client.execute(`INSERT INTO ${table} (id, ref) VALUES (@id, @ref)`, {
+          id: camus.id(CamusObjectId.generateAsString()),
+          ref: camus.uuid(ref),
+        });
+      }
+
+      const matched = await client.scalar<number>(`SELECT COUNT(*) FROM ${table} WHERE ref = ANY(@refs)`, {
+        refs: camus.array(refs.slice(0, 2), ColumnType.Id),
+      });
+
+      expect(matched).toBe(2);
+    } finally {
+      await client.executeDdl(`DROP TABLE ${table}`).catch(() => undefined);
+      await client.close();
+    }
+  });
+});
+
+describe.runIf(SEQUENCES)('sequences', () => {
+  for (const [name, options] of [
+    ['REST transport', { protocol: 'rest', endpoint: REST_ENDPOINT }],
+    ['gRPC transport', { protocol: 'grpc', endpoint: GRPC_ENDPOINT }],
+  ] as const) {
+    describe(name, () => {
+      let client: CamusClient;
+
+      beforeAll(async () => {
+        client = new CamusClient({ database: DATABASE, timeoutSeconds: 30, ...CREDENTIALS, ...options });
+        await client.createDatabase(undefined, { ifNotExists: true });
+      });
+
+      afterAll(async () => {
+        await client.close();
+      });
+
+      it('creates, alters, renames, and drops a sequence', async () => {
+        const sequence = uniqueName('seq');
+        const renamed = `${sequence}_r`;
+
+        await client.execute(createSequenceStatement(sequence, { startWith: 100, incrementBy: 5 }));
+        expect(await client.nextSequenceValue(sequence)).toBe(100n);
+        expect(await client.nextSequenceValue(sequence)).toBe(105n);
+
+        await client.execute(`ALTER SEQUENCE \`${sequence}\` INCREMENT BY 10`);
+        await client.execute(`ALTER SEQUENCE \`${sequence}\` RENAME TO \`${renamed}\``);
+        expect(await client.nextSequenceValue(renamed)).toBe(115n);
+
+        await client.execute(dropSequenceStatement(renamed));
+        await expect(client.nextSequenceValue(renamed)).rejects.toThrow(CamusError);
+      });
+
+      it('fills a column default from a sequence', async () => {
+        const sequence = uniqueName('seq');
+        const table = uniqueName('seq_t');
+
+        try {
+          await client.executeDdl(createSequenceStatement(sequence));
+          await client.executeDdl(
+            `CREATE TABLE ${table} (id OID PRIMARY KEY NOT NULL, number INT64 DEFAULT (${nextValueExpression(sequence)}), subject STRING)`,
+          );
+
+          for (const subject of ['a', 'b', 'c']) {
+            await client.execute(`INSERT INTO ${table} (id, subject) VALUES (@id, @subject)`, {
+              id: camus.id(CamusObjectId.generateAsString()),
+              subject,
+            });
+          }
+
+          const result = await client.query<{ number: number }>(
+            `SELECT number FROM ${table} ORDER BY number`,
+          );
+          expect(result.rows.map((row) => row.number)).toEqual([1, 2, 3]);
+        } finally {
+          await client.executeDdl(`DROP TABLE ${table}`).catch(() => undefined);
+          await client.executeDdl(dropSequenceStatement(sequence, { ifExists: true })).catch(() => undefined);
+        }
+      });
+    });
+  }
 });
 
 describe('unsupported column types', () => {

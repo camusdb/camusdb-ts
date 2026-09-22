@@ -273,6 +273,10 @@ Each helper validates its argument, so a bad value is reported at the call site 
 server. `camus.id` takes the 24 hexadecimal characters of an ObjectId, and `camus.uuid` takes the
 canonical hyphenated string.
 
+A UUID string is always sent as a `Uuid`, also when an array declares its element type as
+`ColumnType.Id`. A 16-byte UUID can never be a 12-byte ObjectId, so the server never matches it
+against an `OID` column. `camus.array(uuids, ColumnType.Id)` therefore sends a `Uuid` array.
+
 ---
 
 ## Types
@@ -461,6 +465,40 @@ Three codes belong to this feature:
 
 A read without a snapshot that keeps seeing a row change under it fails with the retryable
 `CADB0504`, which `withRetry` and `client.transaction` already retry.
+
+### Sequences
+
+A server from 0.13.2 on has sequences. A sequence stores `int64` values only, has a positive
+increment, and never cycles. The server refuses `CYCLE` with `CADB0533`, because a counter that
+wraps would issue again the values that committed rows already hold.
+
+`CREATE SEQUENCE`, `ALTER SEQUENCE`, and `DROP SEQUENCE` go to the DDL route. Two helpers compose
+the create and the drop statements:
+
+```ts
+import { createSequenceStatement, dropSequenceStatement, nextValueExpression } from 'camusdb';
+
+await client.executeDdl(createSequenceStatement('ticket_numbers', { startWith: 1000, ifNotExists: true }));
+
+await client.executeDdl(
+  `CREATE TABLE tickets (
+     id      OID PRIMARY KEY NOT NULL,
+     number  INT64 DEFAULT (${nextValueExpression('ticket_numbers')}),
+     subject STRING
+   )`,
+);
+
+const next = await client.nextSequenceValue('ticket_numbers'); // a bigint
+```
+
+When you leave out `minValue`, the minimum is the server default, 1. The helper never writes
+`NO MINVALUE`, because the server reads it as the smallest 64-bit value.
+
+`nextSequenceValue` runs `SELECT nextval('…')`, inside the `transaction` option when you give one. A
+rollback does not return the value: the server never issues a sequence value two times. Inside the
+same transaction, `SELECT currval('…')` returns the value again. The server accepts `nextval` only
+where it can count the values before the statement runs, so a `nextval` in a derived table fails
+with `CADB0547`.
 
 ---
 

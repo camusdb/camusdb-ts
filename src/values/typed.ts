@@ -50,7 +50,11 @@ export const camus = {
   /** An `id` column value: an ObjectId as its 24-character string. */
   id(value: string): TypedParameter {
     if (!OBJECT_ID.test(value)) {
-      invalid(`'${value}' is not an ObjectId: an ObjectId is 24 hexadecimal digits.`);
+      invalid(
+        isUuid(value)
+          ? `'${value}' is a UUID, not an ObjectId: an ObjectId is 24 hexadecimal digits. Use camus.uuid.`
+          : `'${value}' is not an ObjectId: an ObjectId is 24 hexadecimal digits.`,
+      );
     }
 
     return typed({ type: ColumnType.Id, strValue: value });
@@ -135,7 +139,7 @@ export const camus = {
 
     return typed({
       type: ColumnType.Array,
-      arrayElementType: elementType,
+      arrayElementType: uuidSafeElementType(elementType, items),
       arrayValues: items.map((item) =>
         item === null || item === undefined ? { type: ColumnType.Null } : encode(item, elementType),
       ),
@@ -163,6 +167,23 @@ let arrayEncoder: ((value: unknown, declared: ColumnType) => ColumnValue) | unde
 /** @internal */
 export function registerArrayEncoder(encode: (value: unknown, declared: ColumnType) => ColumnValue): void {
   arrayEncoder = encode;
+}
+
+/**
+ * The element type of an array declared as object ids whose elements are UUID strings: Uuid, since
+ * each such element is sent as a Uuid (see `encodeAs`) and the server refuses an array whose
+ * elements do not match its element type.
+ */
+function uuidSafeElementType(declared: ColumnType, items: readonly unknown[]): ColumnType {
+  if (declared !== ColumnType.Id) return declared;
+
+  for (const item of items) {
+    if (item === null || item === undefined) continue;
+
+    return typeof item === 'string' && isUuid(item) ? ColumnType.Uuid : declared;
+  }
+
+  return declared;
 }
 
 function toBigInt(value: number | bigint): bigint {

@@ -23,6 +23,7 @@ import type { CamusColumn } from './result-set.js';
 import { RowMapper } from './result-set.js';
 import { delay, isRetryable, withRetry } from './retry.js';
 import type { RetryOptions } from './retry.js';
+import { selectNextValueStatement } from './sequence.js';
 import { isValidDatabaseName } from './sql-syntax.js';
 import { ClientRuntime } from './runtime.js';
 import type { CamusRoutingAdvice } from './routing/advice.js';
@@ -770,6 +771,37 @@ export class CamusClient implements AsyncDisposable {
       signal: options.signal,
       timeoutSeconds: options.timeoutSeconds,
     });
+  }
+
+  // ─── Sequences ────────────────────────────────────────────────────────────
+
+  /**
+   * Draws the next value of a sequence with `SELECT nextval('…')` and returns it as a `bigint`.
+   *
+   * ```ts
+   * const ticket = await client.nextSequenceValue('ticket_numbers');
+   * ```
+   *
+   * With a `transaction`, the call runs inside it. A rollback does not return the value: the server
+   * never issues a sequence value two times. Inside the same transaction, `SELECT currval('…')`
+   * returns the value again.
+   *
+   * The server accepts `nextval` only where it can count the values before the statement runs. A
+   * `nextval` in a derived table fails with `CADB0547`.
+   *
+   * @throws {TypeError} when the name cannot be a sequence name.
+   */
+  async nextSequenceValue(name: string, options: StatementOptions = {}): Promise<bigint> {
+    const value = await this.scalar(selectNextValueStatement(name), undefined, {
+      ...options,
+      int64: 'bigint',
+    });
+
+    if (typeof value !== 'bigint') {
+      throw new CamusError(CamusErrorCode.Generic, `nextval('${name}') returned no value.`);
+    }
+
+    return value;
   }
 
   // ─── Query result cache ───────────────────────────────────────────────────

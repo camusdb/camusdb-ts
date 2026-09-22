@@ -91,8 +91,14 @@ export function encodeAs(value: unknown, declared: ColumnType): ColumnValue {
     case ColumnType.Null:
       return { type: ColumnType.Null };
 
-    case ColumnType.Id:
-      return { type: ColumnType.Id, strValue: asIdString(value) };
+    case ColumnType.Id: {
+      const id = asIdString(value);
+
+      // A UUID is 16 bytes and an object id is 12, so a UUID string can never be an object id. Sent
+      // as Id, its 36 characters equal no stored value and the server refuses it; as a Uuid it
+      // compares with a uuid column.
+      return isUuid(id) ? encodeUuid(id) : { type: ColumnType.Id, strValue: id };
+    }
 
     case ColumnType.String:
       return { type: ColumnType.String, strValue: asString(value) };

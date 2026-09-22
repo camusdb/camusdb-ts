@@ -32,6 +32,12 @@ numbers follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   (`CADB0540`), and `LargeValueNotResolved` (`CADB0541`). A server that predates large-value storage
   refuses the `STORAGE` clause as a parse error, so the live cases for it are opt-in with
   `CAMUS_LIVE_LARGE_VALUES=true`.
+- Sequences. `CREATE SEQUENCE`, `ALTER SEQUENCE`, and `DROP SEQUENCE` now go to the DDL route. An
+  older client sent them to the data route. `createSequenceStatement`, `dropSequenceStatement`,
+  `nextValueExpression`, and `selectNextValueStatement` compose the text, and
+  `client.nextSequenceValue` draws one value as a `bigint`. A CamusDB sequence never cycles, so the
+  options have no `cycle`. The helper never writes `NO MINVALUE`, because the server reads it as
+  the smallest 64-bit value and not as the default. Sequences need a server from 0.13.2 on.
 - `CamusErrorCode.EndpointUnreachable` (`CADB0001`). The driver raises it when a request never
   reached a server, so the same work is safe to run again on another endpoint.
 
@@ -45,6 +51,12 @@ numbers follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- A UUID string declared as an object id now travels as a `Uuid`. `camus.array(uuids, ColumnType.Id)`
+  sent each element as 36 characters of `Id` text, which equals no stored value. So `IN` returned
+  no rows, `NOT IN` returned every row, and `=` failed. A UUID is 16 bytes and an ObjectId is 12,
+  so a UUID can never be an ObjectId. Such an array now has the `Uuid` element type. An ObjectId
+  string keeps the `Id` type. `camus.id` still refuses a UUID, and its message now names
+  `camus.uuid`.
 - `validateIdentifier` now refuses an identifier that ends with a backslash, as `validateSqlLiteral`
   already refused a literal that does. CamusDB's lexer reads a backslash and the character after it
   as one unit, so such a name consumed its own closing backtick and the statement parsed as

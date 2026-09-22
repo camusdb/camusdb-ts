@@ -595,6 +595,10 @@ describe('statement classification', () => {
     expect(isDdlStatement('  create unique index ix ON robots (name)')).toBe(true);
     expect(isDdlStatement('CREATE OR REPLACE VIEW v AS SELECT 1')).toBe(true);
     expect(isDdlStatement('TRUNCATE robots')).toBe(true);
+    expect(isDdlStatement('CREATE SEQUENCE s START WITH 1')).toBe(true);
+    expect(isDdlStatement('drop sequence if exists s')).toBe(true);
+    expect(isDdlStatement('ALTER SEQUENCE s RENAME TO t')).toBe(true);
+    expect(isDdlStatement("SELECT nextval('s')")).toBe(false);
     expect(isDdlStatement('REFRESH MATERIALIZED VIEW v')).toBe(false);
     expect(isDdlStatement('SELECT 1')).toBe(false);
   });

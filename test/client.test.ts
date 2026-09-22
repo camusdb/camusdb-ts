@@ -8,6 +8,7 @@ import { stringifyLossless } from '../src/json.js';
 import { CamusLocking } from '../src/options.js';
 import { CamusPreparedStatementPolicy } from '../src/prepared/policy.js';
 import { CamusStatementRouter } from '../src/routing/router.js';
+import { createSequenceStatement, dropSequenceStatement } from '../src/sequence.js';
 import { CamusTokenProvider } from '../src/auth/token-provider.js';
 import { CamusTransportPool } from '../src/transport/transport-pool.js';
 import { camus } from '../src/values/typed.js';
@@ -296,6 +297,40 @@ describe('execute', () => {
     await expect(client().rewriteStorage('do`cs')).rejects.toThrow(TypeError);
 
     expect(server.callCount('execute-sql-ddl')).toBe(0);
+  });
+});
+
+describe('sequences', () => {
+  it('sends a sequence statement to the DDL route', async () => {
+    server.json('execute-sql-ddl', { status: 'ok' });
+
+    const subject = client();
+
+    await subject.execute(createSequenceStatement('tickets', { startWith: 100, incrementBy: 5 }));
+    await subject.execute('ALTER SEQUENCE `tickets` RENAME TO `tickets_2`');
+    await subject.execute(dropSequenceStatement('tickets_2', { ifExists: true }));
+
+    expect(server.requestsTo('execute-sql-ddl').map((r) => (r.body as Record<string, unknown>).sql)).toEqual([
+      'CREATE SEQUENCE `tickets` START WITH 100 INCREMENT BY 5',
+      'ALTER SEQUENCE `tickets` RENAME TO `tickets_2`',
+      'DROP SEQUENCE IF EXISTS `tickets_2`',
+    ]);
+    expect(server.callCount('execute-sql-non-query')).toBe(0);
+  });
+
+  it('draws the next value as a bigint', async () => {
+    queryRoute([{ name: 'nextval', type: ColumnType.Integer64 }], [[105]]);
+
+    expect(await client().nextSequenceValue('tickets')).toBe(105n);
+    expect((server.requestsTo('execute-sql-query')[0]!.body as Record<string, unknown>).sql).toBe(
+      "SELECT nextval('tickets')",
+    );
+  });
+
+  it('refuses a sequence name that cannot be quoted, before any round trip', async () => {
+    await expect(client().nextSequenceValue('tic`kets')).rejects.toThrow(TypeError);
+
+    expect(server.callCount('execute-sql-query')).toBe(0);
   });
 });
 

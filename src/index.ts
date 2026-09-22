@@ -79,6 +79,14 @@ export {
   setColumnStorageStatement,
 } from './column-storage.js';
 
+export {
+  createSequenceStatement,
+  dropSequenceStatement,
+  nextValueExpression,
+  selectNextValueStatement,
+} from './sequence.js';
+export type { CamusSequenceOptions } from './sequence.js';
+
 export { CamusObjectId } from './object-id.js';
 export { CamusVector } from './vector.js';
 

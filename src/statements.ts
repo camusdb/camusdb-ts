@@ -45,6 +45,11 @@ const DDL_PREFIXES = [
   'CREATE MATERIALIZED VIEW',
   'DROP MATERIALIZED VIEW',
   'ALTER MATERIALIZED VIEW',
+  // Sequences. ALTER SEQUENCE covers both the option form and RENAME TO. COMMENT ON SEQUENCE is
+  // absent, as COMMENT ON is for every other object: the data route handles it itself.
+  'CREATE SEQUENCE',
+  'DROP SEQUENCE',
+  'ALTER SEQUENCE',
 ];
 
 const DML_PREFIXES = ['INSERT', 'UPDATE', 'DELETE'];

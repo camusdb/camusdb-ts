@@ -6,7 +6,7 @@ import { CamusError } from '../src/errors.js';
 import { CamusObjectId } from '../src/object-id.js';
 import { CamusVector } from '../src/vector.js';
 import { decodeValue } from '../src/values/decode.js';
-import { encodeParameter, encodeParameters } from '../src/values/encode.js';
+import { encodeAs, encodeParameter, encodeParameters } from '../src/values/encode.js';
 import { dateToDayTicks, dateToTicks, ticksToDate } from '../src/values/ticks.js';
 import { camus } from '../src/values/typed.js';
 import { bytesToUuid, halvesToUuid, isUuid, uuidToBytes, uuidToHalves } from '../src/values/uuid.js';
@@ -262,6 +262,49 @@ describe('camus helpers', () => {
 
     expect(value.arrayElementType).toBe(ColumnType.Float64);
     expect(value.arrayValues!.map((item) => item.floatValue)).toEqual([1, 2]);
+  });
+
+  it('sends a UUID declared as an object id as a Uuid', () => {
+    const uuid = '550e8400-e29b-41d4-a716-446655440000';
+    const { high, low } = uuidToHalves(uuid);
+
+    expect(encodeAs(uuid, ColumnType.Id)).toEqual({
+      type: ColumnType.Uuid,
+      strValue: uuid,
+      uuidHigh: high,
+      longValue: low,
+    });
+  });
+
+  it('keeps an object id string declared as an object id', () => {
+    expect(encodeAs('68000000000000000000abcd', ColumnType.Id)).toEqual({
+      type: ColumnType.Id,
+      strValue: '68000000000000000000abcd',
+    });
+  });
+
+  it('makes an array of UUIDs declared as object ids a Uuid array', () => {
+    const uuids = ['550e8400-e29b-41d4-a716-446655440000', '6ba7b810-9dad-11d1-80b4-00c04fd430c8'];
+    const value = encodeParameter(camus.array([null, ...uuids], ColumnType.Id));
+
+    expect(value.arrayElementType).toBe(ColumnType.Uuid);
+    expect(value.arrayValues!.map((item) => item.type)).toEqual([
+      ColumnType.Null,
+      ColumnType.Uuid,
+      ColumnType.Uuid,
+    ]);
+    expect(value.arrayValues!.slice(1).map((item) => item.strValue)).toEqual(uuids);
+  });
+
+  it('keeps an array of object ids an Id array', () => {
+    const value = encodeParameter(camus.array(['68000000000000000000abcd'], ColumnType.Id));
+
+    expect(value.arrayElementType).toBe(ColumnType.Id);
+    expect(value.arrayValues![0]!.type).toBe(ColumnType.Id);
+  });
+
+  it('names camus.uuid when camus.id receives a UUID', () => {
+    expect(() => camus.id('550e8400-e29b-41d4-a716-446655440000')).toThrow(/camus\.uuid/);
   });
 
   it('passes a hand-built value through', () => {

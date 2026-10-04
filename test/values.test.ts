@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 
 import { ColumnType, columnTypeName, isColumnType } from '../src/column-type.js';
 import { columnValueToJson } from '../src/column-value.js';
+import { CamusErrorCode } from '../src/error-codes.js';
 import { CamusError } from '../src/errors.js';
 import { CamusObjectId } from '../src/object-id.js';
 import { CamusVector } from '../src/vector.js';
@@ -207,6 +208,30 @@ describe('encodeParameter', () => {
     expect(value.arrayValues![1]!.strValue).toBe('b');
   });
 
+  it('makes a number array with a fractional element a float array', () => {
+    const value = encodeParameter([2, null, 1.5, 3]);
+
+    expect(value.arrayElementType).toBe(ColumnType.Float64);
+    expect(value.arrayValues!.map((item) => item.type)).toEqual([
+      ColumnType.Float64,
+      ColumnType.Null,
+      ColumnType.Float64,
+      ColumnType.Float64,
+    ]);
+    expect(value.arrayValues!.map((item) => item.floatValue)).toEqual([2, undefined, 1.5, 3]);
+  });
+
+  it('keeps a number array of whole values an int64 array', () => {
+    const value = encodeParameter([1, 2, 3]);
+
+    expect(value.arrayElementType).toBe(ColumnType.Integer64);
+    expect(value.arrayValues!.map((item) => item.longValue)).toEqual([1n, 2n, 3n]);
+  });
+
+  it('does not widen an array whose type a bigint states', () => {
+    expect(() => encodeParameter([1n, 1.5])).toThrow(/integer/);
+  });
+
   it('infers nothing from an empty array', () => {
     const value = encodeParameter([]);
 
@@ -214,8 +239,41 @@ describe('encodeParameter', () => {
     expect(value.arrayValues).toHaveLength(0);
   });
 
+  it('sends a null element of a scalar array as a null cell', () => {
+    const integers = encodeParameter([null, 5, null]);
+
+    expect(integers.arrayElementType).toBe(ColumnType.Integer64);
+    expect(integers.arrayValues!.map((item) => item.type)).toEqual([
+      ColumnType.Null,
+      ColumnType.Integer64,
+      ColumnType.Null,
+    ]);
+    expect(integers.arrayValues![1]!.longValue).toBe(5n);
+
+    const floats = encodeParameter([null, 1.25]);
+
+    expect(floats.arrayElementType).toBe(ColumnType.Float64);
+    expect(floats.arrayValues!.map((item) => item.floatValue)).toEqual([undefined, 1.25]);
+
+    const bools = encodeParameter([false, null]);
+
+    expect(bools.arrayElementType).toBe(ColumnType.Bool);
+    expect(bools.arrayValues!.map((item) => item.type)).toEqual([ColumnType.Bool, ColumnType.Null]);
+  });
+
   it('refuses an array whose elements are all null', () => {
     expect(() => encodeParameter([null, null])).toThrow(CamusError);
+
+    let caught: unknown;
+
+    try {
+      encodeParameter([null, undefined]);
+    } catch (error) {
+      caught = error;
+    }
+
+    expect(caught).toBeInstanceOf(CamusError);
+    expect((caught as CamusError).code).toBe(CamusErrorCode.InvalidParameter);
   });
 
   it('refuses a value it cannot map', () => {
@@ -262,6 +320,31 @@ describe('camus helpers', () => {
 
     expect(value.arrayElementType).toBe(ColumnType.Float64);
     expect(value.arrayValues!.map((item) => item.floatValue)).toEqual([1, 2]);
+  });
+
+  it('states the element type of an array whose elements are all null', () => {
+    const value = encodeParameter(camus.array([null, null], ColumnType.Integer64));
+
+    expect(value.arrayElementType).toBe(ColumnType.Integer64);
+    expect(value.arrayValues!.map((item) => item.type)).toEqual([ColumnType.Null, ColumnType.Null]);
+  });
+
+  it('converts each element to a stated element type and keeps null elements', () => {
+    const value = encodeParameter(camus.array([1, null], ColumnType.String));
+
+    expect(value.arrayElementType).toBe(ColumnType.String);
+    expect(value.arrayValues!.map((item) => item.type)).toEqual([ColumnType.String, ColumnType.Null]);
+    expect(value.arrayValues![0]!.strValue).toBe('1');
+  });
+
+  it('states a float32 array', () => {
+    const value = encodeParameter(camus.array([1.5, -2], ColumnType.Float32));
+
+    expect(value.arrayElementType).toBe(ColumnType.Float32);
+    expect(value.arrayValues).toEqual([
+      { type: ColumnType.Float32, floatValue: 1.5 },
+      { type: ColumnType.Float32, floatValue: -2 },
+    ]);
   });
 
   it('sends a UUID declared as an object id as a Uuid', () => {
@@ -330,8 +413,13 @@ describe('encodeParameters', () => {
     expect(encodeParameters({})).toBeUndefined();
   });
 
+  it('keeps a name that already has its leading @', () => {
+    expect([...encodeParameters({ '@year': 1977 })!.keys()]).toEqual(['@year']);
+  });
+
   it('refuses the same parameter written both ways', () => {
     expect(() => encodeParameters({ year: 1, '@year': 2 })).toThrow(CamusError);
+    expect(() => encodeParameters({ year: 1, '@year': 2 })).toThrow(/'@year'/);
   });
 });
 

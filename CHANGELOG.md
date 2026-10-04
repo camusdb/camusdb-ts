@@ -51,6 +51,11 @@ numbers follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- An array of numbers whose first value is whole and whose other values are not now binds as a
+  `Float64` array. `[2, 1.5]` took `Integer64` from its first element, and `1.5` then failed with
+  "An int64 parameter needs an integer". JavaScript has one number type, so the first value alone
+  does not show the caller's intent. An array whose first element is a `bigint` or a `camus.*`
+  value keeps the type that element states.
 - A UUID string declared as an object id now travels as a `Uuid`. `camus.array(uuids, ColumnType.Id)`
   sent each element as 36 characters of `Id` text, which equals no stored value. So `IN` returned
   no rows, `NOT IN` returned every row, and `=` failed. A UUID is 16 bytes and an ObjectId is 12,

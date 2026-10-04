@@ -572,6 +572,9 @@ describe('gRPC endpoint health', () => {
   /** grpc-js reports `UNAVAILABLE` as status code 14. */
   const GRPC_UNAVAILABLE = 14;
 
+  /** grpc-js reports `UNAUTHENTICATED` as status code 16. */
+  const GRPC_UNAUTHENTICATED = 16;
+
   /** A failure as grpc-js raises it: a status code, a detail, and no trailers. */
   function status(code: number, details: string): GrpcStatusError {
     return Object.assign(new Error(`${String(code)} ${details}`), { code, details });
@@ -668,6 +671,43 @@ describe('gRPC endpoint health', () => {
     expect(error.code).toBe('CADB0504');
     expect(error.message).toBe('retry');
     expect(pool.isQuarantined('http://a:9005')).toBe(false);
+  });
+
+  /**
+   * The shape a `BatchExecute` stream ends with when the token it opened with expires. The stream
+   * is long-lived and carries the bearer it was built with, so the server refuses the next
+   * operation on it. The driver must read that as `CADB0516`, which the authenticating transport
+   * replays on, and must leave the endpoint in rotation: the node answered, and every stream in the
+   * pool reaches this point together.
+   */
+  it('reads an expired token on a stream as an authentication failure and keeps the endpoint', () => {
+    const pool = new CamusEndpointPool('http://a:9005,http://b:9005');
+
+    const expired: GrpcStatusError = Object.assign(status(GRPC_UNAUTHENTICATED, 'Authentication failed'), {
+      metadata: fakeMetadata({
+        'camus-error-code': 'CADB0516',
+        'camus-error-message': 'Authentication failed',
+      }),
+    });
+
+    const error = translateGrpcFailure(pool, 'http://b:9005', expired);
+
+    expect(error.code).toBe(CamusErrorCode.AuthenticationFailed);
+    expect(pool.isQuarantined('http://b:9005')).toBe(false);
+  });
+
+  it('reads a bare unauthenticated status as an authentication failure and keeps the endpoint', () => {
+    // The authentication gate at stream open can refuse with no trailers at all.
+    const pool = new CamusEndpointPool('http://a:9005,http://b:9005');
+
+    const error = translateGrpcFailure(
+      pool,
+      'http://b:9005',
+      status(GRPC_UNAUTHENTICATED, 'Authentication failed'),
+    );
+
+    expect(error.code).toBe(CamusErrorCode.AuthenticationFailed);
+    expect(pool.isQuarantined('http://b:9005')).toBe(false);
   });
 
   it('works without a pool, for a transport that was built without one', () => {

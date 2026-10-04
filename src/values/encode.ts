@@ -40,6 +40,8 @@ export type Parameters = Readonly<Record<string, ParameterValue>>;
  *   embedding, and a packed float32 buffer has no other meaning in CamusDB.
  * - `CamusObjectId` — `Id`.
  * - an array — `Array`, with the element type inferred from the first element that is not null.
+ *   When that element is a whole `number` and another element is a `number` that is not, the
+ *   element type is `Float64`.
  */
 export function encodeParameter(value: ParameterValue): ColumnValue {
   if (isTypedParameter(value)) return value.value;
@@ -205,6 +207,14 @@ function encodeArray(value: unknown, declaredElementType: ColumnType): ColumnVal
     for (const item of value) {
       if (item === null || item === undefined) continue;
       elementType = inferElementType(item);
+
+      // JavaScript has one number type, so `[2, 1.5]` is a float array whose first value happens
+      // to be whole. Read from the first number alone it would be Integer64, and 1.5 would then
+      // fail to encode. A bigint or a `camus.*` element states its type, so it is not widened.
+      if (typeof item === 'number' && elementType === ColumnType.Integer64 && hasFractionalNumber(value)) {
+        elementType = ColumnType.Float64;
+      }
+
       break;
     }
 
@@ -224,6 +234,15 @@ function encodeArray(value: unknown, declaredElementType: ColumnType): ColumnVal
   }
 
   return { type: ColumnType.Array, arrayElementType: elementType, arrayValues: items };
+}
+
+/** True when some element is a `number` that is not an integer, `NaN` and the infinities included. */
+function hasFractionalNumber(items: readonly unknown[]): boolean {
+  for (const item of items) {
+    if (typeof item === 'number' && !Number.isInteger(item)) return true;
+  }
+
+  return false;
 }
 
 function inferElementType(item: unknown): ColumnType {

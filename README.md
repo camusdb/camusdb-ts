@@ -231,7 +231,7 @@ change what the statement means.
 | `Uint8Array`, `Buffer`, `ArrayBuffer` | `Bytes` |
 | `Float32Array` | `Bytes`, packed as a vector |
 | `CamusObjectId` | `Id` |
-| an array | `Array`, with the element type read from the first element that is not null |
+| an array | `Array`, with the element type read from the first element that is not null. When that element is a whole `number` and another `number` element is not whole, the element type is `Float64`. |
 
 A UUID-shaped string is **not** read as a `uuid`. A 36-character string that happens to look like
 one would otherwise change type silently.

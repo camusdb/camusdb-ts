@@ -1,0 +1,70 @@
+name: Live
+
+# Runs the live suite (test/live) against a real CamusDB server, over both REST and gRPC.
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      image:
+        description: 'The CamusDB server image to test against'
+        required: false
+
+concurrency:
+  group: live-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # The newest published server, so each run tests the driver against the current release.
+  # Large-value storage and sequences need 0.13.3 or later. INSERT … RETURNING needs 0.14.1 or later.
+  CAMUS_IMAGE: ${{ inputs.image || 'camusdb/camusdb:latest' }}
+  CAMUS_LIVE_ENDPOINT: http://localhost:5095
+  CAMUS_LIVE_GRPC_ENDPOINT: http://localhost:5096
+  CAMUS_LIVE_DATABASE: camusdb_ts_live
+  CAMUS_LIVE_LARGE_VALUES: 'true'
+  CAMUS_LIVE_SEQUENCES: 'true'
+  CAMUS_LIVE_RETURNING: 'true'
+
+jobs:
+  live:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: Start CamusDB
+        run: |
+          docker run --detach --name camusdb \
+            --publish 5095:5095 \
+            --publish 5096:5096 \
+            "$CAMUS_IMAGE"
+
+      - run: npm ci
+
+      - name: Wait for CamusDB
+        run: |
+          # The health probe answers 200 only when the node can serve requests, and 503 before.
+          for attempt in $(seq 1 60); do
+            if curl --fail --silent --show-error "$CAMUS_LIVE_ENDPOINT/v1/cluster/health"; then
+              echo
+              echo "CamusDB is ready."
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "CamusDB did not become ready in 120 seconds." >&2
+          docker logs camusdb
+          exit 1
+
+      - run: npm run test:live
+
+      - name: Server logs
+        if: failure()
+        run: docker logs camusdb

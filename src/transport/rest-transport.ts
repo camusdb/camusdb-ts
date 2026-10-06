@@ -55,6 +55,13 @@ interface StatusEnvelope {
 interface NonQueryResponseBody extends StatusEnvelope {
   rows?: number;
   routing?: unknown;
+
+  /** The output columns of an `INSERT … RETURNING`. Absent without `RETURNING`, and absent when the
+   * request set `discardReturningRows`. */
+  columns?: unknown;
+
+  /** The `RETURNING` rows, positional against `columns`, in the encoding of a query's `rows`. */
+  returningRows?: unknown;
 }
 
 interface StartTransactionResponseBody extends StatusEnvelope {
@@ -247,9 +254,14 @@ export class RestTransport implements CamusTransport {
       request.signal,
     );
 
+    // `columns` is present only for an INSERT … RETURNING whose rows were not discarded. The rows
+    // use the positional encoding of a query response, so the query decoder reads them.
     return {
       affectedRows: asNumber(body.rows),
       routing: routingAdviceFromJson(body),
+      returning: Array.isArray(body.columns)
+        ? resultSetFromWire(body.columns, body.returningRows)
+        : undefined,
     };
   }
 
@@ -614,6 +626,10 @@ function buildQueryBody(
   if (hasTransaction(request)) {
     body.txnIdPT = request.txnIdPT;
     body.txnIdCounter = request.txnIdCounter;
+  } else if (request.autocommitOptions !== undefined) {
+    // A read leaves the options unset. A non-query, and an INSERT … RETURNING sent to the query
+    // endpoint, set them for the writable transaction the server begins.
+    Object.assign(body, concurrencyFields(request.autocommitOptions));
   }
 
   if (request.routingAcceptVersion > 0) body.routingAcceptVersion = request.routingAcceptVersion;
@@ -627,9 +643,8 @@ function buildNonQueryBody(
 ): Record<string, unknown> {
   const body = buildQueryBody(request, binding);
 
-  if (!hasTransaction(request) && request.autocommitOptions !== undefined) {
-    Object.assign(body, concurrencyFields(request.autocommitOptions));
-  }
+  // Sent only when true, so the request keeps the shape that a server without RETURNING accepts.
+  if (request.discardReturningRows === true) body.discardReturningRows = true;
 
   return body;
 }

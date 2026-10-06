@@ -42,8 +42,9 @@ export interface TransportSqlRequest {
 
   /**
    * Concurrency options for the short transaction the server begins for this statement. They apply
-   * only when there is no explicit transaction, and are absent on the read-query path, which has
-   * no locking mode.
+   * only when there is no explicit transaction. A read runs in a read-only snapshot with no locking
+   * mode, so the query path leaves them absent, except for an `INSERT … RETURNING` that is sent to
+   * the query endpoint: that statement begins a writable transaction, as a non-query does.
    */
   readonly autocommitOptions?: CamusTransactionOptions | undefined;
 
@@ -72,6 +73,15 @@ export interface TransportSqlRequest {
    * the default, asks for none and keeps the exact pre-routing wire shape.
    */
   readonly routingAcceptVersion: number;
+
+  /**
+   * Asks the non-query endpoint for the row count only, without the rows of an
+   * `INSERT … RETURNING`. The server still checks the `RETURNING` list and the `SELECT` privilege
+   * it needs. A statement without `RETURNING` is not affected, so `execute` sets it on every
+   * statement. The query endpoints refuse it, so only the non-query path sets it. When it is unset
+   * or false, the request keeps the shape that a server without `RETURNING` accepts.
+   */
+  readonly discardReturningRows?: boolean | undefined;
 
   readonly signal?: AbortSignal | undefined;
 }
@@ -117,6 +127,13 @@ export interface QueryTransportResult {
 export interface NonQueryTransportResult {
   readonly affectedRows: number;
   readonly routing?: CamusRoutingAdvice | undefined;
+
+  /**
+   * The rows of an `INSERT … RETURNING`, one for each inserted row, in insert order. It is
+   * `undefined` for a statement without `RETURNING` and for a request that set
+   * `discardReturningRows`. It has columns and no rows when the statement inserted no rows.
+   */
+  readonly returning?: CamusResultSet | undefined;
 }
 
 /** A statement the server registered: the placeholder names it declares, in binding order. */
@@ -182,7 +199,10 @@ export interface CamusTransport {
    */
   executeQueryStream(request: TransportSqlRequest): Promise<CamusRowSource>;
 
-  /** Runs an `INSERT`, `UPDATE`, or `DELETE` and reports the affected-row count. */
+  /**
+   * Runs an `INSERT`, `UPDATE`, or `DELETE` and reports the affected-row count, plus the rows of an
+   * `INSERT … RETURNING` unless the request set `discardReturningRows`.
+   */
   executeNonQuery(request: TransportSqlRequest): Promise<NonQueryTransportResult>;
 
   /**

@@ -5,6 +5,8 @@
  * file that was distributed with this source code.
  */
 
+import { hasReturningKeyword } from './sql-syntax.js';
+
 /**
  * Classifies a statement by its leading keywords.
  *
@@ -54,6 +56,8 @@ const DDL_PREFIXES = [
 
 const DML_PREFIXES = ['INSERT', 'UPDATE', 'DELETE'];
 
+const INSERT_PREFIXES = ['INSERT'];
+
 /**
  * The statements the server accepts a registration for: the repeatable data statements, whose
  * whole point is running many times with different values. Schema and administration statements
@@ -80,6 +84,14 @@ export function isDdlStatement(sql: string): boolean {
 /** True when the statement writes rows and reports how many. */
 export function isDmlStatement(sql: string): boolean {
   return startsWithAny(sql, DML_PREFIXES);
+}
+
+/**
+ * True when the statement is an `INSERT` with a `RETURNING` list, which sends back the rows it
+ * inserted. The keyword test skips literals, comments, delimited names, and placeholders.
+ */
+export function isInsertReturning(sql: string): boolean {
+  return startsWithAny(sql, INSERT_PREFIXES) && hasReturningKeyword(sql);
 }
 
 /** True when the statement may be registered as a prepared statement. */

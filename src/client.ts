@@ -20,7 +20,7 @@ import { PrepareDecision } from './prepared/policy.js';
 import type { EvictedStatement } from './prepared/policy.js';
 import { CamusQueryStream } from './query-stream.js';
 import type { CamusColumn } from './result-set.js';
-import { RowMapper } from './result-set.js';
+import { CamusResultSet, RowMapper } from './result-set.js';
 import { delay, isRetryable, withRetry } from './retry.js';
 import type { RetryOptions } from './retry.js';
 import { selectNextValueStatement } from './sequence.js';
@@ -30,9 +30,14 @@ import type { CamusRoutingAdvice } from './routing/advice.js';
 import { ROUTING_ACCEPT_VERSION } from './routing/advice.js';
 import { CamusRouteOpKind } from './routing/route-cache.js';
 import type { CamusStatementRouter } from './routing/router.js';
-import { isDdlStatement, isPreparableStatement, runsInOwnTransaction } from './statements.js';
+import {
+  isDdlStatement,
+  isInsertReturning,
+  isPreparableStatement,
+  runsInOwnTransaction,
+} from './statements.js';
 import { CamusTransaction } from './transaction.js';
-import type { CamusBranchRow, TransportSqlRequest } from './transport/transport.js';
+import type { CamusBranchRow, NonQueryTransportResult, TransportSqlRequest } from './transport/transport.js';
 import type { Int64Mode } from './values/decode.js';
 import type { Parameters } from './values/encode.js';
 import { encodeParameters } from './values/encode.js';
@@ -54,7 +59,11 @@ export interface StatementOptions {
 
 /** Options for a statement that begins its own short transaction. */
 export interface AutocommitStatementOptions extends StatementOptions {
-  /** Concurrency knobs for the short transaction the server begins for this statement. */
+  /**
+   * Concurrency knobs for the short transaction the server begins for this statement. A read
+   * ignores them: it runs in a read-only snapshot. They apply to a write, which includes an
+   * `INSERT … RETURNING` that is sent through `query` or `queryStream`.
+   */
   readonly transactionOptions?: CamusTransactionOptions | undefined;
 }
 
@@ -67,6 +76,12 @@ export interface QueryResult<T> {
   readonly columns: CamusColumn[];
 
   readonly rowCount: number;
+
+  /**
+   * The inserted-row count of an `INSERT … RETURNING` that `query` ran, or `undefined` for a read.
+   * The server sends one row for each inserted row, so it equals `rowCount`.
+   */
+  readonly affectedRows?: number | undefined;
 
   /** How a cache-hinted `SELECT` resolved, or `undefined` when the statement carried no hint. */
   readonly cacheMetadata?: CamusCacheMetadata | undefined;
@@ -227,12 +242,28 @@ export class CamusClient implements AsyncDisposable {
    * column to the JavaScript value its declared type calls for.
    *
    * Use `queryStream` when the result may be large: this method holds every row in memory.
+   *
+   * An `INSERT … RETURNING` is accepted here too. It goes to the non-query route, and the rows are
+   * the stored values of the inserted rows, in insert order:
+   *
+   * ```ts
+   * const { rows } = await client.query<{ id: string }>(
+   *   'INSERT INTO robots (id, name) VALUES (GEN_ID(), @name) RETURNING id',
+   *   { name: 'R2-D2' },
+   * );
+   * ```
+   *
+   * All the rows of an `INSERT … RETURNING` arrive in one reply. On gRPC the server refuses a reply
+   * larger than 4 MiB with `CADB0550`, before the commit, so the statement stores nothing. Use
+   * `queryStream` for a large `INSERT … SELECT … RETURNING`.
    */
   async query<T = Record<string, unknown>>(
     sql: string,
     parameters?: Parameters,
-    options: StatementOptions = {},
+    options: AutocommitStatementOptions = {},
   ): Promise<QueryResult<T>> {
+    if (isInsertReturning(sql)) return this.queryInsertReturning<T>(sql, parameters, options);
+
     const encoded = encodeParameters(parameters);
     const transaction = options.transaction;
 
@@ -257,11 +288,14 @@ export class CamusClient implements AsyncDisposable {
     };
   }
 
-  /** Runs a `SELECT` and reads its first row, or `undefined` when it returned none. */
+  /**
+   * Runs a `SELECT` and reads its first row, or `undefined` when it returned none. It accepts an
+   * `INSERT … RETURNING` as `query` does.
+   */
   async queryOne<T = Record<string, unknown>>(
     sql: string,
     parameters?: Parameters,
-    options: StatementOptions = {},
+    options: AutocommitStatementOptions = {},
   ): Promise<T | undefined> {
     const result = await this.query<T>(sql, parameters, options);
     return result.rows[0];
@@ -273,11 +307,19 @@ export class CamusClient implements AsyncDisposable {
    * ```ts
    * const total = await client.scalar<number>('SELECT COUNT(*) FROM robots');
    * ```
+   *
+   * It accepts an `INSERT … RETURNING` as `query` does, so it can read a generated key:
+   *
+   * ```ts
+   * const id = await client.scalar<string>('INSERT INTO robots (id, name) VALUES (GEN_ID(), @name) RETURNING id', {
+   *   name: 'R2-D2',
+   * });
+   * ```
    */
   async scalar<T = unknown>(
     sql: string,
     parameters?: Parameters,
-    options: StatementOptions = {},
+    options: AutocommitStatementOptions = {},
   ): Promise<T | undefined> {
     const result = await this.query(sql, parameters, options);
 
@@ -309,21 +351,39 @@ export class CamusClient implements AsyncDisposable {
    * neither path retries a statement on its own. Rows can reach this side before the statement's
    * own short transaction commits, so a late conflict surfaces from the iteration. Run the work in
    * `client.transaction`, or wrap the call in `withRetry`, when you need a retry.
+   *
+   * An `INSERT … RETURNING` is accepted here too, and goes to the same streaming query endpoint.
+   * Use this method for a `RETURNING` result that is too large for `query`. The server sends no row
+   * before the commit, so a conflict never surfaces mid-read for it. The stream reports no
+   * inserted-row count, so count the rows as you read them.
    */
   async queryStream<T = Record<string, unknown>>(
     sql: string,
     parameters?: Parameters,
-    options: StatementOptions = {},
+    options: AutocommitStatementOptions = {},
   ): Promise<CamusQueryStream<T>> {
     const encoded = encodeParameters(parameters);
     const transaction = options.transaction;
+    const insertReturning = isInsertReturning(sql);
 
     // A learned route still steers the send, which costs nothing, but the streaming endpoint's
-    // trailer carries no routing metadata, so nothing is negotiated or learned.
-    const route = await this.route(sql, CamusRouteOpKind.Query, transaction, options.signal);
+    // trailer carries no routing metadata, so nothing is negotiated or learned. An
+    // INSERT … RETURNING reuses the route learned for the write, which is where the rows live.
+    const route = await this.route(
+      sql,
+      insertReturning ? CamusRouteOpKind.NonQuery : CamusRouteOpKind.Query,
+      transaction,
+      options.signal,
+    );
 
     const request = await this.buildRequest(sql, encoded, route, transaction, options, {
       negotiateRouting: false,
+      // A read runs in a read-only snapshot with no locking mode, but an autocommit INSERT on the
+      // query endpoint begins a writable transaction that honors the same options as a non-query.
+      autocommitOptions:
+        insertReturning && transaction === undefined
+          ? this.resolveTransactionOptions(options.transactionOptions)
+          : undefined,
     });
 
     const source = await this.runtime.transport.executeQueryStream(request);
@@ -342,6 +402,10 @@ export class CamusClient implements AsyncDisposable {
    * ```
    *
    * A DDL statement is accepted here too and is sent to the DDL route, where it reports zero rows.
+   *
+   * For an `INSERT … RETURNING`, this reports the inserted-row count and the server does not send
+   * the rows. The server still checks the `RETURNING` list and the `SELECT` privilege that it needs.
+   * To read the rows, use `query`, `queryOne`, `scalar`, or `queryStream`.
    */
   async execute(
     sql: string,
@@ -835,11 +899,52 @@ export class CamusClient implements AsyncDisposable {
 
   // ─── Internals ────────────────────────────────────────────────────────────
 
+  /**
+   * Runs a write and reports its count only. `discardReturningRows` has no effect on a statement
+   * without `RETURNING`, so this sets it on every statement and does not parse the SQL for the clause.
+   */
   private async executeNonQuery(
     sql: string,
     parameters: Parameters | undefined,
     options: AutocommitStatementOptions,
   ): Promise<ExecuteResult> {
+    const result = await this.executeNonQueryCore(sql, parameters, options, true);
+
+    return { affectedRows: result.affectedRows, routingAdvice: result.routing };
+  }
+
+  /** Runs an `INSERT … RETURNING` on the non-query route and maps the rows it sent back. */
+  private async queryInsertReturning<T>(
+    sql: string,
+    parameters: Parameters | undefined,
+    options: AutocommitStatementOptions,
+  ): Promise<QueryResult<T>> {
+    const result = await this.executeNonQueryCore(sql, parameters, options, false);
+
+    // The server decides the shape. A reply without `columns` has nothing to map, but it still
+    // reports the count.
+    const resultSet = result.returning ?? CamusResultSet.EMPTY;
+    const mapper = new RowMapper(resultSet.columnNames, this.decodeOptions(options));
+
+    return {
+      rows: mapper.mapAll<T>(resultSet),
+      columns: resultSet.columns,
+      rowCount: resultSet.rowCount,
+      affectedRows: result.affectedRows,
+      routingAdvice: result.routing,
+    };
+  }
+
+  /**
+   * Runs a write on the non-query route. The endpoint, the negotiation flag, and the learning after
+   * a success follow the same routing rules as the query path.
+   */
+  private async executeNonQueryCore(
+    sql: string,
+    parameters: Parameters | undefined,
+    options: AutocommitStatementOptions,
+    discardReturningRows: boolean,
+  ): Promise<NonQueryTransportResult> {
     const encoded = encodeParameters(parameters);
     const transaction = options.transaction;
 
@@ -849,13 +954,14 @@ export class CamusClient implements AsyncDisposable {
       negotiateRouting: route.router !== undefined,
       autocommitOptions:
         transaction === undefined ? this.resolveTransactionOptions(options.transactionOptions) : undefined,
+      discardReturningRows,
     });
 
     const result = await this.runtime.transport.executeNonQuery(request);
 
     route.router?.learn(request.database, sql, CamusRouteOpKind.NonQuery, result.routing, route.revision);
 
-    return { affectedRows: result.affectedRows, routingAdvice: result.routing };
+    return result;
   }
 
   /**
@@ -918,7 +1024,11 @@ export class CamusClient implements AsyncDisposable {
     route: { endpoint: string; router: CamusStatementRouter | undefined },
     transaction: CamusTransaction | undefined,
     options: StatementOptions,
-    extra: { negotiateRouting: boolean; autocommitOptions?: CamusTransactionOptions | undefined },
+    extra: {
+      negotiateRouting: boolean;
+      autocommitOptions?: CamusTransactionOptions | undefined;
+      discardReturningRows?: boolean | undefined;
+    },
   ): Promise<TransportSqlRequest> {
     return {
       endpoint: route.endpoint,
@@ -928,6 +1038,7 @@ export class CamusClient implements AsyncDisposable {
       timeoutSeconds: options.timeoutSeconds ?? this.runtime.timeoutSeconds,
       prepared: await this.shouldPrepare(sql, route.endpoint, options),
       routingAcceptVersion: extra.negotiateRouting ? ROUTING_ACCEPT_VERSION : 0,
+      ...(extra.discardReturningRows === true ? { discardReturningRows: true } : {}),
       ...(transaction === undefined
         ? extra.autocommitOptions === undefined
           ? {}

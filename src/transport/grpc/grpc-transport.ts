@@ -225,7 +225,14 @@ export class GrpcTransport implements CamusTransport, CamusLoginClient {
 
       this.observeToken(result.token);
 
-      return { affectedRows: result.affectedRows, routing: result.routing };
+      return {
+        affectedRows: result.affectedRows,
+        routing: result.routing,
+        returning:
+          result.returningSchema === undefined
+            ? undefined
+            : buildResultSet(result.returningSchema, result.returningRows),
+      };
     });
   }
 
@@ -759,6 +766,9 @@ export class GrpcTransport implements CamusTransport, CamusLoginClient {
     // Forwarded for a prepared and an inline request alike: negotiation is a property of the
     // statement's execution, not of how its text travelled. Zero asks for nothing.
     wire.routingAcceptVersion = request.routingAcceptVersion;
+
+    // Set only by the non-query path: the query RPCs refuse a request that asks for no rows.
+    if (request.discardReturningRows === true) wire.discardReturningRows = true;
 
     return wire;
   }

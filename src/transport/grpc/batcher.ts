@@ -47,6 +47,15 @@ export interface BatchNonQueryResult {
   readonly affectedRows: number;
   readonly token: BatchCausalToken;
   readonly routing: CamusRoutingAdvice | undefined;
+
+  /**
+   * The output columns of an `INSERT … RETURNING`, or `undefined` for a statement without
+   * `RETURNING` and for a request that set `discardReturningRows`.
+   */
+  readonly returningSchema: GrpcResultSchema | undefined;
+
+  /** The `RETURNING` rows, aligned to `returningSchema`. Empty when the schema is `undefined`. */
+  readonly returningRows: GrpcResultRow[];
 }
 
 /** A prepared statement registered on one stream: the handle, and which stream minted it. */
@@ -981,6 +990,10 @@ export class GrpcBatcher {
             c: fromWire(reply.causalTokenC),
           },
           routing: decodeRoutingAdvice(reply.routing),
+          // returning_schema is a message field, so "unset" (no RETURNING, or count only) and "set
+          // with no rows" (a RETURNING that inserted nothing) stay distinct.
+          returningSchema: reply.returningSchema ?? undefined,
+          returningRows: reply.returningRows ?? [],
         } satisfies BatchNonQueryResult);
         return;
       }

@@ -160,6 +160,7 @@ export interface GrpcSqlRequest {
   positionalParameters?: GrpcValue[];
   priority?: number;
   routingAcceptVersion?: number;
+  discardReturningRows?: boolean;
 }
 
 export interface GrpcNonQueryReply {
@@ -169,6 +170,13 @@ export interface GrpcNonQueryReply {
   causalTokenN: number;
   warning: string;
   routing?: GrpcRoutingAdviceMessage | null;
+
+  /** The output columns of an `INSERT … RETURNING`. Null for a statement without `RETURNING` and for
+   * a request that set `discardReturningRows`. */
+  returningSchema?: GrpcResultSchema | null;
+
+  /** The `RETURNING` rows, aligned to `returningSchema`. */
+  returningRows?: GrpcResultRow[];
 }
 
 export interface GrpcDdlReply {

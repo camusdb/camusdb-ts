@@ -135,3 +135,85 @@ export function validateBareName(name: string, maxLength: number, parameterName:
     );
   }
 }
+
+const RETURNING = 'RETURNING';
+
+/**
+ * True when `sql` holds the keyword `RETURNING` as a token: not inside a string literal, a
+ * delimited identifier, or a comment, and not as part of a longer name or an `@placeholder`.
+ *
+ * `RETURNING` is a reserved word on the server, so a token match is the clause itself. A column or
+ * a table called `returning` must be written with backticks, which this skips. The scan follows the
+ * lexer rules that `validateSqlLiteral` describes: a backslash and the character after it are one
+ * unit, and a doubled quote stays inside the literal.
+ */
+export function hasReturningKeyword(sql: string): boolean {
+  let i = 0;
+
+  while (i < sql.length) {
+    const c = sql[i]!;
+
+    if (c === "'" || c === '"' || c === '`') {
+      i = skipDelimited(sql, i, c);
+      continue;
+    }
+
+    if (c === '-' && sql[i + 1] === '-') {
+      const end = sql.indexOf('\n', i);
+      i = end < 0 ? sql.length : end + 1;
+      continue;
+    }
+
+    if (c === '/' && sql[i + 1] === '*') {
+      const end = sql.indexOf('*/', i + 2);
+      i = end < 0 ? sql.length : end + 2;
+      continue;
+    }
+
+    if (isWordCharacter(c)) {
+      const start = i;
+
+      while (i < sql.length && isWordCharacter(sql[i]!)) i++;
+
+      if (i - start === RETURNING.length && sql.slice(start, i).toUpperCase() === RETURNING) return true;
+
+      continue;
+    }
+
+    i++;
+  }
+
+  return false;
+}
+
+/** `@`, `$`, and `.` join the word, so `@returning` and `t.returning` are not the keyword. */
+function isWordCharacter(character: string): boolean {
+  return /[\p{L}\p{Nd}_@$.]/u.test(character);
+}
+
+/** The index just past the closing delimiter, or the end of the text when the literal never closes. */
+function skipDelimited(sql: string, open: number, quote: string): number {
+  let j = open + 1;
+
+  while (j < sql.length) {
+    const character = sql[j];
+
+    if (character === '\\' && quote !== '`') {
+      j += 2;
+      continue;
+    }
+
+    if (character === quote) {
+      if (sql[j + 1] === quote) {
+        j += 2;
+        continue;
+      }
+
+      return j + 1;
+    }
+
+    j++;
+  }
+
+  return sql.length;
+}

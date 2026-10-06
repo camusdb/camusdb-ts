@@ -7,6 +7,51 @@ numbers follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.4.0] — 2026-10-06
+
+### Added
+
+- `INSERT … RETURNING`. `query`, `queryOne`, and `scalar` send an `INSERT` with a `RETURNING`
+  clause to the non-query route, and read the rows from its reply. `QueryResult.affectedRows` gives
+  the inserted-row count. `execute` always sends `discardReturningRows`, so the server sends the
+  count only. The flag has no effect without `RETURNING`, and the driver omits it when it is false.
+  `queryStream` sends an `INSERT … RETURNING` to the streaming query endpoint with the autocommit
+  isolation, mode, and locking. That path has no gRPC 4 MiB reply limit (`CADB0550`). The keyword
+  test skips string literals, backtick names, comments, and `@parameters`. `camus_sql.proto` matches
+  the server copy. The options of `query`, `queryOne`, `scalar`, and `queryStream` now accept
+  `transactionOptions`, which a read ignores. The live cases are opt-in with
+  `CAMUS_LIVE_RETURNING=true`.
+
+### Fixed
+
+- An array of numbers whose first value is whole and whose other values are not now binds as a
+  `Float64` array. `[2, 1.5]` took `Integer64` from its first element, and `1.5` then failed with
+  "An int64 parameter needs an integer". JavaScript has one number type, so the first value alone
+  does not show the caller's intent. An array whose first element is a `bigint` or a `camus.*`
+  value keeps the type that element states.
+
+## [0.3.0] — 2026-09-22
+
+### Added
+
+- Sequences. `CREATE SEQUENCE`, `ALTER SEQUENCE`, and `DROP SEQUENCE` now go to the DDL route. An
+  older client sent them to the data route. `createSequenceStatement`, `dropSequenceStatement`,
+  `nextValueExpression`, and `selectNextValueStatement` compose the text, and
+  `client.nextSequenceValue` draws one value as a `bigint`. A CamusDB sequence never cycles, so the
+  options have no `cycle`. The helper never writes `NO MINVALUE`, because the server reads it as
+  the smallest 64-bit value and not as the default. Sequences need a server from 0.13.2 on.
+
+### Fixed
+
+- A UUID string declared as an object id now travels as a `Uuid`. `camus.array(uuids, ColumnType.Id)`
+  sent each element as 36 characters of `Id` text, which equals no stored value. So `IN` returned
+  no rows, `NOT IN` returned every row, and `=` failed. A UUID is 16 bytes and an ObjectId is 12,
+  so a UUID can never be an ObjectId. Such an array now has the `Uuid` element type. An ObjectId
+  string keeps the `Id` type. `camus.id` still refuses a UUID, and its message now names
+  `camus.uuid`.
+
+## [0.2.1] — 2026-09-21
+
 ### Added
 
 - gRPC batch stream frames. The operations that wait together are written as a single stream
@@ -24,22 +69,6 @@ numbers follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   because a transaction its caller abandoned would otherwise hold the stream, and its locks, open
   for good. A statement of a transaction that finishes on a retired stream runs inline rather than
   prepared, because the slot's registration belongs to the stream that replaced it.
-- Large-value storage. `CamusColumnStorage` names the four column storage strategies as the SQL
-  keywords the server accepts, `setColumnStorageStatement` and `rewriteStorageStatement` compose the
-  two statements, and `client.rewriteStorage` converts the rows a table already stores. A strategy
-  decides the form of future writes only, so it never changes a query result. Three server codes
-  come with the feature: `ColumnStorageNotApplicable` (`CADB0414`), `LargeValueCorrupt`
-  (`CADB0540`), and `LargeValueNotResolved` (`CADB0541`). A server that predates large-value storage
-  refuses the `STORAGE` clause as a parse error, so the live cases for it are opt-in with
-  `CAMUS_LIVE_LARGE_VALUES=true`.
-- Sequences. `CREATE SEQUENCE`, `ALTER SEQUENCE`, and `DROP SEQUENCE` now go to the DDL route. An
-  older client sent them to the data route. `createSequenceStatement`, `dropSequenceStatement`,
-  `nextValueExpression`, and `selectNextValueStatement` compose the text, and
-  `client.nextSequenceValue` draws one value as a `bigint`. A CamusDB sequence never cycles, so the
-  options have no `cycle`. The helper never writes `NO MINVALUE`, because the server reads it as
-  the smallest 64-bit value and not as the default. Sequences need a server from 0.13.2 on.
-- `CamusErrorCode.EndpointUnreachable` (`CADB0001`). The driver raises it when a request never
-  reached a server, so the same work is safe to run again on another endpoint.
 
 ### Changed
 
@@ -51,17 +80,6 @@ numbers follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
-- An array of numbers whose first value is whole and whose other values are not now binds as a
-  `Float64` array. `[2, 1.5]` took `Integer64` from its first element, and `1.5` then failed with
-  "An int64 parameter needs an integer". JavaScript has one number type, so the first value alone
-  does not show the caller's intent. An array whose first element is a `bigint` or a `camus.*`
-  value keeps the type that element states.
-- A UUID string declared as an object id now travels as a `Uuid`. `camus.array(uuids, ColumnType.Id)`
-  sent each element as 36 characters of `Id` text, which equals no stored value. So `IN` returned
-  no rows, `NOT IN` returned every row, and `=` failed. A UUID is 16 bytes and an ObjectId is 12,
-  so a UUID can never be an ObjectId. Such an array now has the `Uuid` element type. An ObjectId
-  string keeps the `Id` type. `camus.id` still refuses a UUID, and its message now names
-  `camus.uuid`.
 - `validateIdentifier` now refuses an identifier that ends with a backslash, as `validateSqlLiteral`
   already refused a literal that does. CamusDB's lexer reads a backslash and the character after it
   as one unit, so such a name consumed its own closing backtick and the statement parsed as
@@ -114,11 +132,31 @@ numbers follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   tie-breaker.
 - `announcesFrames` now reads a header version strictly. `Number.parseInt` stops at the first
   character it cannot read, so `1x` announced version 1.
+
+## [0.2.0] — 2026-09-17
+
+### Added
+
+- Large-value storage. `CamusColumnStorage` names the four column storage strategies as the SQL
+  keywords the server accepts, `setColumnStorageStatement` and `rewriteStorageStatement` compose the
+  two statements, and `client.rewriteStorage` converts the rows a table already stores. A strategy
+  decides the form of future writes only, so it never changes a query result. Three server codes
+  come with the feature: `ColumnStorageNotApplicable` (`CADB0414`), `LargeValueCorrupt`
+  (`CADB0540`), and `LargeValueNotResolved` (`CADB0541`). A server that predates large-value storage
+  refuses the `STORAGE` clause as a parse error, so the live cases for it are opt-in with
+  `CAMUS_LIVE_LARGE_VALUES=true`.
+- `CamusErrorCode.EndpointUnreachable` (`CADB0001`). The driver raises it when a request never
+  reached a server, so the same work is safe to run again on another endpoint.
+
+### Fixed
+
 - The gRPC transport now sets an endpoint aside when it stops answering. Only the REST transport
   did this before, so a gRPC client kept every statement pointed at a node that was gone, and
   learned routing kept preferring it. A gRPC failure that never left the client now reports
   `CADB0001`. A connection that failed under a call that was already sent still reports `CADB0000`,
   because that call's outcome is unknown, but the endpoint is set aside all the same.
+
+## [0.1.1] — 2026-09-16
 
 ### Changed
 

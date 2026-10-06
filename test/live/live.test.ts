@@ -16,6 +16,8 @@
  *   CAMUS_LIVE_LARGE_VALUES   set to true to run the large-value cases, which need a server with
  *                             large-value storage: an older server refuses the STORAGE clause
  *   CAMUS_LIVE_SEQUENCES      set to true to run the sequence cases, which need a server from 0.13.2
+ *   CAMUS_LIVE_RETURNING      set to true to run the INSERT … RETURNING cases, which need a server
+ *                             with RETURNING: an older server refuses the clause as a parse error
  *
  * Every case creates its own table and drops it afterwards, so the suite leaves nothing behind and
  * two runs never collide.
@@ -44,6 +46,7 @@ const GRPC_ENDPOINT = process.env.CAMUS_LIVE_GRPC_ENDPOINT ?? 'http://localhost:
 const DATABASE = process.env.CAMUS_LIVE_DATABASE ?? 'camusdb_ts_live';
 const LARGE_VALUES = process.env.CAMUS_LIVE_LARGE_VALUES?.toLowerCase() === 'true';
 const SEQUENCES = process.env.CAMUS_LIVE_SEQUENCES?.toLowerCase() === 'true';
+const RETURNING = process.env.CAMUS_LIVE_RETURNING?.toLowerCase() === 'true';
 
 const CREDENTIALS =
   process.env.CAMUS_LIVE_USER === undefined
@@ -1173,6 +1176,120 @@ describe.runIf(SEQUENCES)('sequences', () => {
           await client.executeDdl(`DROP TABLE ${table}`).catch(() => undefined);
           await client.executeDdl(dropSequenceStatement(sequence, { ifExists: true })).catch(() => undefined);
         }
+      });
+    });
+  }
+});
+
+describe.runIf(RETURNING)('INSERT … RETURNING', () => {
+  for (const [name, options] of [
+    ['REST transport', { protocol: 'rest', endpoint: REST_ENDPOINT }],
+    ['gRPC transport', { protocol: 'grpc', endpoint: GRPC_ENDPOINT }],
+  ] as const) {
+    describe(name, () => {
+      let client: CamusClient;
+      const tables: string[] = [];
+
+      async function createTable(): Promise<string> {
+        const table = uniqueName('ret');
+
+        await client.executeDdl(
+          `CREATE TABLE ${table} (id OID PRIMARY KEY NOT NULL, name STRING NOT NULL, total FLOAT64, status STRING DEFAULT ('new'))`,
+        );
+
+        tables.push(table);
+        return table;
+      }
+
+      beforeAll(async () => {
+        client = new CamusClient({ database: DATABASE, timeoutSeconds: 30, ...CREDENTIALS, ...options });
+        await client.createDatabase(undefined, { ifNotExists: true });
+      });
+
+      afterAll(async () => {
+        for (const table of tables) {
+          await client.executeDdl(`DROP TABLE ${table}`).catch(() => undefined);
+        }
+
+        await client.close();
+      });
+
+      it('returns the stored values through query', async () => {
+        const table = await createTable();
+
+        const result = await client.query<{ id: string; name: string; doubled: number; status: string }>(
+          `INSERT INTO ${table} (id, name, total) VALUES (GEN_ID(), @a, 10), (GEN_ID(), @b, 20)
+           RETURNING id, name, total * 2 AS doubled, status`,
+          { a: 'a', b: 'b' },
+        );
+
+        expect(result.affectedRows).toBe(2);
+        expect(result.columns.map((column) => column.name)).toEqual(['id', 'name', 'doubled', 'status']);
+        expect(result.rows.map((row) => row.name)).toEqual(['a', 'b']);
+        expect(result.rows.map((row) => row.doubled)).toEqual([20, 40]);
+        expect(result.rows.every((row) => row.status === 'new')).toBe(true);
+
+        // The ids that came back are the stored ids.
+        const count = await client.scalar(`SELECT COUNT(*) FROM ${table} WHERE id = @id`, {
+          id: camus.id(result.rows[0]!.id),
+        });
+        expect(Number(count)).toBe(1);
+      });
+
+      it('returns the generated key through scalar', async () => {
+        const table = await createTable();
+
+        const id = await client.scalar<string>(
+          `INSERT INTO ${table} (id, name) VALUES (GEN_ID(), 'k') RETURNING id`,
+        );
+
+        expect(typeof id).toBe('string');
+        expect(id!.length).toBeGreaterThan(0);
+      });
+
+      it('returns the count only through execute', async () => {
+        const table = await createTable();
+
+        const result = await client.execute(
+          `INSERT INTO ${table} (id, name) VALUES (GEN_ID(), 'x'), (GEN_ID(), 'y'), (GEN_ID(), 'z') RETURNING *`,
+        );
+
+        expect(result.affectedRows).toBe(3);
+      });
+
+      it('streams the rows through queryStream', async () => {
+        const table = await createTable();
+
+        await using stream = await client.queryStream<{ name: string }>(
+          `INSERT INTO ${table} (id, name) VALUES (GEN_ID(), 's1'), (GEN_ID(), 's2') RETURNING name`,
+        );
+
+        const names: string[] = [];
+        for await (const row of stream) names.push(row.name);
+
+        expect(names).toEqual(['s1', 's2']);
+      });
+
+      it('removes the returned rows on a rollback', async () => {
+        const table = await createTable();
+
+        const transaction = await client.beginTransaction();
+
+        try {
+          await expect(
+            client.scalar(
+              `INSERT INTO ${table} (id, name) VALUES (GEN_ID(), 'tx') RETURNING name`,
+              undefined,
+              {
+                transaction,
+              },
+            ),
+          ).resolves.toBe('tx');
+        } finally {
+          await transaction.rollback();
+        }
+
+        expect(Number(await client.scalar(`SELECT COUNT(*) FROM ${table}`))).toBe(0);
       });
     });
   }

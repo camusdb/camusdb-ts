@@ -40,10 +40,12 @@ jobs:
           cache: npm
 
       - name: Start CamusDB
+        # Host networking, so the server sees the tests connect from loopback. With published ports
+        # it sees the Docker bridge address, and the backup routes refuse a non-loopback caller when
+        # authentication is off.
         run: |
           docker run --detach --name camusdb \
-            --publish 5095:5095 \
-            --publish 5096:5096 \
+            --network host \
             "$CAMUS_IMAGE"
 
       - run: npm ci

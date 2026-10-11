@@ -18,6 +18,8 @@ import { ColumnType } from './column-type.js';
  * - `Float64` and `Float32` — `floatValue`.
  * - `Bool` — `boolValue`.
  * - `String` and `Id` — `strValue`.
+ * - `Numeric` — `strValue` as decimal text. The server sends the canonical form: no exponent, no
+ *   trailing zeros, and at most 9 fraction digits.
  * - `Date` and `DateTime` — `longValue` as UTC .NET ticks. `Date` is truncated to midnight.
  * - `Bytes` — `bytesValue`. JSON carries it as base64.
  * - `Array` — `arrayValues` plus `arrayElementType`.
@@ -90,6 +92,7 @@ export function columnValueToJson(value: ColumnValue): ColumnValueJson {
 
     case ColumnType.Id:
     case ColumnType.String:
+    case ColumnType.Numeric:
       json.strValue = value.strValue ?? '';
       return json;
 

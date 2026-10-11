@@ -257,6 +257,7 @@ await client.query('SELECT * FROM robots WHERE key = @key AND made = @made AND t
 | `camus.int64(value)` | `Integer64` |
 | `camus.float64(value)` | `Float64` |
 | `camus.float32(value)` | `Float32` |
+| `camus.numeric(value)` | `Numeric`, from a decimal `string`, a `bigint`, or a `number` |
 | `camus.bool(value)` | `Bool` |
 | `camus.string(value)` | `String` |
 | `camus.bytes(value)` | `Bytes` |
@@ -293,6 +294,7 @@ against an `OID` column. `camus.array(uuids, ColumnType.Id)` therefore sends a `
 | `Bytes` | `Uint8Array` |
 | `Date`, `DateTime` | `Date`, in UTC |
 | `Uuid` | `string`, canonical and lowercase |
+| `Numeric` | `string`, the exact decimal text — see [NUMERIC](#numeric) |
 | `Array` | an array of the values above |
 
 ### 64-bit integers
@@ -315,6 +317,36 @@ Set it for the whole client, or for one statement:
 const client = new CamusClient({ endpoint, database, int64: 'bigint' });
 
 await client.query('SELECT n FROM counters', undefined, { int64: 'number' });
+```
+
+### NUMERIC
+
+`NUMERIC` (alias `DECIMAL`) is an exact decimal with precision 38 and scale 9. Its range is
+`-99999999999999999999999999999.999999999` to `99999999999999999999999999999.999999999`. The server
+refuses `NUMERIC(P, S)`, because the precision and the scale are fixed. A value travels as decimal
+text on REST and on gRPC, so no digit goes through a JavaScript number.
+
+- A `NUMERIC` column reaches you as a `string` with the canonical text: no exponent, no trailing
+  zeros, and no point for a whole number (`'1.5'`, `'1200'`, `'0'`). JavaScript has no decimal
+  type, and a `number` holds only about 15 significant digits. Use `Number(value)` when a rounded
+  value is enough, or give the text to a decimal library.
+- `camus.numeric(value)` binds a `NUMERIC`. A `string` binds its text as it is, a `bigint` binds its
+  digits, and a finite `number` binds the shortest text that reads back as the same number. The
+  server rounds more than 9 fraction digits half away from zero. A value past the range fails with
+  `CADB0417` (`CamusErrorCode.NumericValueOutOfRange`).
+- A plain `number` still binds as `Float64` or `Integer64`. Into a `FLOAT64` column the server
+  converts a NUMERIC value to a double, and a comparison of NUMERIC with FLOAT64 compares as doubles.
+  Use `camus.numeric` for an exact comparison.
+- The server has no `ARRAY(NUMERIC)`. An array of `camus.numeric` values, or
+  `camus.array(items, ColumnType.Numeric)`, fails before the request is sent.
+
+```ts
+await client.execute('INSERT INTO orders (id, price, total) VALUES (GEN_ID(), @price, @total)', {
+  price: camus.numeric('19.99'),
+  total: camus.numeric('12345678901234567890.123456789'),
+});
+
+const row = await client.queryOne<{ total: string }>('SELECT total FROM orders LIMIT 1');
 ```
 
 ### Dates
@@ -386,11 +418,11 @@ await client.insert('robots', {
 
 Column names carry no `@` here, because they bind to columns rather than to placeholders.
 
-### `INSERT … RETURNING`
+### `RETURNING`
 
-An `INSERT` can send back values from the rows that it inserted. The values are the stored values,
-so they include column defaults, sequence and identity values, and coerced types. Use `query`,
-`queryOne`, or `scalar` to read them:
+An `INSERT`, `UPDATE`, or `DELETE` can send back values from the rows that it wrote. The values are
+the stored values, so they include column defaults, sequence and identity values, and coerced
+types. Use `query`, `queryOne`, or `scalar` to read them:
 
 ```ts
 const result = await client.query<{ id: string; name: string; doubled: number }>(
@@ -408,24 +440,43 @@ const id = await client.scalar<string>(
 );
 ```
 
-- The driver sends an `INSERT` with a `RETURNING` clause to the non-query route, also when you
-  call `query`. The keyword test skips string literals, comments, backtick names, and
+An `UPDATE` returns the new row, after the `SET` clause. A `DELETE` returns the deleted row. In
+both statements, the `RETURNING` list comes after the `LIMIT`, if there is one:
+
+```ts
+const updated = await client.query<{ id: string; year: number }>(
+  'UPDATE robots SET year = year + 1 WHERE year < @year RETURNING id, year',
+  { year: 1980 },
+);
+
+const deleted = await client.query<{ id: string }>(
+  'DELETE FROM robots WHERE year > 2000 LIMIT 10 RETURNING id',
+);
+```
+
+- The driver sends an `INSERT`, `UPDATE`, or `DELETE` with a `RETURNING` clause to the non-query
+  route, also when you call `query`. The keyword test skips string literals, comments, backtick names, and
   `@parameters`.
 - `execute` returns the count only. The driver tells the server not to send the rows. The server
   still checks the `RETURNING` list and the `SELECT` privilege.
 - The `transactionOptions` of `query`, `queryOne`, `scalar`, and `queryStream` apply to the short
-  transaction of an `INSERT … RETURNING`. A read ignores them.
+  transaction of a write with `RETURNING`. A read ignores them.
 - The `RETURNING` list accepts `*`, columns, expressions, aliases, and parameters. It does not
   accept aggregates, subqueries, or sequence functions.
-- `INSERT … RETURNING` needs the `SELECT` privilege on the table, in addition to `INSERT`.
+- A `RETURNING` list needs the `SELECT` privilege on the table, in addition to `INSERT`, `UPDATE`,
+  or `DELETE`.
+- An `INSERT` returns its rows in insert order. An `UPDATE` or a `DELETE` returns its rows in no
+  defined order.
+- An `UPDATE` cannot return the old values. The server has no `OLD` and `NEW` qualifiers.
 - `RETURNING` is a reserved word. A column or a table called `returning` needs backticks.
-- The server has no `UPDATE … RETURNING` or `DELETE … RETURNING`.
 
 `query`, `queryOne`, and `scalar` receive all rows in one reply. On gRPC, the server refuses a reply
 that is larger than 4 MiB with `CADB0550`, before the commit, so the statement stores nothing. For
-a large `INSERT … SELECT … RETURNING`, use `queryStream`. It sends the statement to the streaming
-query endpoint, which sends no row before the commit. The stream reports no inserted-row count, so
-count the rows as you read them.
+a large result, such as an `INSERT … SELECT … RETURNING` or an `UPDATE` of many rows, use
+`queryStream`. It sends the statement to the streaming query endpoint, which sends no row before the
+commit. The stream reports no written-row count, so count the rows as you read them.
+
+See `docs/returning.md` in the server repository for the full rules.
 
 ### `TRUNCATE`
 
@@ -572,9 +623,9 @@ Two limits are worth knowing:
   from the call. The driver retries no autocommit statement, `query` included: run the work in
   `client.transaction`, or wrap it in `withRetry`, when you need a retry.
 
-`queryStream` also accepts an `INSERT … RETURNING`. The server sends no row of it before the
-commit, so a conflict never surfaces mid-read for it. See
-[`INSERT … RETURNING`](#insert--returning).
+`queryStream` also accepts an `INSERT`, `UPDATE`, or `DELETE` with `RETURNING`. The server sends
+no row of it before the commit, so a conflict never surfaces mid-read for it. See
+[`RETURNING`](#returning).
 
 ---
 

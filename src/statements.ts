@@ -56,8 +56,6 @@ const DDL_PREFIXES = [
 
 const DML_PREFIXES = ['INSERT', 'UPDATE', 'DELETE'];
 
-const INSERT_PREFIXES = ['INSERT'];
-
 /**
  * The statements the server accepts a registration for: the repeatable data statements, whose
  * whole point is running many times with different values. Schema and administration statements
@@ -87,11 +85,12 @@ export function isDmlStatement(sql: string): boolean {
 }
 
 /**
- * True when the statement is an `INSERT` with a `RETURNING` list, which sends back the rows it
- * inserted. The keyword test skips literals, comments, delimited names, and placeholders.
+ * True when the statement is an `INSERT`, `UPDATE`, or `DELETE` with a `RETURNING` list, which
+ * sends back the rows it wrote. The keyword test skips literals, comments, delimited names, and
+ * placeholders.
  */
-export function isInsertReturning(sql: string): boolean {
-  return startsWithAny(sql, INSERT_PREFIXES) && hasReturningKeyword(sql);
+export function isWriteReturning(sql: string): boolean {
+  return isDmlStatement(sql) && hasReturningKeyword(sql);
 }
 
 /** True when the statement may be registered as a prepared statement. */

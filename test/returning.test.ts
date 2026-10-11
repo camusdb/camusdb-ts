@@ -7,7 +7,7 @@ import { CamusEndpointPool } from '../src/endpoint-pool.js';
 import { CamusPreparedStatementPolicy } from '../src/prepared/policy.js';
 import { CamusStatementRouter } from '../src/routing/router.js';
 import { hasReturningKeyword } from '../src/sql-syntax.js';
-import { isInsertReturning } from '../src/statements.js';
+import { isWriteReturning } from '../src/statements.js';
 import { CamusTokenProvider } from '../src/auth/token-provider.js';
 import { GrpcBatcher } from '../src/transport/grpc/batcher.js';
 import type { BatchStream } from '../src/transport/grpc/batcher.js';
@@ -26,6 +26,8 @@ describe('the RETURNING keyword scan', () => {
     "INSERT INTO t (a) VALUES ('a\\'b') RETURNING a",
     'INSERT INTO t SELECT * FROM s /* comment */ RETURNING id',
     'INSERT INTO t (a) VALUES (1) -- note\nRETURNING a',
+    'UPDATE t SET a = 1 WHERE b = 2 RETURNING a, b',
+    'DELETE FROM t WHERE a > 2000 LIMIT 10 RETURNING *',
   ])('finds the keyword in %j', (sql) => {
     expect(hasReturningKeyword(sql)).toBe(true);
   });
@@ -42,18 +44,27 @@ describe('the RETURNING keyword scan', () => {
     'INSERT INTO t (a) SELECT s.returning FROM s',
     'INSERT INTO t (a) VALUES ("RETURNING")',
     "INSERT INTO t (a) VALUES ('unterminated RETURNING",
+    "UPDATE t SET note = 'RETURNING' WHERE a = 1",
+    'DELETE FROM `returning` WHERE a = 1',
   ])('does not find the keyword in %j', (sql) => {
     expect(hasReturningKeyword(sql)).toBe(false);
   });
 
-  it('accepts an INSERT only', () => {
-    expect(isInsertReturning('  insert into t (a) values (1) returning a')).toBe(true);
-    expect(isInsertReturning('UPDATE t SET a = 1 RETURNING a')).toBe(false);
-    expect(isInsertReturning('SELECT 1 AS returning_value')).toBe(false);
+  it('accepts an INSERT, an UPDATE, and a DELETE', () => {
+    expect(isWriteReturning('  insert into t (a) values (1) returning a')).toBe(true);
+    expect(isWriteReturning('UPDATE t SET a = 1 RETURNING a')).toBe(true);
+    expect(isWriteReturning('delete from t where a = 1 returning *')).toBe(true);
+  });
+
+  it('refuses a statement that is not a write with RETURNING', () => {
+    expect(isWriteReturning('UPDATE t SET a = 1')).toBe(false);
+    expect(isWriteReturning('DELETE FROM t WHERE a = 1')).toBe(false);
+    expect(isWriteReturning('SELECT 1 AS returning_value')).toBe(false);
+    expect(isWriteReturning('SELECT a FROM t WHERE b = 1 /* RETURNING */')).toBe(false);
   });
 });
 
-describe('INSERT … RETURNING over REST', () => {
+describe('RETURNING over REST', () => {
   let server: FakeCamusServer;
 
   beforeAll(async () => {
@@ -213,6 +224,74 @@ describe('INSERT … RETURNING over REST', () => {
     expect(body).not.toHaveProperty('discardReturningRows');
   });
 
+  it('reads the new rows of an UPDATE through query', async () => {
+    server.json('execute-sql-non-query', returningReply);
+
+    const result = await client(';IsolationLevel=Serializable;Locking=Optimistic').query<{
+      id: string;
+      n: number;
+    }>('UPDATE t SET n = n + 1 WHERE n < @n RETURNING id, n', { n: 30 });
+
+    expect(result.rows).toEqual([
+      { id: '6849f3aa', n: 10 },
+      { id: '6849f3bb', n: 20 },
+    ]);
+    expect(result.affectedRows).toBe(2);
+
+    // The write goes to the non-query endpoint with the autocommit options, and asks for the rows.
+    expect(server.callCount('execute-sql-query')).toBe(0);
+
+    const body = server.requestsTo('execute-sql-non-query')[0]!.body;
+
+    expect(body).toMatchObject({ isolationLevel: 'Serializable', locking: 'Optimistic' });
+    expect(body).not.toHaveProperty('discardReturningRows');
+  });
+
+  it('reads the first deleted value of a DELETE through scalar', async () => {
+    server.json('execute-sql-non-query', returningReply);
+
+    await expect(client().scalar<string>('DELETE FROM t WHERE n > 5 LIMIT 10 RETURNING id')).resolves.toBe(
+      '6849f3aa',
+    );
+
+    expect(server.callCount('execute-sql-query')).toBe(0);
+  });
+
+  it('asks for the count only of an UPDATE through execute', async () => {
+    server.json('execute-sql-non-query', { status: 'ok', rows: 3 });
+
+    const result = await client().execute('UPDATE t SET n = 0 WHERE n > 0 RETURNING id');
+
+    expect(result.affectedRows).toBe(3);
+    expect(server.requestsTo('execute-sql-non-query')[0]!.body).toMatchObject({ discardReturningRows: true });
+  });
+
+  it('streams the deleted rows of a DELETE through queryStream', async () => {
+    server.on('execute-sql-query-stream', (_request, response) => {
+      respondNdjson(response, [
+        { status: 'ok', columns: [{ name: 'id', type: ColumnType.Id }] },
+        ['6849f3aa'],
+        ['6849f3bb'],
+        { status: 'ok', total: 2, serverTimeMs: 0.5 },
+      ]);
+    });
+
+    await using stream = await client(';IsolationLevel=Serializable').queryStream<{ id: string }>(
+      'DELETE FROM t WHERE n > 5 RETURNING id',
+    );
+
+    const ids: string[] = [];
+    for await (const row of stream) ids.push(row.id);
+
+    expect(ids).toEqual(['6849f3aa', '6849f3bb']);
+
+    // The autocommit DELETE runs in a writable transaction, so its options travel with it.
+    const body = server.requestsTo('execute-sql-query-stream')[0]!.body;
+
+    expect(body).toMatchObject({ isolationLevel: 'Serializable' });
+    expect(body).not.toHaveProperty('discardReturningRows');
+  });
+
   it('keeps a plain INSERT on the query endpoint through query', async () => {
     server.on('execute-sql-query', (_request, response) => {
       respondJson(response, 200, { status: 'ok', columns: [], rows: [] });
@@ -226,7 +305,7 @@ describe('INSERT … RETURNING over REST', () => {
   });
 });
 
-describe('INSERT … RETURNING over gRPC', () => {
+describe('RETURNING over gRPC', () => {
   class FakeStream implements BatchStream {
     readonly sent: GrpcBatchExecuteRequest[] = [];
 

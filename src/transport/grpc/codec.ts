@@ -71,6 +71,9 @@ export function encodeValue(value: ColumnValue): GrpcValue {
     case ColumnType.Uuid:
       return { uuidValue: Buffer.from(encodeUuid(value)) };
 
+    case ColumnType.Numeric:
+      return { numericValue: value.strValue ?? '' };
+
     case ColumnType.Array:
       return { arrayValue: encodeArray(value) };
 
@@ -123,6 +126,9 @@ export function decodeValue(value: GrpcValue): ColumnValue {
     case 'uuidValue':
       return decodeUuid(value.uuidValue);
 
+    case 'numericValue':
+      return { type: ColumnType.Numeric, strValue: value.numericValue ?? '' };
+
     case 'arrayValue':
       return decodeArray(value.arrayValue);
 
@@ -152,6 +158,7 @@ const VALUE_KINDS: readonly ValueKind[] = [
   'datetimeValue',
   'arrayValue',
   'uuidValue',
+  'numericValue',
   'nullValue',
 ];
 
@@ -179,10 +186,32 @@ export function buildResultSet(
     const base = r * columnCount;
     const limit = Math.min(columnCount, values.length);
 
-    for (let c = 0; c < limit; c++) cells[base + c] = decodeValue(values[c]!);
+    for (let c = 0; c < limit; c++) {
+      const cell = decodeValue(values[c]!);
+      cells[base + c] = types[c] === ColumnType.Numeric ? asNumericCell(cell) : cell;
+    }
   }
 
   return new CamusResultSet(names, types, cells, rows.length);
+}
+
+/**
+ * A number in a `numeric` column, as `numeric` text. For a NULL `p`, `SELECT COALESCE(p, 0)` sends
+ * the int64 `0` while the schema says numeric. The REST decoder reads that cell as `'0'`, so this
+ * keeps the two transports in agreement.
+ */
+function asNumericCell(cell: ColumnValue): ColumnValue {
+  switch (cell.type) {
+    case ColumnType.Integer64:
+      return { type: ColumnType.Numeric, strValue: (cell.longValue ?? 0n).toString() };
+
+    case ColumnType.Float64:
+    case ColumnType.Float32:
+      return { type: ColumnType.Numeric, strValue: String(cell.floatValue ?? 0) };
+
+    default:
+      return cell;
+  }
 }
 
 /** The cache verdict a query terminator carried, or `undefined` when the statement was unhinted. */

@@ -16,6 +16,9 @@ const TYPED = Symbol.for('camusdb.typedParameter');
 
 const OBJECT_ID = /^[0-9a-fA-F]{24}$/;
 
+/** The server's NUMERIC text: an optional sign, digits with an optional point, an optional exponent. */
+const NUMERIC_TEXT = /^[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?$/;
+
 /**
  * A parameter whose column type the caller stated, rather than one the driver inferred from the
  * JavaScript value. Build one with a helper from `camus` below and pass it as a parameter value.
@@ -43,8 +46,8 @@ function invalid(message: string): never {
  *
  * The driver infers a column type from the JavaScript value, which is right for most parameters. A
  * helper here states the type instead, for the cases inference cannot reach: a `uuid` column (a
- * UUID is an ordinary string in JavaScript), an `id` column, a `float32` column, a date-only
- * column, and an empty array, whose element type nothing can be read from.
+ * UUID is an ordinary string in JavaScript), an `id` column, a `float32` column, a `numeric`
+ * column, a date-only column, and an empty array, whose element type nothing can be read from.
  */
 export const camus = {
   /** An `id` column value: an ObjectId as its 24-character string. */
@@ -78,6 +81,19 @@ export const camus = {
   /** A `float64` column value. */
   float64(value: number): TypedParameter {
     return typed({ type: ColumnType.Float64, floatValue: value });
+  },
+
+  /**
+   * A `numeric` column value: an exact decimal with 38 digits, 9 of them after the point.
+   *
+   * A `string` binds its decimal text as it is, so every digit reaches the server. Use it for a
+   * value that a `number` cannot hold exactly. A `bigint` binds its digits. A `number` binds the
+   * shortest text that reads back as the same number, so `0.1` binds as `0.1` and not as its binary
+   * value. The server rounds more than 9 fraction digits half away from zero, and it refuses a
+   * value outside the range with `CADB0417`.
+   */
+  numeric(value: string | number | bigint): TypedParameter {
+    return typed({ type: ColumnType.Numeric, strValue: toNumericText(value) });
   },
 
   /** A `float32` column value. The server narrows it to single precision. */
@@ -130,6 +146,10 @@ export const camus = {
    * type cannot be inferred, and whenever the element type is not the one inference would pick.
    */
   array(items: readonly unknown[], elementType: ColumnType): TypedParameter {
+    if (elementType === ColumnType.Numeric) {
+      invalid('The server has no ARRAY(NUMERIC). Use ColumnType.Float64 or ColumnType.String elements.');
+    }
+
     // Imported lazily to break the cycle with the encoder, which imports this module.
     const encode = arrayEncoder;
 
@@ -194,6 +214,35 @@ function toBigInt(value: number | bigint): bigint {
   }
 
   return BigInt(value);
+}
+
+function toNumericText(value: string | number | bigint): string {
+  switch (typeof value) {
+    case 'bigint':
+      return value.toString();
+
+    case 'number':
+      if (!Number.isFinite(value)) {
+        invalid(`A numeric parameter cannot hold ${String(value)}.`);
+      }
+
+      // The shortest text that reads back as the same double. An exponent ('1e+21') is valid NUMERIC
+      // text.
+      return String(value);
+
+    case 'string': {
+      const text = value.trim();
+
+      if (!NUMERIC_TEXT.test(text)) {
+        invalid(`'${value}' is not a decimal number.`);
+      }
+
+      return text;
+    }
+
+    default:
+      return invalid(`Cannot use ${typeof value} as a numeric value.`);
+  }
 }
 
 function toBytes(value: Uint8Array | ArrayBuffer): Uint8Array {

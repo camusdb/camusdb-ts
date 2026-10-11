@@ -7,6 +7,26 @@ numbers follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- `NUMERIC` (alias `DECIMAL`): an exact decimal with precision 38 and scale 9. `ColumnType.Numeric`
+  is wire type 12. The value is its decimal text in `strValue` on REST and in `numeric_value` on
+  gRPC. `camus_sql.proto` matches the server copy again. A `NUMERIC` column reads as a `string` with
+  the exact canonical text. `camus.numeric(value)` binds a decimal `string`, a `bigint`, or a finite
+  `number`, and it refuses text that is not a decimal number. A number cell in a `NUMERIC` column
+  (`COALESCE(p, 0)` with a NULL `p`) reads as `NUMERIC` text on REST and on gRPC. The server has no `ARRAY(NUMERIC)`, so
+  an array of `NUMERIC` values fails before the request is sent. A plain `number` still binds as
+  `Float64` or `Integer64`. `CamusErrorCode.NumericValueOutOfRange` is `CADB0417`. The live cases
+  are opt-in with `CAMUS_LIVE_NUMERIC=true`.
+- `UPDATE … RETURNING` and `DELETE … RETURNING`. `query`, `queryOne`, and `scalar` send an `UPDATE`
+  or a `DELETE` with a `RETURNING` clause to the non-query route, as they do for an `INSERT`, and
+  `QueryResult.affectedRows` gives the written-row count. An `UPDATE` returns the new row and a
+  `DELETE` returns the deleted row, in no defined order. `queryStream` sends such a statement to the
+  streaming query endpoint with the autocommit options. Before, `query` and `queryStream` sent it
+  as a read, with no autocommit options and no row count. `execute` already sent the count-only
+  flag. `camus_sql.proto` comments match the server copy. The live cases run with
+  `CAMUS_LIVE_RETURNING=true`.
+
 ## [0.4.0] — 2026-10-06
 
 ### Added

@@ -25,6 +25,12 @@ export const ColumnType = {
   DateTime: 9,
   Array: 10,
   Uuid: 11,
+
+  /**
+   * Exact decimal with precision 38 and scale 9 (SQL `NUMERIC`, alias `DECIMAL`). It travels as its
+   * decimal text in `strValue`, so no digit goes through a JavaScript number.
+   */
+  Numeric: 12,
 } as const;
 
 export type ColumnType = (typeof ColumnType)[keyof typeof ColumnType];
@@ -42,6 +48,7 @@ const NAMES: Record<number, string> = {
   9: 'DateTime',
   10: 'Array',
   11: 'Uuid',
+  12: 'Numeric',
 };
 
 /** The declared type's name, for diagnostics and for `QueryResult.columns[i].typeName`. */

@@ -41,6 +41,8 @@ export const DEFAULT_DECODE_OPTIONS: DecodeOptions = Object.freeze({ int64: 'aut
  * - `Date` and `DateTime` — `Date`, in UTC. Sub-millisecond precision is truncated; read
  *   `longValue` from the raw row for the exact stored tick count.
  * - `Uuid` — the canonical lowercase hyphenated `string`.
+ * - `Numeric` — the exact decimal `string`, for example `'12.5'`. JavaScript has no decimal type, and
+ *   a `number` holds only about 15 significant digits.
  * - `Array` — an array of the values above.
  */
 export function decodeValue(value: ColumnValue, options: DecodeOptions = DEFAULT_DECODE_OPTIONS): unknown {
@@ -50,6 +52,7 @@ export function decodeValue(value: ColumnValue, options: DecodeOptions = DEFAULT
 
     case ColumnType.Id:
     case ColumnType.String:
+    case ColumnType.Numeric:
       return value.strValue ?? '';
 
     case ColumnType.Integer64:

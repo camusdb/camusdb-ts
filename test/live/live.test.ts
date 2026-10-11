@@ -16,8 +16,11 @@
  *   CAMUS_LIVE_LARGE_VALUES   set to true to run the large-value cases, which need a server with
  *                             large-value storage: an older server refuses the STORAGE clause
  *   CAMUS_LIVE_SEQUENCES      set to true to run the sequence cases, which need a server from 0.13.2
- *   CAMUS_LIVE_RETURNING      set to true to run the INSERT … RETURNING cases, which need a server
- *                             with RETURNING: an older server refuses the clause as a parse error
+ *   CAMUS_LIVE_RETURNING      set to true to run the INSERT, UPDATE and DELETE … RETURNING cases,
+ *                             which need a server with RETURNING on all three statements: an older
+ *                             server refuses the clause as a parse error
+ *   CAMUS_LIVE_NUMERIC        set to true to run the NUMERIC cases, which need a server with the
+ *                             NUMERIC column type
  *
  * Every case creates its own table and drops it afterwards, so the suite leaves nothing behind and
  * two runs never collide.
@@ -30,6 +33,7 @@ import {
   CamusClient,
   CamusColumnStorage,
   CamusError,
+  CamusErrorCode,
   CamusObjectId,
   CamusVector,
   camus,
@@ -47,6 +51,7 @@ const DATABASE = process.env.CAMUS_LIVE_DATABASE ?? 'camusdb_ts_live';
 const LARGE_VALUES = process.env.CAMUS_LIVE_LARGE_VALUES?.toLowerCase() === 'true';
 const SEQUENCES = process.env.CAMUS_LIVE_SEQUENCES?.toLowerCase() === 'true';
 const RETURNING = process.env.CAMUS_LIVE_RETURNING?.toLowerCase() === 'true';
+const NUMERIC = process.env.CAMUS_LIVE_NUMERIC?.toLowerCase() === 'true';
 
 const CREDENTIALS =
   process.env.CAMUS_LIVE_USER === undefined
@@ -1181,7 +1186,7 @@ describe.runIf(SEQUENCES)('sequences', () => {
   }
 });
 
-describe.runIf(RETURNING)('INSERT … RETURNING', () => {
+describe.runIf(RETURNING)('RETURNING', () => {
   for (const [name, options] of [
     ['REST transport', { protocol: 'rest', endpoint: REST_ENDPOINT }],
     ['gRPC transport', { protocol: 'grpc', endpoint: GRPC_ENDPOINT }],
@@ -1290,6 +1295,179 @@ describe.runIf(RETURNING)('INSERT … RETURNING', () => {
         }
 
         expect(Number(await client.scalar(`SELECT COUNT(*) FROM ${table}`))).toBe(0);
+      });
+
+      it('returns the new rows of an UPDATE through query', async () => {
+        const table = await createTable();
+
+        await client.execute(
+          `INSERT INTO ${table} (id, name, total) VALUES (GEN_ID(), 'a', 10), (GEN_ID(), 'b', 20), (GEN_ID(), 'c', 30)`,
+        );
+
+        const result = await client.query<{ name: string; total: number }>(
+          `UPDATE ${table} SET total = total + 1 WHERE total < @limit RETURNING name, total`,
+          { limit: 25 },
+        );
+
+        expect(result.affectedRows).toBe(2);
+        expect(result.rows.map((row) => `${row.name}=${String(row.total)}`).sort()).toEqual(['a=11', 'b=21']);
+      });
+
+      it('returns an empty result with columns when an UPDATE matches nothing', async () => {
+        const table = await createTable();
+
+        const result = await client.query(`UPDATE ${table} SET total = 0 WHERE name = 'none' RETURNING id`);
+
+        expect(result.affectedRows).toBe(0);
+        expect(result.columns.map((column) => column.name)).toEqual(['id']);
+        expect(result.rows).toEqual([]);
+      });
+
+      it('returns the deleted row of a DELETE through scalar', async () => {
+        const table = await createTable();
+
+        await client.execute(`INSERT INTO ${table} (id, name) VALUES (GEN_ID(), 'gone'), (GEN_ID(), 'kept')`);
+
+        await expect(
+          client.scalar(`DELETE FROM ${table} WHERE name = @name RETURNING name`, { name: 'gone' }),
+        ).resolves.toBe('gone');
+
+        expect(Number(await client.scalar(`SELECT COUNT(*) FROM ${table}`))).toBe(1);
+      });
+
+      it('returns the count only of a DELETE through execute', async () => {
+        const table = await createTable();
+
+        await client.execute(`INSERT INTO ${table} (id, name) VALUES (GEN_ID(), 'x'), (GEN_ID(), 'y')`);
+
+        const result = await client.execute(`DELETE FROM ${table} WHERE name <> '' RETURNING *`);
+
+        expect(result.affectedRows).toBe(2);
+      });
+
+      it('streams the new rows of an UPDATE through queryStream', async () => {
+        const table = await createTable();
+
+        await client.execute(
+          `INSERT INTO ${table} (id, name, total) VALUES (GEN_ID(), 's1', 1), (GEN_ID(), 's2', 2)`,
+        );
+
+        await using stream = await client.queryStream<{ name: string; total: number }>(
+          `UPDATE ${table} SET total = total * 10 WHERE total > 0 RETURNING name, total`,
+        );
+
+        const rows: string[] = [];
+        for await (const row of stream) rows.push(`${row.name}=${String(row.total)}`);
+
+        expect(rows.sort()).toEqual(['s1=10', 's2=20']);
+      });
+
+      it('returns the deleted rows of a DELETE in a transaction', async () => {
+        const table = await createTable();
+
+        await client.execute(`INSERT INTO ${table} (id, name) VALUES (GEN_ID(), 'tx')`);
+
+        const transaction = await client.beginTransaction();
+
+        try {
+          const result = await client.query<{ name: string }>(
+            `DELETE FROM ${table} WHERE name = 'tx' RETURNING name`,
+            undefined,
+            {
+              transaction,
+            },
+          );
+
+          expect(result.rows.map((row) => row.name)).toEqual(['tx']);
+        } finally {
+          await transaction.rollback();
+        }
+
+        expect(Number(await client.scalar(`SELECT COUNT(*) FROM ${table}`))).toBe(1);
+      });
+    });
+  }
+});
+
+describe.runIf(NUMERIC)('NUMERIC', () => {
+  for (const [name, options] of [
+    ['REST transport', { protocol: 'rest', endpoint: REST_ENDPOINT }],
+    ['gRPC transport', { protocol: 'grpc', endpoint: GRPC_ENDPOINT }],
+  ] as const) {
+    describe(name, () => {
+      let client: CamusClient;
+      const tables: string[] = [];
+
+      async function createTable(): Promise<string> {
+        const table = uniqueName('num');
+
+        await client.executeDdl(`CREATE TABLE ${table} (id INT64 PRIMARY KEY NOT NULL, price NUMERIC)`);
+
+        tables.push(table);
+        return table;
+      }
+
+      beforeAll(async () => {
+        client = new CamusClient({ database: DATABASE, timeoutSeconds: 30, ...CREDENTIALS, ...options });
+        await client.createDatabase(undefined, { ifNotExists: true });
+      });
+
+      afterAll(async () => {
+        for (const table of tables) {
+          await client.executeDdl(`DROP TABLE ${table}`).catch(() => undefined);
+        }
+
+        await client.close();
+      });
+
+      it('round-trips every digit', async () => {
+        const table = await createTable();
+        const wide = '12345678901234567890.123456789';
+
+        await client.execute(`INSERT INTO ${table} (id, price) VALUES (1, @a), (2, @b), (3, @c), (4, NULL)`, {
+          a: camus.numeric(wide),
+          b: camus.numeric(19.99),
+          c: camus.numeric(-1200n),
+        });
+
+        const result = await client.query<{ id: number; price: string | null }>(
+          `SELECT id, price FROM ${table} ORDER BY id`,
+        );
+
+        expect(result.columns[1]!.type).toBe(ColumnType.Numeric);
+        expect(result.rows.map((row) => row.price)).toEqual([wide, '19.99', '-1200', null]);
+      });
+
+      it('compares a bound numeric exactly', async () => {
+        const table = await createTable();
+
+        await client.execute(
+          `INSERT INTO ${table} (id, price) VALUES (1, NUMERIC '0.1'), (2, NUMERIC '0.3')`,
+        );
+
+        const ids = await client.query<{ id: number }>(`SELECT id FROM ${table} WHERE price = @p`, {
+          p: camus.numeric('0.3'),
+        });
+
+        expect(ids.rows.map((row) => row.id)).toEqual([2]);
+      });
+
+      it('reads COALESCE of a NULL numeric as numeric text', async () => {
+        const table = await createTable();
+
+        await client.execute(`INSERT INTO ${table} (id, price) VALUES (1, NULL)`);
+
+        expect(await client.scalar(`SELECT COALESCE(price, 0) FROM ${table}`)).toBe('0');
+      });
+
+      it('refuses a value past the range', async () => {
+        const table = await createTable();
+
+        await expect(
+          client.execute(`INSERT INTO ${table} (id, price) VALUES (1, @p)`, {
+            p: camus.numeric('1e40'),
+          }),
+        ).rejects.toMatchObject({ code: CamusErrorCode.NumericValueOutOfRange });
       });
     });
   }

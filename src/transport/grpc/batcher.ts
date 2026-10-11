@@ -49,7 +49,7 @@ export interface BatchNonQueryResult {
   readonly routing: CamusRoutingAdvice | undefined;
 
   /**
-   * The output columns of an `INSERT … RETURNING`, or `undefined` for a statement without
+   * The output columns of a write with `RETURNING`, or `undefined` for a statement without
    * `RETURNING` and for a request that set `discardReturningRows`.
    */
   readonly returningSchema: GrpcResultSchema | undefined;
@@ -991,7 +991,7 @@ export class GrpcBatcher {
           },
           routing: decodeRoutingAdvice(reply.routing),
           // returning_schema is a message field, so "unset" (no RETURNING, or count only) and "set
-          // with no rows" (a RETURNING that inserted nothing) stay distinct.
+          // with no rows" (a RETURNING that wrote nothing) stay distinct.
           returningSchema: reply.returningSchema ?? undefined,
           returningRows: reply.returningRows ?? [],
         } satisfies BatchNonQueryResult);

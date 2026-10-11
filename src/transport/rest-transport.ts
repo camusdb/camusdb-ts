@@ -56,8 +56,8 @@ interface NonQueryResponseBody extends StatusEnvelope {
   rows?: number;
   routing?: unknown;
 
-  /** The output columns of an `INSERT … RETURNING`. Absent without `RETURNING`, and absent when the
-   * request set `discardReturningRows`. */
+  /** The output columns of a write with `RETURNING`. Absent without `RETURNING`, and absent when
+   * the request set `discardReturningRows`. */
   columns?: unknown;
 
   /** The `RETURNING` rows, positional against `columns`, in the encoding of a query's `rows`. */
@@ -254,7 +254,7 @@ export class RestTransport implements CamusTransport {
       request.signal,
     );
 
-    // `columns` is present only for an INSERT … RETURNING whose rows were not discarded. The rows
+    // `columns` is present only for a write with RETURNING whose rows were not discarded. The rows
     // use the positional encoding of a query response, so the query decoder reads them.
     return {
       affectedRows: asNumber(body.rows),
@@ -627,7 +627,7 @@ function buildQueryBody(
     body.txnIdPT = request.txnIdPT;
     body.txnIdCounter = request.txnIdCounter;
   } else if (request.autocommitOptions !== undefined) {
-    // A read leaves the options unset. A non-query, and an INSERT … RETURNING sent to the query
+    // A read leaves the options unset. A non-query, and a write with RETURNING sent to the query
     // endpoint, set them for the writable transaction the server begins.
     Object.assign(body, concurrencyFields(request.autocommitOptions));
   }

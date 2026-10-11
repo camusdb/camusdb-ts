@@ -112,6 +112,7 @@ function valueCost(value: GrpcValue): number {
   let cost = MESSAGE_BYTES;
 
   cost += textCost(value.stringValue);
+  cost += textCost(value.numericValue);
   cost += bytesCost(value.bytesValue);
   cost += bytesCost(value.uuidValue);
 

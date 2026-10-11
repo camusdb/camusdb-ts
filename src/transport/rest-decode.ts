@@ -93,6 +93,9 @@ export function decodeCell(cell: unknown, declared: ColumnType): ColumnValue {
     case ColumnType.Uuid:
       return decodeUuidCell(cell);
 
+    case ColumnType.Numeric:
+      return decodeNumericCell(cell, declared);
+
     case ColumnType.Array:
       return decodeArrayCell(cell);
 
@@ -121,6 +124,26 @@ function decodeUuidCell(cell: unknown): ColumnValue {
   if (typeof cell === 'string') return { type: ColumnType.Uuid, uuidValue: cell };
 
   return NULL_VALUE;
+}
+
+/**
+ * A `numeric` is wired as a JSON string with its canonical decimal text. A JSON number can also
+ * arrive in a `numeric` column: for a NULL `p`, `SELECT COALESCE(p, 0)` gives the int64 `0` while
+ * the column metadata says numeric. An integer token is exact, so it becomes a `Numeric` with its
+ * digits. A fraction token reads back as the shortest text of its double.
+ */
+function decodeNumericCell(cell: unknown, declared: ColumnType): ColumnValue {
+  switch (typeof cell) {
+    case 'string':
+      return { type: ColumnType.Numeric, strValue: cell };
+
+    case 'number':
+    case 'bigint':
+      return { type: ColumnType.Numeric, strValue: String(cell) };
+
+    default:
+      return decodeScalarByToken(cell, declared);
+  }
 }
 
 /**

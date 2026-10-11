@@ -35,6 +35,12 @@ export const CamusErrorCode = {
    */
   ColumnStorageNotApplicable: 'CADB0414',
 
+  /**
+   * A `numeric` value or result is outside the range of the type,
+   * ±99999999999999999999999999999.999999999. The server never truncates or wraps it.
+   */
+  NumericValueOutOfRange: 'CADB0417',
+
   /** The database already exists. Also raised when `IF NOT EXISTS` loses a registration race. */
   DatabaseAlreadyExists: 'CADB0012',
 

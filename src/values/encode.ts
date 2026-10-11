@@ -218,6 +218,12 @@ function encodeArray(value: unknown, declaredElementType: ColumnType): ColumnVal
       break;
     }
 
+    if (elementType === ColumnType.Numeric) {
+      return invalid(
+        'The server has no ARRAY(NUMERIC). Bind the elements as numbers, or as camus.float64 values.',
+      );
+    }
+
     if (elementType === ColumnType.Null && value.length > 0) {
       return invalid(
         'Cannot infer the element type of an array parameter whose elements are all null. ' +

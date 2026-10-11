@@ -77,7 +77,8 @@ export type ValueKind =
   | 'dateValue'
   | 'datetimeValue'
   | 'arrayValue'
-  | 'uuidValue';
+  | 'uuidValue'
+  | 'numericValue';
 
 export interface GrpcValue {
   kind?: ValueKind | undefined;
@@ -93,6 +94,7 @@ export interface GrpcValue {
   datetimeValue?: Int64Wire;
   arrayValue?: GrpcArrayValue;
   uuidValue?: Buffer;
+  numericValue?: string;
 }
 
 export interface GrpcArrayValue {
@@ -171,7 +173,7 @@ export interface GrpcNonQueryReply {
   warning: string;
   routing?: GrpcRoutingAdviceMessage | null;
 
-  /** The output columns of an `INSERT … RETURNING`. Null for a statement without `RETURNING` and for
+  /** The output columns of a write with `RETURNING`. Null for a statement without `RETURNING` and for
    * a request that set `discardReturningRows`. */
   returningSchema?: GrpcResultSchema | null;
 

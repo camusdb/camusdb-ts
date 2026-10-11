@@ -25,6 +25,7 @@ env:
   CAMUS_LIVE_LARGE_VALUES: 'true'
   CAMUS_LIVE_SEQUENCES: 'true'
   CAMUS_LIVE_RETURNING: 'true'
+  CAMUS_LIVE_NUMERIC: 'true'
 
 jobs:
   live:

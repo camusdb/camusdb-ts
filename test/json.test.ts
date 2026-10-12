@@ -111,6 +111,18 @@ describe('stringifyLossless', () => {
     expect(stringifyLossless({ a: 9223372036854775807n })).toBe('{"a":9223372036854775807}');
   });
 
+  it('writes a negative zero as -0, where JSON.stringify writes 0', () => {
+    expect(JSON.stringify({ a: -0 })).toBe('{"a":0}');
+    expect(stringifyLossless({ a: -0, b: [-0, 0] })).toBe('{"a":-0,"b":[-0,0]}');
+  });
+
+  it('round-trips a negative zero', () => {
+    const parsed = parseLossless(stringifyLossless([-0, 11111111111111111111n])) as unknown[];
+
+    expect(Object.is(parsed[0], -0)).toBe(true);
+    expect(Object.is((JSON.parse(stringifyLossless([-0])) as number[])[0], -0)).toBe(true);
+  });
+
   it('round-trips a 64-bit value', () => {
     const value = { longValue: -9223372036854775808n };
     const parsed = parseLossless(stringifyLossless(value)) as { longValue: bigint };

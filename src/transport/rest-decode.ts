@@ -19,7 +19,7 @@ import { CamusResultSet } from '../result-set.js';
  * row, is what lets a result with no rows still report its column count, names, and types.
  */
 export function resultSetFromWire(columns: unknown, rows: unknown): CamusResultSet {
-  const { names, types } = readSchema(columns);
+  const { names, types, elementTypes } = readSchema(columns);
 
   if (!Array.isArray(rows) || names.length === 0) {
     return new CamusResultSet(names, types, [], 0);
@@ -37,7 +37,7 @@ export function resultSetFromWire(columns: unknown, rows: unknown): CamusResultS
     const limit = Math.min(columnCount, row.length);
 
     for (let c = 0; c < limit; c++) {
-      cells[base + c] = decodeCell(row[c] as unknown, types[c]!);
+      cells[base + c] = decodeCell(row[c] as unknown, types[c]!, elementTypes[c]);
     }
 
     // Any position the row omitted keeps the null the array was filled with.
@@ -46,23 +46,44 @@ export function resultSetFromWire(columns: unknown, rows: unknown): CamusResultS
   return new CamusResultSet(names, types, cells, rowCount);
 }
 
-/** The output column names and declared types of a response's `columns` element. */
-export function readSchema(columns: unknown): { names: string[]; types: ColumnType[] } {
-  if (!Array.isArray(columns)) return { names: [], types: [] };
+/** The output columns of a response's `columns` element. */
+export interface WireSchema {
+  names: string[];
+  types: ColumnType[];
+
+  /**
+   * The element type of each `Array` column, and `Null` for every other column. A server that
+   * predates the `elementType` field reports none, so every entry is `Null` from one.
+   */
+  elementTypes: ColumnType[];
+}
+
+/** The output column names, declared types, and array element types of a `columns` element. */
+export function readSchema(columns: unknown): WireSchema {
+  if (!Array.isArray(columns)) return { names: [], types: [], elementTypes: [] };
 
   const names: string[] = new Array<string>(columns.length);
   const types: ColumnType[] = new Array<ColumnType>(columns.length);
+  const elementTypes: ColumnType[] = new Array<ColumnType>(columns.length);
 
   for (let i = 0; i < columns.length; i++) {
-    const column = columns[i] as { name?: unknown; type?: unknown } | null;
+    const column = columns[i] as { name?: unknown; type?: unknown; elementType?: unknown } | null;
 
     names[i] = typeof column?.name === 'string' ? column.name : '';
 
     const type = asNumber(column?.type, ColumnType.Null);
     types[i] = isColumnType(type) ? type : ColumnType.Null;
+
+    // An array of arrays is not a column type, so a nested element type is read as unknown rather
+    // than trusted.
+    const elementType = asNumber(column?.elementType, ColumnType.Null);
+    elementTypes[i] =
+      types[i] === ColumnType.Array && isColumnType(elementType) && elementType !== ColumnType.Array
+        ? elementType
+        : ColumnType.Null;
   }
 
-  return { names, types };
+  return { names, types, elementTypes };
 }
 
 /**
@@ -73,8 +94,15 @@ export function readSchema(columns: unknown): { names: string[]; types: ColumnTy
  * exact, which it always is for a real column reference. A scalar that arrives as a JSON-native
  * value is read by its token instead, so an over-broad inferred type on an expression column — a
  * numeric projection reported as a string, say — still round-trips.
+ *
+ * `elementType` is the schema's element type for an `Array` column, and `Null` when the server did
+ * not report one.
  */
-export function decodeCell(cell: unknown, declared: ColumnType): ColumnValue {
+export function decodeCell(
+  cell: unknown,
+  declared: ColumnType,
+  elementType: ColumnType = ColumnType.Null,
+): ColumnValue {
   if (cell === null || cell === undefined) return NULL_VALUE;
 
   switch (declared) {
@@ -97,7 +125,7 @@ export function decodeCell(cell: unknown, declared: ColumnType): ColumnValue {
       return decodeNumericCell(cell, declared);
 
     case ColumnType.Array:
-      return decodeArrayCell(cell);
+      return decodeArrayCell(cell, elementType);
 
     default:
       // A defensive recovery for a gap in the server's type inference: a join projection can
@@ -149,24 +177,47 @@ function decodeNumericCell(cell: unknown, declared: ColumnType): ColumnValue {
 /**
  * Decodes an array cell.
  *
- * The wire schema carries no per-element type for an array, so element types are read from the
- * JSON token. That is exact for every element type JSON has a token for. An element type that is
- * itself string-encoded or array-encoded — a uuid, a date, or bytes inside an array — is not
- * reconstructed, and reaches the caller as the string or number the token held.
+ * Elements are plain JSON values in the scalar wire forms: a date as ticks, bytes as base64, a uuid
+ * as `[high, low]`. With the column's element type from the schema, each element is decoded as a
+ * cell of that type, so the array matches what gRPC returns.
+ *
+ * A server that predates the schema field reports no element type, and the elements are read from
+ * their JSON tokens instead. That is exact for every element type JSON has a token for, and two
+ * further cases are inferred safely: a `[high, low]` pair can only be a uuid, and a fraction or a
+ * negative zero can only come from a float array, so every number in that array is a float. A
+ * date, bytes, or a whole-numbered float array is not reconstructed, and reaches the caller as the
+ * string or number the token held.
  */
-function decodeArrayCell(cell: unknown): ColumnValue {
+function decodeArrayCell(cell: unknown, elementType: ColumnType): ColumnValue {
   if (!Array.isArray(cell)) return NULL_VALUE;
 
   const values: ColumnValue[] = new Array<ColumnValue>(cell.length);
-  let elementType: ColumnType = ColumnType.Null;
+
+  if (elementType !== ColumnType.Null) {
+    for (let i = 0; i < cell.length; i++) values[i] = decodeCell(cell[i] as unknown, elementType);
+
+    return { type: ColumnType.Array, arrayValues: values, arrayElementType: elementType };
+  }
+
+  const numberType = cell.some(isFloatToken) ? ColumnType.Float64 : ColumnType.Null;
+  let inferred: ColumnType = ColumnType.Null;
 
   for (let i = 0; i < cell.length; i++) {
-    const decoded = decodeScalarByToken(cell[i] as unknown, ColumnType.Null);
-    if (decoded.type !== ColumnType.Null) elementType = decoded.type;
+    const item = cell[i] as unknown;
+
+    const decoded =
+      Array.isArray(item) && item.length === 2 ? decodeUuidCell(item) : decodeScalarByToken(item, numberType);
+
+    if (decoded.type !== ColumnType.Null) inferred = decoded.type;
     values[i] = decoded;
   }
 
-  return { type: ColumnType.Array, arrayValues: values, arrayElementType: elementType };
+  return { type: ColumnType.Array, arrayValues: values, arrayElementType: inferred };
+}
+
+/** True for a JSON number an `int64` cannot hold: a fraction, or a negative zero. */
+function isFloatToken(item: unknown): boolean {
+  return typeof item === 'number' && (!Number.isInteger(item) || Object.is(item, -0));
 }
 
 function decodeScalarByToken(cell: unknown, declared: ColumnType): ColumnValue {
@@ -178,11 +229,15 @@ function decodeScalarByToken(cell: unknown, declared: ColumnType): ColumnValue {
       return { type: ColumnType.Bool, boolValue: cell };
 
     case 'bigint':
+      if (declared === ColumnType.Float64 || declared === ColumnType.Float32) {
+        return decodeFloat(Number(cell), declared);
+      }
+
       return { type: ColumnType.Integer64, longValue: cell };
 
     case 'number':
       if (declared === ColumnType.Float64 || declared === ColumnType.Float32) {
-        return { type: declared, floatValue: cell };
+        return decodeFloat(cell, declared);
       }
 
       return Number.isInteger(cell)
@@ -192,6 +247,15 @@ function decodeScalarByToken(cell: unknown, declared: ColumnType): ColumnValue {
     default:
       return NULL_VALUE;
   }
+}
+
+/**
+ * A float cell. The server writes a `float32` as the shortest text that names it, which read as a
+ * double is a nearby double rather than the stored value: `-9.321863E+23` is not a `float32`.
+ * Rounding it back to single precision recovers the stored value, which is what gRPC returns.
+ */
+function decodeFloat(value: number, declared: ColumnType): ColumnValue {
+  return { type: declared, floatValue: declared === ColumnType.Float32 ? Math.fround(value) : value };
 }
 
 /**

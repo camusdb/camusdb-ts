@@ -223,15 +223,15 @@ change what the statement means.
 | --- | --- |
 | `null`, `undefined` | `Null` |
 | `boolean` | `Bool` |
-| `number` that is an integer | `Integer64` |
-| `number` that is not | `Float64` |
+| `number` that is an integer, other than `-0` | `Integer64` |
+| `number` that is not, and `-0` | `Float64` |
 | `bigint` | `Integer64` |
 | `string` | `String` |
 | `Date` | `DateTime` |
 | `Uint8Array`, `Buffer`, `ArrayBuffer` | `Bytes` |
 | `Float32Array` | `Bytes`, packed as a vector |
 | `CamusObjectId` | `Id` |
-| an array | `Array`, with the element type read from the first element that is not null. When that element is a whole `number` and another `number` element is not whole, the element type is `Float64`. |
+| an array | `Array`, with the element type read from the first element that is not null. When that element is a whole `number` and another `number` element is not whole or is `-0`, the element type is `Float64`. |
 
 A UUID-shaped string is **not** read as a `uuid`. A 36-character string that happens to look like
 one would otherwise change type silently.
@@ -296,6 +296,15 @@ against an `OID` column. `camus.array(uuids, ColumnType.Id)` therefore sends a `
 | `Uuid` | `string`, canonical and lowercase |
 | `Numeric` | `string`, the exact decimal text — see [NUMERIC](#numeric) |
 | `Array` | an array of the values above |
+
+A `Float32` value is the single-precision number the server stored, on both transports. A negative
+zero keeps its sign in both directions.
+
+An array element reads as its element type on both transports. Over REST the driver reads that type
+from the `elementType` field of the result's `columns`. An older server does not send the field. A
+`Date`, `DateTime`, or `Bytes` element then reads as its wire value: the tick count as a number or
+a `bigint`, and the bytes as base64 text. A `Float64` array whose numbers are all whole reads them
+as integers. Use gRPC, or a newer server, when you read such arrays.
 
 ### 64-bit integers
 
@@ -564,8 +573,8 @@ A server from 0.13.2 on has sequences. A sequence stores `int64` values only, ha
 increment, and never cycles. The server refuses `CYCLE` with `CADB0533`, because a counter that
 wraps would issue again the values that committed rows already hold.
 
-`CREATE SEQUENCE`, `ALTER SEQUENCE`, and `DROP SEQUENCE` go to the DDL route. Two helpers compose
-the create and the drop statements:
+`CREATE SEQUENCE`, `ALTER SEQUENCE`, `DROP SEQUENCE`, and `COMMENT ON SEQUENCE` go to the DDL
+route. Two helpers compose the create and the drop statements:
 
 ```ts
 import { createSequenceStatement, dropSequenceStatement, nextValueExpression } from 'camusdb';

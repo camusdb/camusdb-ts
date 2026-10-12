@@ -598,9 +598,27 @@ describe('statement classification', () => {
     expect(isDdlStatement('CREATE SEQUENCE s START WITH 1')).toBe(true);
     expect(isDdlStatement('drop sequence if exists s')).toBe(true);
     expect(isDdlStatement('ALTER SEQUENCE s RENAME TO t')).toBe(true);
+    expect(isDdlStatement("COMMENT ON SEQUENCE s IS 'x'")).toBe(true);
     expect(isDdlStatement("SELECT nextval('s')")).toBe(false);
     expect(isDdlStatement('REFRESH MATERIALIZED VIEW v')).toBe(false);
     expect(isDdlStatement('SELECT 1')).toBe(false);
+  });
+
+  it('routes a sequence comment to the DDL route, but no other comment', () => {
+    expect(isDdlStatement("COMMENT ON SEQUENCE s IS 'x'")).toBe(true);
+    expect(isDdlStatement("  comment on sequence s is 'x'")).toBe(true);
+    expect(isDdlStatement('Comment On Sequence `s` IS NULL')).toBe(true);
+    expect(isDdlStatement("COMMENT  ON\n\tSEQUENCE s IS 'x'")).toBe(true);
+    expect(isDdlStatement("COMMENT ON TABLE t IS 'x'")).toBe(false);
+    expect(isDdlStatement("COMMENT ON COLUMN t.a IS 'x'")).toBe(false);
+    expect(isDdlStatement("COMMENTON SEQUENCE s IS 'x'")).toBe(false);
+  });
+
+  it('accepts any run of whitespace between the keywords of a prefix', () => {
+    expect(isDdlStatement('CREATE\n  TABLE robots (id id)')).toBe(true);
+    expect(isDdlStatement('create   or\treplace view v AS SELECT 1')).toBe(true);
+    expect(isDdlStatement('CREATETABLE robots (id id)')).toBe(false);
+    expect(isDdlStatement('CREATE')).toBe(false);
   });
 
   it('recognizes a write statement', () => {

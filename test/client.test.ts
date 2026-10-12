@@ -318,6 +318,16 @@ describe('sequences', () => {
     expect(server.callCount('execute-sql-non-query')).toBe(0);
   });
 
+  it('sends a sequence comment to the DDL route, which is the one route that runs it', async () => {
+    server.json('execute-sql-ddl', { status: 'ok' });
+
+    const result = await client().execute("COMMENT ON SEQUENCE `tickets` IS 'issued numbers'");
+
+    expect(result.affectedRows).toBe(0);
+    expect(server.callCount('execute-sql-ddl')).toBe(1);
+    expect(server.callCount('execute-sql-non-query')).toBe(0);
+  });
+
   it('draws the next value as a bigint', async () => {
     queryRoute([{ name: 'nextval', type: ColumnType.Integer64 }], [[105]]);
 
@@ -884,5 +894,118 @@ describe('the backup admin API', () => {
 
     // The backup routes are REST-only, so a gRPC client must be told where the HTTP port is.
     await expect(subject.backups.listBackups()).rejects.toThrow(CamusError);
+  });
+});
+
+describe('REST value fidelity', () => {
+  const UUID = '550e8400-e29b-41d4-a716-446655440000';
+  const DAY = new Date('2024-03-15T00:00:00.000Z');
+
+  /** A typed array column for each element type the server wires in a non-JSON form. */
+  const columns = [
+    { name: 'ad', type: ColumnType.Array, elementType: ColumnType.Date },
+    { name: 'ab', type: ColumnType.Array, elementType: ColumnType.Bytes },
+    { name: 'au', type: ColumnType.Array, elementType: ColumnType.Uuid },
+    { name: 'af', type: ColumnType.Array, elementType: ColumnType.Float64 },
+    { name: 'ag', type: ColumnType.Array, elementType: ColumnType.Float32 },
+    { name: 'g', type: ColumnType.Float32 },
+  ];
+
+  function row(): unknown[] {
+    const { high, low } = uuidToHalves(UUID);
+
+    return [[dateToTicks(DAY)], ['AQID'], [[high, low]], [0, -0, 1.5], [-9.321863e23], -9.321863e23];
+  }
+
+  const expected = {
+    ad: [DAY],
+    ab: [new Uint8Array([1, 2, 3])],
+    au: [UUID],
+    af: [0, -0, 1.5],
+    ag: [Math.fround(-9.321863e23)],
+    g: Math.fround(-9.321863e23),
+  };
+
+  it('writes a negative zero float parameter as -0', async () => {
+    server.json('execute-sql-non-query', { status: 'ok', rows: 1 });
+    server.json('insert', { status: 'ok', rows: 1 });
+
+    const subject = client();
+
+    await subject.execute('INSERT INTO t (id, f, g, af) VALUES (@id, @f, @g, @af)', {
+      id: 1,
+      f: camus.float64(-0),
+      g: camus.float32(-0),
+      af: camus.array([-0, 0.5], ColumnType.Float64),
+    });
+
+    await subject.insert('t', { f: camus.float64(-0) });
+    await subject.execute('INSERT INTO t (f, af) VALUES (@f, @af)', { f: -0, af: [1, -0] });
+
+    const raw = server.requestsTo('execute-sql-non-query')[0]!.rawBody;
+
+    expect(raw).toContain('"@f":{"type":5,"floatValue":-0}');
+    expect(raw).toContain('"@g":{"type":6,"floatValue":-0}');
+    expect(raw).toContain('"arrayValues":[{"type":5,"floatValue":-0},{"type":5,"floatValue":0.5}]');
+    expect(server.requestsTo('insert')[0]!.rawBody).toContain('"f":{"type":5,"floatValue":-0}');
+
+    // A plain -0 is inferred as a float, alone and among the numbers of an array.
+    const inferred = server.requestsTo('execute-sql-non-query')[1]!.rawBody;
+
+    expect(inferred).toContain('"@f":{"type":5,"floatValue":-0}');
+    expect(inferred).toContain(
+      '"@af":{"type":10,"arrayElementType":5,"arrayValues":[{"type":5,"floatValue":1},{"type":5,"floatValue":-0}]}',
+    );
+  });
+
+  it('decodes typed array elements and float32 cells in a query', async () => {
+    server.json('execute-sql-query', stringifyLossless({ status: 'ok', columns, rows: [row()] }));
+
+    const rows = (await client().query('SELECT * FROM t', undefined, { int64: 'bigint' })).rows;
+
+    expect(rows).toEqual([expected]);
+    expect(Object.is((rows[0] as typeof expected).af[1], -0)).toBe(true);
+  });
+
+  it('decodes typed array elements in a stream', async () => {
+    server.on('execute-sql-query-stream', (_request, response) => {
+      respondNdjson(response, [
+        { status: 'ok', columns },
+        stringifyLossless(row()),
+        { status: 'ok', total: 1 },
+      ]);
+    });
+
+    const stream = await client().queryStream('SELECT * FROM t', undefined, { int64: 'bigint' });
+
+    expect(await stream.toArray()).toEqual([expected]);
+  });
+
+  it('decodes typed array elements in the rows a write returns', async () => {
+    server.json(
+      'execute-sql-non-query',
+      stringifyLossless({ status: 'ok', rows: 1, columns, returningRows: [row()] }),
+    );
+
+    const result = await client().query('INSERT INTO t (ad) VALUES (@ad) RETURNING *', { ad: [] });
+
+    expect(result.rows).toEqual([expected]);
+  });
+
+  it('writes a negative zero as -0 in the values of a prepared statement', async () => {
+    server.json('prepare-sql-statement', { status: 'ok', statementId: 'stmt-1', parameterNames: ['@f'] });
+    server.json('execute-sql-query', stringifyLossless({ status: 'ok', columns, rows: [row()] }));
+
+    const subject = client();
+    const sql = 'SELECT * FROM t WHERE f = @f';
+
+    await subject.prepare(sql);
+    const rows = (await subject.query(sql, { f: camus.float64(-0) }, { int64: 'bigint' })).rows;
+
+    const body = server.requestsTo('execute-sql-query')[0]!;
+
+    expect((body.body as Record<string, unknown>).statementId).toBe('stmt-1');
+    expect(body.rawBody).toContain('"positionalParameters":[{"type":5,"floatValue":-0}]');
+    expect(rows).toEqual([expected]);
   });
 });

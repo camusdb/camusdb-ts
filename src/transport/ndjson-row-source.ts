@@ -37,16 +37,25 @@ export class NdjsonRowSource implements CamusRowSource {
 
   readonly recordsAffected = -1;
 
+  /** The element type of each `Array` column, or `Null` when the header did not report one. */
+  private readonly elementTypes: readonly ColumnType[];
+
   private readonly lines: LineReader;
 
   private finished = false;
 
   private closed = false;
 
-  private constructor(lines: LineReader, names: readonly string[], types: readonly ColumnType[]) {
+  private constructor(
+    lines: LineReader,
+    names: readonly string[],
+    types: readonly ColumnType[],
+    elementTypes: readonly ColumnType[],
+  ) {
     this.lines = lines;
     this.columnNames = names;
     this.columnTypes = types;
+    this.elementTypes = elementTypes;
   }
 
   /** Reads the header line and reports a source positioned before the first row. */
@@ -100,9 +109,9 @@ export class NdjsonRowSource implements CamusRowSource {
       throw error;
     }
 
-    const { names, types } = readSchema((parsed as { columns?: unknown }).columns);
+    const { names, types, elementTypes } = readSchema((parsed as { columns?: unknown }).columns);
 
-    return new NdjsonRowSource(lines, names, types);
+    return new NdjsonRowSource(lines, names, types, elementTypes);
   }
 
   async next(): Promise<readonly ColumnValue[] | undefined> {
@@ -135,7 +144,7 @@ export class NdjsonRowSource implements CamusRowSource {
       const limit = Math.min(cells.length, parsed.length);
 
       for (let c = 0; c < limit; c++) {
-        cells[c] = decodeCell(parsed[c] as unknown, this.columnTypes[c]!);
+        cells[c] = decodeCell(parsed[c] as unknown, this.columnTypes[c]!, this.elementTypes[c]);
       }
 
       return cells;

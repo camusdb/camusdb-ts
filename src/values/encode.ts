@@ -151,7 +151,8 @@ function encodeInferred(value: unknown): ColumnValue {
       return { type: ColumnType.String, strValue: value };
 
     case 'number':
-      return Number.isInteger(value)
+      // A negative zero is a float: an int64 has no sign for zero, so it would bind as 0.
+      return isWholeInteger(value)
         ? { type: ColumnType.Integer64, longValue: BigInt(value) }
         : { type: ColumnType.Float64, floatValue: value };
 
@@ -211,7 +212,7 @@ function encodeArray(value: unknown, declaredElementType: ColumnType): ColumnVal
       // JavaScript has one number type, so `[2, 1.5]` is a float array whose first value happens
       // to be whole. Read from the first number alone it would be Integer64, and 1.5 would then
       // fail to encode. A bigint or a `camus.*` element states its type, so it is not widened.
-      if (typeof item === 'number' && elementType === ColumnType.Integer64 && hasFractionalNumber(value)) {
+      if (typeof item === 'number' && elementType === ColumnType.Integer64 && hasFloatNumber(value)) {
         elementType = ColumnType.Float64;
       }
 
@@ -242,13 +243,21 @@ function encodeArray(value: unknown, declaredElementType: ColumnType): ColumnVal
   return { type: ColumnType.Array, arrayElementType: elementType, arrayValues: items };
 }
 
-/** True when some element is a `number` that is not an integer, `NaN` and the infinities included. */
-function hasFractionalNumber(items: readonly unknown[]): boolean {
+/**
+ * True when some element is a `number` an int64 cannot hold: one that is not an integer, `NaN` and
+ * the infinities included, or a negative zero.
+ */
+function hasFloatNumber(items: readonly unknown[]): boolean {
   for (const item of items) {
-    if (typeof item === 'number' && !Number.isInteger(item)) return true;
+    if (typeof item === 'number' && !isWholeInteger(item)) return true;
   }
 
   return false;
+}
+
+/** True for an integer `number` other than negative zero, which only a float can hold. */
+function isWholeInteger(value: number): boolean {
+  return Number.isInteger(value) && !Object.is(value, -0);
 }
 
 function inferElementType(item: unknown): ColumnType {

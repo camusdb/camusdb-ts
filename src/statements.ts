@@ -48,10 +48,13 @@ const DDL_PREFIXES = [
   'DROP MATERIALIZED VIEW',
   'ALTER MATERIALIZED VIEW',
   // Sequences. ALTER SEQUENCE covers both the option form and RENAME TO. COMMENT ON SEQUENCE is
-  // absent, as COMMENT ON is for every other object: the data route handles it itself.
+  // here although COMMENT ON for every other object is not: the data route handles those itself,
+  // but released servers refuse a sequence comment there as an unknown statement, and only the
+  // DDL route runs it.
   'CREATE SEQUENCE',
   'DROP SEQUENCE',
   'ALTER SEQUENCE',
+  'COMMENT ON SEQUENCE',
 ];
 
 const DML_PREFIXES = ['INSERT', 'UPDATE', 'DELETE'];
@@ -103,14 +106,48 @@ export function runsInOwnTransaction(sql: string): boolean {
   return startsWithAny(sql, OWN_TRANSACTION_PREFIXES);
 }
 
+/**
+ * True when the statement begins with one of the prefixes, ignoring case.
+ *
+ * The keywords of a prefix may be separated by any run of whitespace, including a line break, as
+ * they may be in SQL: `COMMENT  ON\nSEQUENCE` is the same statement as `COMMENT ON SEQUENCE`, and
+ * a strict match would send it to a route that refuses it.
+ */
 function startsWithAny(sql: string, prefixes: readonly string[]): boolean {
   const trimmed = sql.trimStart();
 
   for (const prefix of prefixes) {
-    if (trimmed.length < prefix.length) continue;
-
-    if (trimmed.slice(0, prefix.length).toUpperCase() === prefix) return true;
+    if (startsWithKeywords(trimmed, prefix)) return true;
   }
 
   return false;
+}
+
+function startsWithKeywords(text: string, prefix: string): boolean {
+  let position = 0;
+  let wordStart = 0;
+
+  while (wordStart < prefix.length) {
+    if (wordStart > 0) {
+      // At least one whitespace character must separate two keywords.
+      const separatorStart = position;
+      while (position < text.length && /\s/.test(text[position]!)) position++;
+      if (position === separatorStart) return false;
+    }
+
+    const space = prefix.indexOf(' ', wordStart);
+    const wordEnd = space === -1 ? prefix.length : space;
+    const length = wordEnd - wordStart;
+
+    if (text.length - position < length) return false;
+
+    if (text.slice(position, position + length).toUpperCase() !== prefix.slice(wordStart, wordEnd)) {
+      return false;
+    }
+
+    position += length;
+    wordStart = wordEnd + 1;
+  }
+
+  return true;
 }

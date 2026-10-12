@@ -15,8 +15,9 @@
  * driver: a row must come back holding what was written.
  *
  * So this module reads an integer that does not fit a `number` as a `bigint`, and writes a
- * `bigint` as the bare digits a JSON number is. Everything else behaves exactly as the built-in
- * functions do.
+ * `bigint` as the bare digits a JSON number is. It also writes a negative zero as `-0`, where
+ * `JSON.stringify` writes `0` and so turns a bound `-0.0` into a positive zero on the server.
+ * Everything else behaves exactly as the built-in functions do.
  */
 
 /**
@@ -34,7 +35,7 @@ export function parseLossless(text: string): unknown {
 const LONG_INTEGER = /\d{16,}/;
 
 /**
- * Serializes a value as JSON, writing a `bigint` as a JSON number.
+ * Serializes a value as JSON, writing a `bigint` as a JSON number and a negative zero as `-0`.
  *
  * `undefined`, a function, and a symbol are omitted from an object and become `null` in an array,
  * which is what `JSON.stringify` does. A value with a `toJSON` method is replaced by its result,
@@ -64,7 +65,10 @@ function writeValue(value: unknown, out: string[], depth: number): void {
       return;
 
     case 'number':
-      out.push(Number.isFinite(value) ? String(value) : 'null');
+      // `String(-0)` is `'0'`. The server reads `-0` as the negative zero it is, into a float or
+      // an integer field alike.
+      if (Object.is(value, -0)) out.push('-0');
+      else out.push(Number.isFinite(value) ? String(value) : 'null');
       return;
 
     case 'boolean':

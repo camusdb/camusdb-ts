@@ -261,6 +261,37 @@ describe('encodeParameter', () => {
     expect(bools.arrayValues!.map((item) => item.type)).toEqual([ColumnType.Bool, ColumnType.Null]);
   });
 
+  it('binds a negative zero as a float, which keeps its sign', () => {
+    const value = encodeParameter(-0);
+
+    expect(value).toEqual({ type: ColumnType.Float64, floatValue: -0 });
+    expect(Object.is(value.floatValue, -0)).toBe(true);
+    expect(encodeParameter(0)).toEqual({ type: ColumnType.Integer64, longValue: 0n });
+  });
+
+  it('binds an array with a negative zero among its numbers as a float array', () => {
+    for (const items of [
+      [1, -0],
+      [-0, 1],
+      [null, -0],
+    ]) {
+      const value = encodeParameter(items);
+
+      expect(value.arrayElementType).toBe(ColumnType.Float64);
+      expect(value.arrayValues!.filter((item) => item.type !== ColumnType.Null)).toEqual(
+        items.filter((item) => item !== null).map((floatValue) => ({ type: ColumnType.Float64, floatValue })),
+      );
+    }
+
+    expect(Object.is(encodeParameter([1, -0]).arrayValues![1]!.floatValue, -0)).toBe(true);
+    expect(encodeParameter([0, 1]).arrayElementType).toBe(ColumnType.Integer64);
+
+    // A stated element type is kept: an int64 has no negative zero.
+    expect(encodeParameter(camus.array([-0], ColumnType.Integer64)).arrayValues).toEqual([
+      { type: ColumnType.Integer64, longValue: 0n },
+    ]);
+  });
+
   it('refuses an array whose elements are all null', () => {
     expect(() => encodeParameter([null, null])).toThrow(CamusError);
 

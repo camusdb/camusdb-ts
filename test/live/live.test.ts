@@ -21,6 +21,11 @@
  *                             server refuses the clause as a parse error
  *   CAMUS_LIVE_NUMERIC        set to true to run the NUMERIC cases, which need a server with the
  *                             NUMERIC column type
+ *   CAMUS_LIVE_ARRAY_ELEMENT_TYPES
+ *                             set to true to run the typed-array cases, which need a server that
+ *                             reports an array column's element type in a REST result: without it,
+ *                             REST reads a date, bytes, or a whole-numbered float element as a
+ *                             plain JSON value
  *
  * Every case creates its own table and drops it afterwards, so the suite leaves nothing behind and
  * two runs never collide.
@@ -52,6 +57,7 @@ const LARGE_VALUES = process.env.CAMUS_LIVE_LARGE_VALUES?.toLowerCase() === 'tru
 const SEQUENCES = process.env.CAMUS_LIVE_SEQUENCES?.toLowerCase() === 'true';
 const RETURNING = process.env.CAMUS_LIVE_RETURNING?.toLowerCase() === 'true';
 const NUMERIC = process.env.CAMUS_LIVE_NUMERIC?.toLowerCase() === 'true';
+const ARRAY_ELEMENT_TYPES = process.env.CAMUS_LIVE_ARRAY_ELEMENT_TYPES?.toLowerCase() === 'true';
 
 const CREDENTIALS =
   process.env.CAMUS_LIVE_USER === undefined
@@ -354,6 +360,33 @@ function suite(name: string, options: Partial<CamusClientOptions>): void {
       expect([...result.rows].map((row) => row.n).sort(compareBigInt)).toEqual(
         [...values].sort(compareBigInt),
       );
+    });
+
+    it('keeps a negative zero and a float32 exact', async () => {
+      const table = uniqueName('floats');
+
+      await client.executeDdl(`CREATE TABLE ${table} (id INT64 PRIMARY KEY NOT NULL, f FLOAT64, g FLOAT32)`);
+      tables.push(table);
+
+      const insert = `INSERT INTO ${table} (id, f, g) VALUES (@id, @f, @g)`;
+
+      await client.execute(insert, { id: 1, f: camus.float64(-0), g: camus.float32(-0) });
+      await client.execute(insert, { id: 2, f: camus.float64(0.1), g: camus.float32(-9.321863e23) });
+
+      // A prepared statement sends its values positionally, which is a separate encoding path.
+      await client.prepare(insert);
+      await client.execute(insert, { id: 3, f: camus.float64(-0), g: camus.float32(-0) });
+
+      const result = await client.query<{ id: number; f: number; g: number }>(
+        `SELECT id, f, g FROM ${table} ORDER BY id`,
+      );
+
+      expect(result.rows).toEqual([
+        { id: 1, f: -0, g: -0 },
+        { id: 2, f: 0.1, g: Math.fround(-9.321863e23) },
+        { id: 3, f: -0, g: -0 },
+      ]);
+      expect(Object.is(result.rows[0]!.f, -0)).toBe(true);
     });
 
     it('reads a null as null', async () => {
@@ -1156,6 +1189,18 @@ describe.runIf(SEQUENCES)('sequences', () => {
         await expect(client.nextSequenceValue(renamed)).rejects.toThrow(CamusError);
       });
 
+      it('comments on a sequence through execute', async () => {
+        const sequence = uniqueName('seq');
+
+        try {
+          await client.execute(createSequenceStatement(sequence));
+          await client.execute(`COMMENT ON SEQUENCE \`${sequence}\` IS 'issued numbers'`);
+          await client.execute(`COMMENT ON SEQUENCE \`${sequence}\` IS NULL`);
+        } finally {
+          await client.executeDdl(dropSequenceStatement(sequence, { ifExists: true })).catch(() => undefined);
+        }
+      });
+
       it('fills a column default from a sequence', async () => {
         const sequence = uniqueName('seq');
         const table = uniqueName('seq_t');
@@ -1488,6 +1533,73 @@ describe('unsupported column types', () => {
 
     await client.close();
   });
+});
+
+describe.runIf(ARRAY_ELEMENT_TYPES)('typed arrays', () => {
+  for (const [name, options] of [
+    ['REST transport', { protocol: 'rest', endpoint: REST_ENDPOINT }],
+    ['gRPC transport', { protocol: 'grpc', endpoint: GRPC_ENDPOINT }],
+  ] as const) {
+    describe(name, () => {
+      let client: CamusClient;
+      const tables: string[] = [];
+
+      beforeAll(async () => {
+        client = new CamusClient({ database: DATABASE, timeoutSeconds: 30, ...CREDENTIALS, ...options });
+        await client.createDatabase(undefined, { ifNotExists: true });
+      });
+
+      afterAll(async () => {
+        for (const table of tables) await client.executeDdl(`DROP TABLE ${table}`).catch(() => undefined);
+        await client.close();
+      });
+
+      it('reads every element type back as the type it was written as', async () => {
+        const table = uniqueName('arrays');
+
+        await client.executeDdl(
+          `CREATE TABLE ${table} (id INT64 PRIMARY KEY NOT NULL, ad ARRAY(DATE), adt ARRAY(DATETIME),` +
+            ' ab ARRAY(BYTES), au ARRAY(UUID), af ARRAY(FLOAT64), ag ARRAY(FLOAT32), ai ARRAY(INT64))',
+        );
+        tables.push(table);
+
+        const day = new Date('2024-03-15T00:00:00.000Z');
+        const instant = new Date('2024-03-15T12:34:56.789Z');
+        const uuid = '550e8400-e29b-41d4-a716-446655440000';
+
+        const values = {
+          id: 1,
+          ad: camus.array([day], ColumnType.Date),
+          adt: camus.array([instant], ColumnType.DateTime),
+          ab: camus.array([new Uint8Array([1, 2, 3])], ColumnType.Bytes),
+          au: camus.array([uuid], ColumnType.Uuid),
+          af: camus.array([0, -0, 1.5], ColumnType.Float64),
+          ag: camus.array([-9.321863e23], ColumnType.Float32),
+          ai: camus.array([7, 9223372036854775807n], ColumnType.Integer64),
+        };
+
+        await client.execute(
+          `INSERT INTO ${table} (id, ad, adt, ab, au, af, ag, ai) VALUES (@id, @ad, @adt, @ab, @au, @af, @ag, @ai)`,
+          values,
+        );
+
+        const expected = {
+          ad: [day],
+          adt: [instant],
+          ab: [new Uint8Array([1, 2, 3])],
+          au: [uuid],
+          af: [0, -0, 1.5],
+          ag: [Math.fround(-9.321863e23)],
+          ai: [7, 9223372036854775807n],
+        };
+
+        const sql = `SELECT ad, adt, ab, au, af, ag, ai FROM ${table}`;
+
+        expect((await client.query(sql)).rows).toEqual([expected]);
+        expect(await (await client.queryStream(sql)).toArray()).toEqual([expected]);
+      });
+    });
+  }
 });
 
 it('exposes the array column type for a caller that needs it', () => {

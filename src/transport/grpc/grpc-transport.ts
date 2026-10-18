@@ -13,6 +13,8 @@ import { CamusProtocol } from '../../config.js';
 import { CamusError } from '../../errors.js';
 import { CamusErrorCode } from '../../error-codes.js';
 import type { CamusEndpointPool } from '../../endpoint-pool.js';
+import type { CamusNodeStats } from '../../node-stats.js';
+import { nodeStatsFromWire } from '../../node-stats.js';
 import type { CamusTransactionOptions } from '../../options.js';
 import { setOwn } from '../../own-record.js';
 import { CamusIsolationLevel, CamusLocking, CamusTransactionMode } from '../../options.js';
@@ -33,16 +35,32 @@ import type {
   CamusBranchRow,
   CamusTransport,
   NonQueryTransportResult,
+  PipelineStatementOutcome,
+  PipelineTransportResult,
   PreparedStatementInfo,
   QueryTransportResult,
   StartTransactionResult,
   TransportInsertRequest,
+  TransportPipelineRequest,
   TransportSqlRequest,
 } from '../transport.js';
 import { hasTransaction } from '../transport.js';
-import { announcesFrames, FRAME_ACCEPT_HEADER, FRAME_HEADER, FRAME_VERSION } from './batch-frames.js';
-import type { BatchCausalToken, BatchStream, PreparedSlotEntry } from './batcher.js';
-import { EMPTY_CAUSAL_TOKEN, GrpcBatcher, PreparedStatementStaleError } from './batcher.js';
+import { runSequentialPipeline } from '../sequential-pipeline.js';
+import { announcedFrameVersion, FRAME_ACCEPT_HEADER, FRAME_HEADER, FRAME_VERSION } from './batch-frames.js';
+import type {
+  BatchCausalToken,
+  BatchNonQueryResult,
+  BatchQueryResult,
+  BatchStream,
+  PipelineOp,
+  PreparedSlotEntry,
+} from './batcher.js';
+import {
+  EMPTY_CAUSAL_TOKEN,
+  GrpcBatcher,
+  PipelineUnsupportedError,
+  PreparedStatementStaleError,
+} from './batcher.js';
 import { buildResultSet, encodeValue, fromWire, toWire } from './codec.js';
 import { indicatesEndpointDown, isEndpointUnreachable } from './endpoint-health.js';
 import type {
@@ -57,7 +75,12 @@ import type {
   GrpcTxnHandle,
   GrpcValue,
 } from './messages.js';
-import { GrpcIsolationLevel, GrpcLockingMode, GrpcTransactionMode } from './messages.js';
+import {
+  GrpcBatchStatementKind,
+  GrpcIsolationLevel,
+  GrpcLockingMode,
+  GrpcTransactionMode,
+} from './messages.js';
 import type {
   GrpcDuplexCall,
   GrpcMetadata,
@@ -236,6 +259,240 @@ export class GrpcTransport implements CamusTransport, CamusLoginClient {
     });
   }
 
+  // ─── Pipelines ────────────────────────────────────────────────────────────
+
+  /**
+   * Sends a whole pipeline as one stream message: the start that its statements name by
+   * `txnStartRef`, the statements, and a conditional commit. It is one exchange, answered
+   * operation by operation.
+   *
+   * The batcher decides, for each stream and at the moment of the write, whether the pipeline can
+   * be written as one frame. The stream's server must have announced the pipeline contract, frames
+   * must be on, and the pipeline must fit one frame. When it cannot, every operation fails with
+   * `PipelineUnsupportedError` before anything was written. The same request then runs here one
+   * exchange per step, exactly as it ran before pipelines.
+   *
+   * Prepared executions follow the rules for a lone operation (see `executeBatched`). A
+   * registration that is found stale before the write is dropped, and the pipeline is sent again,
+   * prepared once more and then inline. A transaction that finishes on a rotated-out stream runs
+   * inline from the start. A stale handle that the server reports after the pipeline began
+   * (`CADB0520`) is a statement failure like any other, because the transaction it began is gone
+   * with it. The caller then retries from `BEGIN`, as for a conflict.
+   */
+  async executePipeline(request: TransportPipelineRequest): Promise<PipelineTransportResult> {
+    await this.auth.getToken(request.signal);
+
+    const batcher = await this.batcherFor(request.endpoint);
+    const slot = request.streamSlot ?? batcher.reserveSlot();
+
+    const mayPrepare = !(
+      request.txnIdPT !== undefined &&
+      request.txnIdCounter !== undefined &&
+      batcher.isBoundToRetiredStream(request.txnIdPT, request.txnIdCounter)
+    );
+
+    const result = await this.withDeadline(request.timeoutSeconds, request.signal, async (callSignal) => {
+      for (let attempt = 0; ; attempt++) {
+        const { ops, entries } = await this.buildPipelineOps(
+          batcher,
+          slot,
+          request,
+          mayPrepare && attempt < 2,
+          callSignal,
+        );
+
+        const settled = await Promise.allSettled(batcher.enqueuePipeline(ops, slot, callSignal));
+
+        const reasons: unknown[] = settled.flatMap((outcome) =>
+          outcome.status === 'rejected' ? [outcome.reason as unknown] : [],
+        );
+
+        if (callSignal?.aborted === true && reasons.includes(callSignal.reason)) throw callSignal.reason;
+
+        // Nothing was written in either case below, so the same request can be sent again.
+        if (reasons.some((reason) => reason instanceof PipelineUnsupportedError)) return undefined;
+
+        if (attempt < 2 && reasons.some((reason) => reason instanceof PreparedStatementStaleError)) {
+          entries.forEach((entry, i) => {
+            if (entry !== undefined) {
+              batcher.invalidatePrepared(slot, request.database, request.statements[i]!.sql, entry);
+            }
+          });
+
+          continue;
+        }
+
+        return this.assemblePipelineResult(request, settled, slot);
+      }
+    });
+
+    return result ?? runSequentialPipeline(this, request);
+  }
+
+  /**
+   * The wire operations of a pipeline, in order, and the prepared registration each statement used,
+   * so that a stale one can be dropped. An entry is `undefined` for an inline statement. When a
+   * registration cannot be had, that statement runs inline, as a lone one does: to prepare is an
+   * optimization.
+   */
+  private async buildPipelineOps(
+    batcher: GrpcBatcher,
+    slot: number,
+    request: TransportPipelineRequest,
+    prepared: boolean,
+    signal: AbortSignal | undefined,
+  ): Promise<{ ops: PipelineOp[]; entries: (PreparedSlotEntry | undefined)[] }> {
+    const ops: PipelineOp[] = [];
+    const entries: (PreparedSlotEntry | undefined)[] = [];
+
+    if (request.start !== undefined) {
+      ops.push({
+        kind: GrpcBatchStatementKind.Start,
+        request: { database: request.database, ...concurrencyFields(request.start) },
+      });
+    }
+
+    for (const statement of request.statements) {
+      const sql: TransportSqlRequest = {
+        endpoint: request.endpoint,
+        database: request.database,
+        sql: statement.sql,
+        parameters: statement.parameters,
+        txnIdPT: request.txnIdPT,
+        txnIdCounter: request.txnIdCounter,
+        streamSlot: slot,
+        timeoutSeconds: request.timeoutSeconds,
+        prepared: statement.prepared,
+        routingAcceptVersion: statement.routingAcceptVersion,
+        discardReturningRows: statement.discardReturningRows,
+      };
+
+      const kind =
+        statement.kind === 'query' ? GrpcBatchStatementKind.Query : GrpcBatchStatementKind.NonQuery;
+
+      let entry: PreparedSlotEntry | undefined;
+
+      if (prepared && statement.prepared) {
+        try {
+          entry = await batcher.ensurePrepared(slot, request.database, statement.sql, signal);
+        } catch (error) {
+          // It runs inline instead, as a lone statement does.
+          if (!CamusError.is(error)) throw error;
+        }
+      }
+
+      entries.push(entry);
+
+      ops.push(
+        entry === undefined
+          ? { kind, request: this.buildSqlRequest(sql) }
+          : {
+              kind,
+              request: this.buildPreparedSqlRequest(sql, entry),
+              expectedTransportId: entry.transportId,
+            },
+      );
+    }
+
+    if (request.commit) {
+      const commit: GrpcSqlRequest = { database: request.database };
+
+      if (request.txnIdPT !== undefined && request.txnIdCounter !== undefined) {
+        commit.txnHandle = this.buildHandle(request.txnIdPT, request.txnIdCounter);
+      }
+
+      ops.push({ kind: GrpcBatchStatementKind.CommitIfOk, request: commit });
+    }
+
+    return { ops, entries };
+  }
+
+  /** Reads one answered pipeline, operation by operation, into the transport-neutral result. */
+  private assemblePipelineResult(
+    request: TransportPipelineRequest,
+    settled: PromiseSettledResult<unknown>[],
+    slot: number,
+  ): PipelineTransportResult {
+    let next = 0;
+    let started: StartTransactionResult | undefined;
+    let startFailure: Error | undefined;
+
+    if (request.start !== undefined) {
+      const start = settled[next++]!;
+
+      if (start.status === 'fulfilled') {
+        const handle = start.value as GrpcTxnHandle;
+
+        this.observeToken({
+          n: handle.causalTokenN,
+          l: fromWire(handle.causalTokenL),
+          c: fromWire(handle.causalTokenC),
+        });
+
+        started = { txnIdPT: fromWire(handle.txnIdPt), txnIdCounter: handle.txnIdCounter, streamSlot: slot };
+      } else {
+        startFailure = toError(start.reason);
+
+        // Thrown and not reported, so the authenticating wrapper can renew the token and replay. A
+        // start refused for its token ran nothing, and neither did the operations that named it.
+        if (CamusError.is(startFailure) && startFailure.code === CamusErrorCode.AuthenticationFailed) {
+          throw startFailure;
+        }
+      }
+    }
+
+    const outcomes: PipelineStatementOutcome[] = request.statements.map((statement) => {
+      const outcome = settled[next++]!;
+
+      if (outcome.status === 'rejected') return { failure: toError(outcome.reason) };
+
+      if (statement.kind === 'query') {
+        const query = outcome.value as BatchQueryResult;
+
+        this.observeToken(query.token);
+
+        return {
+          query: {
+            resultSet: buildResultSet(query.schema, query.rows),
+            cacheMetadata: query.cacheMetadata,
+            routing: query.routing,
+          },
+        };
+      }
+
+      const nonQuery = outcome.value as BatchNonQueryResult;
+
+      this.observeToken(nonQuery.token);
+
+      return {
+        nonQuery: {
+          affectedRows: nonQuery.affectedRows,
+          routing: nonQuery.routing,
+          returning:
+            nonQuery.returningSchema === undefined
+              ? undefined
+              : buildResultSet(nonQuery.returningSchema, nonQuery.returningRows),
+        },
+      };
+    });
+
+    let committed = false;
+    let commitFailure: Error | undefined;
+
+    if (request.commit) {
+      const commit = settled[next]!;
+
+      if (commit.status === 'fulfilled') {
+        this.observeToken(commit.value as BatchCausalToken);
+        committed = true;
+      } else {
+        commitFailure = toError(commit.reason);
+      }
+    }
+
+    return { started, startFailure, statements: outcomes, committed, commitFailure, exchanges: 1 };
+  }
+
   // ─── Prepared statements ──────────────────────────────────────────────────
 
   async prepare(
@@ -384,6 +641,19 @@ export class GrpcTransport implements CamusTransport, CamusLoginClient {
   async ping(endpoint: string, timeoutSeconds: number, signal?: AbortSignal): Promise<boolean> {
     const reply = await this.unary<GrpcPingReply>(endpoint, 'sql', 'ping', {}, timeoutSeconds, signal);
     return reply !== null && reply !== undefined;
+  }
+
+  /**
+   * Calls `CamusSql.GetNodeStats`. A message field that an older server left unset keeps the -1
+   * defaults of the model, and does not become zeros.
+   */
+  async getNodeStats(
+    endpoint: string,
+    timeoutSeconds: number,
+    signal?: AbortSignal,
+  ): Promise<CamusNodeStats> {
+    const reply = await this.unary<unknown>(endpoint, 'sql', 'getNodeStats', {}, timeoutSeconds, signal);
+    return nodeStatsFromWire(endpoint, reply);
   }
 
   // ─── Database administration, composed as SQL ─────────────────────────────
@@ -598,16 +868,16 @@ export class GrpcTransport implements CamusTransport, CamusLoginClient {
     const call = method.call(client, metadata);
 
     let closed = false;
-    let announced = false;
+    let announced = 0;
 
     call.on('metadata', (headers: GrpcMetadata) => {
-      if (announcesFrames(headerValue(headers, FRAME_HEADER))) announced = true;
+      announced = announcedFrameVersion(headerValue(headers, FRAME_HEADER));
     });
 
     return {
       id,
 
-      get framesAnnounced() {
+      get announcedVersion() {
         return announced;
       },
 
@@ -868,6 +1138,10 @@ function isStaleRegistration(error: unknown): boolean {
     error instanceof PreparedStatementStaleError ||
     (CamusError.is(error) && error.code === CamusErrorCode.UnknownPreparedStatement)
   );
+}
+
+function toError(error: unknown): Error {
+  return error instanceof Error ? error : new Error(String(error));
 }
 
 function encodeParameters(

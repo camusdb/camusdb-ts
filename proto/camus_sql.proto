@@ -234,6 +234,14 @@ enum BatchStatementKind {
   // support on this stream's response headers: a server built before frames runs an unknown kind
   // as a NON_QUERY, so a probe would be executed as SQL.
   BATCH_STATEMENT_KIND_FRAME       = 8;
+  // A conditional COMMIT: commits request.txn_handle (or the transaction named by txn_start_ref)
+  // only when every earlier op of that transaction on this stream succeeded; otherwise it rolls the
+  // transaction back (a no-op when the failed statement already did) and answers with the FIRST
+  // failure's code and message instead of a commit_reply. It is what lets a client put the commit
+  // in the same frame as the statements it depends on, since a frame itself gives no atomicity.
+  // Contract version 2: NEVER sent to a server that announced a lower version, which would run it
+  // as a NON_QUERY and leave the transaction open.
+  BATCH_STATEMENT_KIND_COMMIT_IF_OK = 9;
 }
 
 // PREPARE terminator. The client MUST await this reply before sending any op that references the
@@ -278,6 +286,17 @@ message BatchExecuteRequest {
   // `items` is read, on every other kind only `request` is read. A message that sets `items` with a
   // kind other than FRAME, or sets `request` on a FRAME, is invalid.
   repeated BatchExecuteRequest items = 4;
+  // Items of a FRAME only (contract version 2): the request_id of a START item EARLIER in the same
+  // frame whose transaction this op belongs to. The handle does not exist when the frame is sent,
+  // so the op names the START instead of a txn_handle; the server resolves it once the START has
+  // answered and runs the op on that transaction, chained behind the START and the earlier ops that
+  // name it. Rules: it must be unset (0) on a message outside a frame; it must name a START that
+  // precedes this item in the same frame; it may not be combined with request.txn_handle; a START,
+  // PREPARE or CLOSE may not carry one. A violation refuses the op with CADB0400 and runs nothing.
+  // When the START itself fails, every op that names it is answered with the START's error and
+  // runs nothing. NEVER sent to a server that announced a lower version: it would ignore the field
+  // and run the op as an autocommit statement.
+  int32 txn_start_ref = 5;
 }
 
 // Response-side frame. A wrapper message because a oneof cannot hold a repeated field.
@@ -467,6 +486,99 @@ message PingReply {
   string message = 1;
 }
 
+// ─── Node stats ───────────────────────────────────────────────────────────────
+// The resource state of the node that receives the call (not the cluster): disk, CPU and memory.
+// Every size is bytes and every number is plain. A value the node cannot read is -1, never 0, and
+// has an entry in `errors`; one failed probe never fails the call. See docs/node-stats.md.
+//
+// Authorization: with authentication on, a superuser or a holder of the MONITOR privilege
+// (GRANT MONITOR ON *.* TO <user>); anyone else gets PERMISSION_DENIED (CADB0517). With
+// authentication off, anyone. The same answer is served over REST at GET /v1/admin/stats.
+
+message NodeStatsRequest {}
+
+message NodeIdentity {
+  // The node's Raft node id; empty early in boot.
+  string node_id            = 1;
+  // The node's Raft endpoint (host:port); empty early in boot.
+  string endpoint           = 2;
+  string version            = 3;
+  bool   cluster_mode       = 4;
+  int64  uptime_seconds     = 5;
+  // When the reply was built — Unix epoch milliseconds, UTC.
+  int64  sampled_at_unix_ms = 6;
+}
+
+message DiskVolumeStats {
+  // "data" for the volume that holds data_dir. "wal" for the Raft WAL directory, present only when
+  // that directory is on a different volume.
+  string role                = 1;
+  string path                = 2;
+  // The mount point holding `path`; empty when not known yet.
+  string mount_point         = 3;
+  int64  total_bytes         = 4;
+  // Raw free space of the volume.
+  int64  free_bytes          = 5;
+  // Free space this server's user may write; what the watermark compares.
+  int64  available_bytes     = 6;
+  int64  used_bytes          = 7;
+  // The write-admission watermark (min_free_disk_bytes) for this volume. The gate watches the data
+  // volume only, so a "wal" entry reports 0.
+  int64  min_free_disk_bytes = 8;
+  // True while the write gate refuses writes because of this volume — the gate's own answer, from
+  // the same cached probe. Always false on a "wal" entry.
+  bool   below_watermark     = 9;
+  // Bytes of the storage engine's files on this volume (key/value store, plus the WAL when it shares
+  // the volume). Measured off the request path, refreshed every minute; 0 for an in-memory engine.
+  int64  engine_bytes        = 10;
+}
+
+message CpuStats {
+  // Process CPU as a share of the whole node (all processor_count processors), 0-100.
+  double process_cpu_percent   = 1;
+  // The window process_cpu_percent is averaged over: up to one minute of background samples.
+  int64  process_cpu_window_ms = 2;
+  // Processors as the runtime sees them, with container CPU limits applied.
+  int32  processor_count       = 3;
+  // Host load averages (Linux, macOS); -1 elsewhere.
+  double load_average_1m       = 4;
+  double load_average_5m       = 5;
+  double load_average_15m      = 6;
+}
+
+message MemoryStats {
+  int64 process_working_set_bytes = 1;
+  // Managed heap size as of the last garbage collection (before the first one, the bytes
+  // allocated so far).
+  int64 gc_heap_bytes             = 2;
+  // Memory the garbage collector holds committed as of the last collection; -1 until the first
+  // collection completes.
+  int64 gc_committed_bytes        = 3;
+  // The managed heap hard limit in force (explicit, or the runtime's default inside a memory-limited
+  // container). 0 means no limit is in force.
+  int64 gc_memory_limit_bytes     = 4;
+  // The cgroup memory limit when one applies, else the host's physical memory.
+  int64 host_total_bytes          = 5;
+  // Of host_total_bytes, how much is still available.
+  int64 host_available_bytes      = 6;
+}
+
+// Why one field is -1. `field` is the field's path in this reply, e.g. "cpu.load_average_1m" or
+// "disks[wal].engine_bytes".
+message NodeStatsError {
+  string field   = 1;
+  string message = 2;
+}
+
+message NodeStatsReply {
+  NodeIdentity             node   = 1;
+  // The data volume first; a "wal" entry follows only when the WAL is on its own volume.
+  repeated DiskVolumeStats disks  = 2;
+  CpuStats                 cpu    = 3;
+  MemoryStats              memory = 4;
+  repeated NodeStatsError  errors = 5;
+}
+
 // SQL-centric service: mirrors /execute-sql-query, /execute-sql-non-query,
 // /execute-sql-ddl, and the transaction lifecycle endpoints.
 service CamusSql {
@@ -482,6 +594,8 @@ service CamusSql {
   rpc CommitTransaction (TxnHandle)        returns (CommitReply);
   rpc RollbackTransaction(TxnHandle)       returns (RollbackReply);
   rpc Ping              (PingRequest)      returns (PingReply);
+  // The receiving node's disk, CPU and memory. Read-only and cheap enough to poll every minute.
+  rpc GetNodeStats      (NodeStatsRequest) returns (NodeStatsReply);
 }
 
 // ─── CamusAuth service ────────────────────────────────────────────────────────

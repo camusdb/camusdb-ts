@@ -265,3 +265,26 @@ describe('resolveOptions', () => {
     ).toThrow(CamusError);
   });
 });
+
+describe('HttpVersion', () => {
+  const base = 'Endpoint=http://localhost:5095;Database=test';
+
+  it('reads an absent, 1.1, or unknown value as HTTP/1.1, as the .NET driver does', () => {
+    expect(resolveConnectionString(base).httpVersion).toBe('1.1');
+    expect(resolveConnectionString(`${base};HttpVersion=1.1`).httpVersion).toBe('1.1');
+    expect(resolveConnectionString(`${base};HttpVersion=fast`).httpVersion).toBe('1.1');
+    expect(
+      resolveOptions({ endpoint: 'http://localhost:5095', database: 'test', httpVersion: '1.1' }).httpVersion,
+    ).toBe('1.1');
+  });
+
+  it('refuses HTTP/2 and HTTP/3, which Node fetch cannot send', () => {
+    for (const version of ['2', '2.0', '3', '3.0', ' 3 ']) {
+      expect(() => resolveConnectionString(`${base};HttpVersion=${version}`)).toThrow(/HTTP\/1\.1 only/);
+    }
+
+    expect(() =>
+      resolveOptions({ endpoint: 'http://localhost:5095', database: 'test', httpVersion: '2' }),
+    ).toThrow(CamusError);
+  });
+});

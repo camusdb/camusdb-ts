@@ -13,15 +13,16 @@ import type { ColumnValue } from './column-value.js';
 import type { CamusClientOptions, CamusProtocol, ResolvedConfig } from './config.js';
 import { describeConfig, resolveConnectionString, resolveOptions } from './config.js';
 import { CamusError } from './errors.js';
+import type { CamusNodeStats } from './node-stats.js';
 import { CamusErrorCode } from './error-codes.js';
 import type { CamusTransactionOptions } from './options.js';
 import { withDefaults } from './options.js';
+import { registerStatement, releaseEvicted, shouldPrepare } from './prepared/auto-prepare.js';
 import { PrepareDecision } from './prepared/policy.js';
-import type { EvictedStatement } from './prepared/policy.js';
 import { CamusQueryStream } from './query-stream.js';
 import type { CamusColumn } from './result-set.js';
 import { CamusResultSet, RowMapper } from './result-set.js';
-import { delay, isRetryable, withRetry } from './retry.js';
+import { delay, isRetryable, retryLoop } from './retry.js';
 import type { RetryOptions } from './retry.js';
 import { selectNextValueStatement } from './sequence.js';
 import { isValidDatabaseName } from './sql-syntax.js';
@@ -36,6 +37,8 @@ import {
   isPreparableStatement,
   runsInOwnTransaction,
 } from './statements.js';
+import type { CamusOperation } from './telemetry.js';
+import { CamusRetryKind, operationName, recordRetry, startOperation, traced } from './telemetry.js';
 import { CamusTransaction } from './transaction.js';
 import type { CamusBranchRow, NonQueryTransportResult, TransportSqlRequest } from './transport/transport.js';
 import type { Int64Mode } from './values/decode.js';
@@ -265,17 +268,30 @@ export class CamusClient implements AsyncDisposable {
    * 4 MiB with `CADB0550`, before the commit, so the statement stores nothing. Use `queryStream` for
    * a large result, such as an `INSERT … SELECT … RETURNING` or an `UPDATE` of many rows.
    */
-  async query<T = Record<string, unknown>>(
+  query<T = Record<string, unknown>>(
     sql: string,
     parameters?: Parameters,
     options: AutocommitStatementOptions = {},
   ): Promise<QueryResult<T>> {
-    if (isWriteReturning(sql)) return this.queryWriteReturning<T>(sql, parameters, options);
+    return traced(this.runtime, { operationName: operationName(sql), queryText: sql }, (operation) =>
+      this.runQuery<T>(sql, parameters, options, operation),
+    );
+  }
+
+  private async runQuery<T>(
+    sql: string,
+    parameters: Parameters | undefined,
+    options: AutocommitStatementOptions,
+    operation: CamusOperation | undefined,
+  ): Promise<QueryResult<T>> {
+    if (isWriteReturning(sql)) return this.queryWriteReturning<T>(sql, parameters, options, operation);
 
     const encoded = encodeParameters(parameters);
     const transaction = options.transaction;
 
     const route = await this.route(sql, CamusRouteOpKind.Query, transaction, options.signal);
+
+    operation?.setEndpoint(route.endpoint);
 
     const request = await this.buildRequest(sql, encoded, route, transaction, options, {
       negotiateRouting: route.router !== undefined,
@@ -371,6 +387,26 @@ export class CamusClient implements AsyncDisposable {
     parameters?: Parameters,
     options: AutocommitStatementOptions = {},
   ): Promise<CamusQueryStream<T>> {
+    // The span ends with the stream: at the last row, at a failed read, or at `close`.
+    const operation = startOperation(this.runtime, { operationName: operationName(sql), queryText: sql });
+
+    try {
+      const open = (): Promise<CamusQueryStream<T>> =>
+        this.openQueryStream<T>(sql, parameters, options, operation);
+
+      return await (operation === undefined ? open() : operation.run(open));
+    } catch (error) {
+      operation?.fail(error);
+      throw error;
+    }
+  }
+
+  private async openQueryStream<T>(
+    sql: string,
+    parameters: Parameters | undefined,
+    options: AutocommitStatementOptions,
+    operation: CamusOperation | undefined,
+  ): Promise<CamusQueryStream<T>> {
     const encoded = encodeParameters(parameters);
     const transaction = options.transaction;
     const writeReturning = isWriteReturning(sql);
@@ -385,6 +421,8 @@ export class CamusClient implements AsyncDisposable {
       options.signal,
     );
 
+    operation?.setEndpoint(route.endpoint);
+
     const request = await this.buildRequest(sql, encoded, route, transaction, options, {
       negotiateRouting: false,
       // A read runs in a read-only snapshot with no locking mode, but an autocommit write on the
@@ -397,7 +435,7 @@ export class CamusClient implements AsyncDisposable {
 
     const source = await this.runtime.transport.executeQueryStream(request);
 
-    return new CamusQueryStream<T>(source, this.decodeOptions(options));
+    return new CamusQueryStream<T>(source, this.decodeOptions(options), operation);
   }
 
   /**
@@ -437,7 +475,17 @@ export class CamusClient implements AsyncDisposable {
    * a rollback cannot undo, so the server refuses it rather than promise a rollback it cannot
    * deliver, and the driver refuses it before the round trip.
    */
-  async executeDdl(sql: string, options: AutocommitStatementOptions = {}): Promise<boolean> {
+  executeDdl(sql: string, options: AutocommitStatementOptions = {}): Promise<boolean> {
+    return traced(this.runtime, { operationName: operationName(sql), queryText: sql }, (operation) =>
+      this.runDdl(sql, options, operation),
+    );
+  }
+
+  private async runDdl(
+    sql: string,
+    options: AutocommitStatementOptions,
+    operation: CamusOperation | undefined,
+  ): Promise<boolean> {
     const transaction = options.transaction;
 
     if (transaction !== undefined && runsInOwnTransaction(sql)) {
@@ -453,6 +501,8 @@ export class CamusClient implements AsyncDisposable {
       transaction !== undefined
         ? await transaction.ensureStarted(undefined, options.signal)
         : this.runtime.nextEndpoint();
+
+    operation?.setEndpoint(endpoint);
 
     return this.runtime.transport.executeDdl({
       endpoint,
@@ -483,29 +533,79 @@ export class CamusClient implements AsyncDisposable {
    * It performs exactly what `INSERT INTO` performs, and takes the same authorization, endpoint
    * health, and error translation. Use it to avoid building statement text for a hot write path.
    */
-  async insert(table: string, values: Parameters, options: StatementOptions = {}): Promise<number> {
-    const transaction = options.transaction;
+  insert(table: string, values: Parameters, options: StatementOptions = {}): Promise<number> {
+    return traced(this.runtime, { operationName: 'INSERT', collection: table }, async (operation) => {
+      const transaction = options.transaction;
 
-    const endpoint =
-      transaction !== undefined
-        ? await transaction.ensureStarted(undefined, options.signal)
-        : this.runtime.nextEndpoint();
+      const endpoint =
+        transaction !== undefined
+          ? await transaction.ensureStarted(undefined, options.signal)
+          : this.runtime.nextEndpoint();
 
-    return this.runtime.transport.insert({
-      endpoint,
-      database: this.runtime.database,
-      table,
-      values: encodeUnprefixed(values),
-      timeoutSeconds: options.timeoutSeconds ?? this.runtime.timeoutSeconds,
-      ...(transaction === undefined
-        ? {}
-        : {
-            txnIdPT: transaction.txnIdPT,
-            txnIdCounter: transaction.txnIdCounter,
-            streamSlot: transaction.streamSlot,
-          }),
-      signal: options.signal,
+      operation?.setEndpoint(endpoint);
+
+      return this.runtime.transport.insert({
+        endpoint,
+        database: this.runtime.database,
+        table,
+        values: encodeUnprefixed(values),
+        timeoutSeconds: options.timeoutSeconds ?? this.runtime.timeoutSeconds,
+        ...(transaction === undefined
+          ? {}
+          : {
+              txnIdPT: transaction.txnIdPT,
+              txnIdCounter: transaction.txnIdCounter,
+              streamSlot: transaction.streamSlot,
+            }),
+        signal: options.signal,
+      });
     });
+  }
+
+  /** The endpoints that this client is configured with, in configuration order. */
+  get endpoints(): readonly string[] {
+    return this.runtime.pool.members;
+  }
+
+  /**
+   * The disk, CPU, and memory of one node. See `CamusNodeStats` for every field.
+   *
+   * ```ts
+   * const stats = await client.nodeStats();
+   * const data = stats.dataVolume!;
+   *
+   * console.log(`${data.availableBytes} bytes free of ${data.totalBytes}`);
+   *
+   * for (const endpoint of client.endpoints) {
+   *   const node = await client.nodeStats(endpoint);
+   *   console.log(`${node.address}: ${node.cpu.processCpuPercent}% CPU`);
+   * }
+   * ```
+   *
+   * Without `endpoint`, it asks the next node in the rotation. Each node answers only for itself.
+   * An `endpoint` must be one of `endpoints`, so the client's credentials go only to the addresses
+   * it was configured with.
+   *
+   * It is server-level, not scoped to this client's database, and it works over REST
+   * (`GET /v1/admin/stats`) and gRPC (`GetNodeStats`). With authentication on, the account needs
+   * the superuser attribute or the `MONITOR` privilege (`GRANT MONITOR ON *.* TO <user>`). Any
+   * other account gets `CADB0517`.
+   *
+   * @throws {TypeError} when `endpoint` is not one of `endpoints`.
+   */
+  nodeStats(
+    endpoint?: string,
+    options: { signal?: AbortSignal; timeoutSeconds?: number } = {},
+  ): Promise<CamusNodeStats> {
+    if (endpoint !== undefined && !this.runtime.pool.members.includes(endpoint)) {
+      throw new TypeError(`'${endpoint}' is not one of this client's endpoints.`);
+    }
+
+    return this.runtime.transport.getNodeStats(
+      endpoint ?? this.runtime.nextEndpoint(),
+      options.timeoutSeconds ?? this.runtime.timeoutSeconds,
+      options.signal,
+    );
   }
 
   /** Reports whether the server answers. */
@@ -536,6 +636,9 @@ export class CamusClient implements AsyncDisposable {
    *
    * With `await using`, a transaction that is left without a commit is rolled back as the block
    * unwinds.
+   *
+   * With `deferBegin`, or with learned routing on, `BEGIN` is not sent here. The first statement,
+   * or the first `CamusPipeline` send, sends it.
    */
   async beginTransaction(
     options: CamusTransactionOptions = {},
@@ -544,17 +647,21 @@ export class CamusClient implements AsyncDisposable {
     const effective = this.resolveTransactionOptions(options);
     const router = this.runtime.router;
 
-    if (router === undefined) {
+    if (router === undefined && effective.deferBegin !== true) {
       // Routing off: begin here, on the rotation, right now.
       const endpoint = this.runtime.nextEndpoint();
 
-      const result = await this.runtime.transport.startTransaction(
-        endpoint,
-        this.runtime.database,
-        effective,
-        this.runtime.timeoutSeconds,
-        signal,
-      );
+      const result = await traced(this.runtime, { operationName: 'BEGIN' }, (operation) => {
+        operation?.setEndpoint(endpoint);
+
+        return this.runtime.transport.startTransaction(
+          endpoint,
+          this.runtime.database,
+          effective,
+          this.runtime.timeoutSeconds,
+          signal,
+        );
+      });
 
       return new CamusTransaction(this.runtime, effective, {
         txnIdPT: result.txnIdPT,
@@ -568,7 +675,7 @@ export class CamusClient implements AsyncDisposable {
 
     // An explicit affinity begins the transaction here, on the named statement's learned endpoint,
     // falling back to rotation when nothing is learned. Without one, the first statement chooses.
-    if (effective.affinity !== undefined) {
+    if (router !== undefined && effective.affinity !== undefined) {
       const learned = router.selectEndpoint(
         this.runtime.database,
         effective.affinity,
@@ -598,6 +705,9 @@ export class CamusClient implements AsyncDisposable {
    * an exponential back-off. So the function must be safe to run more than once — it must not send
    * an email, charge a card, or mutate state outside the database on a path that could repeat.
    *
+   * The work can commit the transaction itself with `CamusPipeline.commit`. The transaction is
+   * then not committed a second time.
+   *
    * A commit that reports an unresolved outcome is **not** retried this way. That case is resolved
    * inside `CamusTransaction`, by re-issuing the same commit on the same handle, because replaying
    * the work could apply an already-durable commit twice.
@@ -611,25 +721,30 @@ export class CamusClient implements AsyncDisposable {
       ...(options.signal === undefined ? {} : { signal: options.signal }),
     };
 
-    return withRetry(async () => {
-      const transaction = await this.beginTransaction(options.transactionOptions ?? {}, options.signal);
+    return retryLoop(
+      async () => {
+        const transaction = await this.beginTransaction(options.transactionOptions ?? {}, options.signal);
 
-      let result: T;
+        let result: T;
 
-      try {
-        result = await work(transaction);
-      } catch (error) {
-        await rollbackQuietly(transaction);
-        throw error;
-      }
+        try {
+          result = await work(transaction);
+        } catch (error) {
+          await rollbackQuietly(transaction);
+          throw error;
+        }
 
-      // A commit that lost a conflict leaves nothing to roll back, and one whose outcome was
-      // unknown was already resolved inside `commit`. Either way the transaction is over, and the
-      // retry loop above decides whether to run the whole unit of work again.
-      await transaction.commit(options.signal);
+        // A commit that lost a conflict leaves nothing to roll back, and one whose outcome was
+        // unknown was already resolved inside `commit`. Either way the transaction is over, and the
+        // retry loop above decides whether to run the whole unit of work again. A pipeline that
+        // committed the transaction inside the work already did this step.
+        if (!transaction.isCommittedByPipeline) await transaction.commit(options.signal);
 
-      return result;
-    }, retryOptions);
+        return result;
+      },
+      retryOptions,
+      CamusRetryKind.Transaction,
+    );
   }
 
   // ─── Prepared statements ──────────────────────────────────────────────────
@@ -661,10 +776,10 @@ export class CamusClient implements AsyncDisposable {
     const { decision, evicted } = policy.pin(database, sql);
 
     if (decision === PrepareDecision.Register) {
-      await this.register(endpoint, database, sql, options);
+      await registerStatement(this.runtime, endpoint, database, sql, options);
     }
 
-    this.release(endpoint, evicted);
+    releaseEvicted(this.runtime, endpoint, evicted);
   }
 
   /** Whether a statement is currently kept prepared for this client's database. */
@@ -912,14 +1027,16 @@ export class CamusClient implements AsyncDisposable {
    * Runs a write and reports its count only. `discardReturningRows` has no effect on a statement
    * without `RETURNING`, so this sets it on every statement and does not parse the SQL for the clause.
    */
-  private async executeNonQuery(
+  private executeNonQuery(
     sql: string,
     parameters: Parameters | undefined,
     options: AutocommitStatementOptions,
   ): Promise<ExecuteResult> {
-    const result = await this.executeNonQueryCore(sql, parameters, options, true);
+    return traced(this.runtime, { operationName: operationName(sql), queryText: sql }, async (operation) => {
+      const result = await this.executeNonQueryCore(sql, parameters, options, true, operation);
 
-    return { affectedRows: result.affectedRows, routingAdvice: result.routing };
+      return { affectedRows: result.affectedRows, routingAdvice: result.routing };
+    });
   }
 
   /** Runs a write with `RETURNING` on the non-query route and maps the rows it sent back. */
@@ -927,8 +1044,9 @@ export class CamusClient implements AsyncDisposable {
     sql: string,
     parameters: Parameters | undefined,
     options: AutocommitStatementOptions,
+    operation: CamusOperation | undefined,
   ): Promise<QueryResult<T>> {
-    const result = await this.executeNonQueryCore(sql, parameters, options, false);
+    const result = await this.executeNonQueryCore(sql, parameters, options, false, operation);
 
     // The server decides the shape. A reply without `columns` has nothing to map, but it still
     // reports the count.
@@ -953,11 +1071,14 @@ export class CamusClient implements AsyncDisposable {
     parameters: Parameters | undefined,
     options: AutocommitStatementOptions,
     discardReturningRows: boolean,
+    operation: CamusOperation | undefined,
   ): Promise<NonQueryTransportResult> {
     const encoded = encodeParameters(parameters);
     const transaction = options.transaction;
 
     const route = await this.route(sql, CamusRouteOpKind.NonQuery, transaction, options.signal);
+
+    operation?.setEndpoint(route.endpoint);
 
     const request = await this.buildRequest(sql, encoded, route, transaction, options, {
       negotiateRouting: route.router !== undefined,
@@ -1045,7 +1166,7 @@ export class CamusClient implements AsyncDisposable {
       sql,
       parameters,
       timeoutSeconds: options.timeoutSeconds ?? this.runtime.timeoutSeconds,
-      prepared: await this.shouldPrepare(sql, route.endpoint, options),
+      prepared: await shouldPrepare(this.runtime, sql, route.endpoint, options),
       routingAcceptVersion: extra.negotiateRouting ? ROUTING_ACCEPT_VERSION : 0,
       ...(extra.discardReturningRows === true ? { discardReturningRows: true } : {}),
       ...(transaction === undefined
@@ -1059,109 +1180,6 @@ export class CamusClient implements AsyncDisposable {
           }),
       signal: options.signal,
     };
-  }
-
-  /**
-   * Whether this execution should name a prepared statement instead of carrying its SQL,
-   * registering it first when this is the execution that tips it over the threshold.
-   *
-   * The registration is awaited rather than started in the background, because the whole point is
-   * that this execution and the ones after it are cheap. Firing it off and running inline anyway
-   * would leave a busy statement racing its own warm-up. It costs one extra round trip, once per
-   * statement per endpoint.
-   *
-   * The caller passes the endpoint it already resolved. A REST handle is node-local and the pool
-   * rotates, so registering against a freshly drawn endpoint would routinely prepare on one node
-   * and execute on another — correct, because the transport re-registers where it lands, but a
-   * wasted round trip every single time.
-   */
-  private async shouldPrepare(sql: string, endpoint: string, options: StatementOptions): Promise<boolean> {
-    const policy = this.runtime.preparedStatements;
-
-    if (policy.isDisabled || !isPreparableStatement(sql)) return false;
-
-    const { decision, evicted } = policy.decide(this.runtime.database, sql);
-
-    this.release(endpoint, evicted);
-
-    switch (decision) {
-      case PrepareDecision.Yes:
-        return true;
-
-      case PrepareDecision.Register:
-        return this.register(endpoint, this.runtime.database, sql, options);
-
-      default:
-        return false;
-    }
-  }
-
-  /**
-   * Registers a statement and records what happened, reporting whether it may now run prepared.
-   *
-   * A registration failure never reaches the caller: preparing is an optimization, and the
-   * statement runs inline exactly as it would have if the driver had not tried. What the failure
-   * does decide is whether to ask again. A refusal specific to this statement stops asking for that
-   * statement; anything that says the node has no prepared-statement support at all stops asking
-   * for every statement, because one round trip per distinct SQL to relearn that is worse than not
-   * trying. A failure that never reached a verdict — a timeout, an unreachable node — drops the
-   * entry instead, so one network blip does not cost this statement its registration for the life
-   * of the process.
-   */
-  private async register(
-    endpoint: string,
-    database: string,
-    sql: string,
-    options: StatementOptions,
-  ): Promise<boolean> {
-    const policy = this.runtime.preparedStatements;
-
-    try {
-      await this.runtime.transport.prepare(
-        endpoint,
-        database,
-        sql,
-        options.timeoutSeconds ?? this.runtime.timeoutSeconds,
-        options.signal,
-      );
-
-      policy.markPrepared(database, sql);
-      return true;
-    } catch (error) {
-      // The caller's own cancellation is not a verdict on the statement, but the entry must not be
-      // left mid-registration, or it would never be reconsidered.
-      if (options.signal?.aborted === true) {
-        policy.forget(database, sql);
-        throw error;
-      }
-
-      // The statement is about to run inline and will report any real problem itself. The only
-      // decision left here is whether asking again is worth a round trip.
-      if (CamusError.is(error) && isUnsupported(error)) {
-        policy.markRefused(database, sql);
-        policy.disable();
-        return false;
-      }
-
-      if (declinesStatement(error)) policy.markRefused(database, sql);
-      else policy.forget(database, sql);
-
-      return false;
-    }
-  }
-
-  /**
-   * Releases a statement the policy evicted, so the server stops holding a handle this client has
-   * stopped using.
-   *
-   * It is best effort and off the caller's path: it is bookkeeping, not part of the statement being
-   * run. It takes the endpoint the caller already resolved rather than drawing a new one, which
-   * would rotate the pool as a side effect of housekeeping.
-   */
-  private release(endpoint: string, evicted: EvictedStatement | undefined): void {
-    if (evicted === undefined) return;
-
-    void this.runtime.transport.closePrepared(endpoint, evicted.database, evicted.sql).catch(() => undefined);
   }
 
   /**
@@ -1188,6 +1206,8 @@ export class CamusClient implements AsyncDisposable {
       } catch (error) {
         if (attempt >= maxAttempts || !isRetryable(error)) throw error;
 
+        recordRetry(CamusRetryKind.CreateDatabase, error, { database: this.runtime.database });
+
         const base = Math.min(50 * 2 ** (attempt - 1), 800);
         const jitter = base * 0.25 * (2 * Math.random() - 1);
 
@@ -1195,54 +1215,6 @@ export class CamusClient implements AsyncDisposable {
       }
     }
   }
-}
-
-/**
- * The codes that say nothing about the statement itself.
- *
- * `Generic` covers a call that was sent and then lost, and every failure the driver could not
- * classify. The rest name the connection or the principal. A statement that meets one of these is
- * left reconsiderable: the next call site asks again.
- */
-const UNINFORMATIVE_CODES = new Set<string>([
-  CamusErrorCode.Generic,
-  CamusErrorCode.EndpointUnreachable,
-  CamusErrorCode.AuthenticationFailed,
-  CamusErrorCode.InsufficientPrivilege,
-  CamusErrorCode.TooManyAuthAttempts,
-  CamusErrorCode.InsecureTransport,
-]);
-
-/**
- * True when the server gave a verdict on this statement, rather than the round trip failing.
- *
- * Only a verdict is terminal. A retryable condition, a transport failure, and an error the driver
- * did not raise itself all leave the question open.
- */
-function declinesStatement(error: unknown): boolean {
-  if (!CamusError.is(error)) return false;
-  if (isRetryable(error)) return false;
-
-  return !UNINFORMATIVE_CODES.has(error.code);
-}
-
-/**
- * True when a failure says the node does not implement prepared statements at all, rather than
- * declining this particular statement.
- *
- * Both spellings surface under the generic code, because a server old enough not to have the
- * feature is also too old to have a specific code for refusing it. A server that does have it
- * declines an individual statement with a `CADB05xx` code instead.
- *
- * It is a heuristic, and it is only ever used to answer "is asking again worth a round trip?".
- * Reading it wrong costs at most one wasted registration attempt per statement, never a failed
- * statement.
- */
-function isUnsupported(error: CamusError): boolean {
-  return (
-    error.code === CamusErrorCode.Generic &&
-    (error.message.includes('404') || error.message.toLowerCase().includes('unimplemented'))
-  );
 }
 
 /**

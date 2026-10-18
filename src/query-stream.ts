@@ -8,6 +8,7 @@
 import type { CamusColumn } from './result-set.js';
 import { RowMapper } from './result-set.js';
 import type { CamusRowSource } from './row-source.js';
+import type { CamusOperation } from './telemetry.js';
 import type { DecodeOptions } from './values/decode.js';
 import { columnTypeName } from './column-type.js';
 
@@ -42,10 +43,14 @@ export class CamusQueryStream<T = Record<string, unknown>> implements AsyncItera
 
   private closed = false;
 
+  /** The span of the statement. It ends at the last row, at a failed read, or at `close`. */
+  private readonly operation: CamusOperation | undefined;
+
   /** @internal Built by `CamusClient.queryStream`. */
-  constructor(source: CamusRowSource, options: DecodeOptions) {
+  constructor(source: CamusRowSource, options: DecodeOptions, operation?: CamusOperation) {
     this.source = source;
     this.mapper = new RowMapper(source.columnNames, options);
+    this.operation = operation;
   }
 
   /** The output columns, known before the first row. */
@@ -76,7 +81,15 @@ export class CamusQueryStream<T = Record<string, unknown>> implements AsyncItera
 
     try {
       for (;;) {
-        const cells = await this.source.next();
+        let cells: Awaited<ReturnType<CamusRowSource['next']>>;
+
+        try {
+          cells = await this.source.next();
+        } catch (error) {
+          this.operation?.fail(error);
+          throw error;
+        }
+
         if (cells === undefined) return;
 
         yield this.mapper.map<T>(cells);
@@ -101,6 +114,7 @@ export class CamusQueryStream<T = Record<string, unknown>> implements AsyncItera
     if (this.closed) return;
 
     this.closed = true;
+    this.operation?.complete();
     await this.source.close();
   }
 

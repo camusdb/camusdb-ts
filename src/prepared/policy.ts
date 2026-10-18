@@ -73,6 +73,25 @@ export class CamusPreparedStatementPolicy {
     CamusPreparedStatementPolicy.shared.clear();
   }
 
+  /**
+   * For each database, the statements that the shared policies keep prepared now. It feeds the
+   * `camusdb.client.prepared_statement.count` measurement.
+   *
+   * @internal
+   */
+  static collectPreparedCounts(): Map<string, number> {
+    const counts = new Map<string, number>();
+
+    for (const policy of CamusPreparedStatementPolicy.shared.values()) {
+      for (const entry of policy.entries.values()) {
+        if (entry.state === EntryState.Prepared)
+          counts.set(entry.database, (counts.get(entry.database) ?? 0) + 1);
+      }
+    }
+
+    return counts;
+  }
+
   readonly maxAutoPrepare: number;
 
   readonly minUsages: number;

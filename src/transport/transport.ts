@@ -6,6 +6,7 @@
  */
 
 import type { CamusCacheMetadata } from '../cache.js';
+import type { CamusNodeStats } from '../node-stats.js';
 import type { ColumnValue } from '../column-value.js';
 import type { CamusProtocol } from '../config.js';
 import type { CamusTransactionOptions } from '../options.js';
@@ -138,6 +139,115 @@ export interface NonQueryTransportResult {
   readonly returning?: CamusResultSet | undefined;
 }
 
+/** What one pipelined statement produces: a result set, or an affected-row count. */
+export type PipelineStatementKind = 'query' | 'nonQuery';
+
+/**
+ * One statement of a `TransportPipelineRequest`. It joins the pipeline's transaction, so it carries
+ * no handle of its own. Everything else is what a `TransportSqlRequest` carries for a statement
+ * inside a transaction.
+ */
+export interface TransportPipelineStatement {
+  readonly kind: PipelineStatementKind;
+  readonly sql: string;
+  readonly parameters?: ReadonlyMap<string, ColumnValue> | undefined;
+
+  /** See `TransportSqlRequest.prepared`. */
+  readonly prepared: boolean;
+
+  /** See `TransportSqlRequest.discardReturningRows`. */
+  readonly discardReturningRows?: boolean | undefined;
+
+  /** See `TransportSqlRequest.routingAcceptVersion`. */
+  readonly routingAcceptVersion: number;
+}
+
+/**
+ * Several statements of one transaction, handed to a transport together and answered together.
+ *
+ * The steps are: the transaction's `BEGIN` first when `start` is set, then the statements in
+ * order, then a commit when `commit` is set. The commit happens only if every statement succeeded.
+ * A transport that can send the whole request as one exchange does so. That is gRPC, to a server
+ * that reads the pipeline contract. Any other transport runs it one exchange per step with the same
+ * outcome shape, so the caller never has to know.
+ */
+export interface TransportPipelineRequest {
+  readonly endpoint: string;
+  readonly database: string;
+
+  /**
+   * The options of the transaction to begin as the first step. It is `undefined` when the
+   * transaction that `txnIdPT` and `txnIdCounter` name has already begun.
+   */
+  readonly start?: CamusTransactionOptions | undefined;
+
+  /** The transaction every statement joins, when it has already begun. See `start`. */
+  readonly txnIdPT?: bigint | undefined;
+  readonly txnIdCounter?: number | undefined;
+
+  /** See `TransportSqlRequest.streamSlot`. */
+  readonly streamSlot?: number | undefined;
+
+  readonly statements: readonly TransportPipelineStatement[];
+
+  /** Commit the transaction after the statements, but only if every one of them succeeded. */
+  readonly commit: boolean;
+
+  readonly timeoutSeconds: number;
+  readonly signal?: AbortSignal | undefined;
+}
+
+/** The outcome of one pipelined statement. Exactly one of the three fields is set. */
+export interface PipelineStatementOutcome {
+  readonly query?: QueryTransportResult | undefined;
+  readonly nonQuery?: NonQueryTransportResult | undefined;
+  readonly failure?: Error | undefined;
+}
+
+/**
+ * What a `TransportPipelineRequest` came back with, step by step.
+ *
+ * A failed step is reported here and not thrown. The steps after it were still answered, by the
+ * server or by the transport for it, and the caller owns one result per statement. Only a failure
+ * of the whole call is thrown: a cancellation, a deadline, or a transport fault before anything was
+ * sent.
+ */
+export interface PipelineTransportResult {
+  /** The transaction the pipeline began, when `start` was set and the `BEGIN` succeeded. */
+  readonly started?: StartTransactionResult | undefined;
+
+  /** Why the `BEGIN` failed. Every statement and the commit then carry the same failure. */
+  readonly startFailure?: Error | undefined;
+
+  readonly statements: readonly PipelineStatementOutcome[];
+
+  /** True when the pipeline asked for a commit and the transaction committed. */
+  readonly committed: boolean;
+
+  /**
+   * Why the commit did not happen: the first failed step, or the commit's own failure. It is
+   * `undefined` when no commit was asked for, or when the commit succeeded.
+   */
+  readonly commitFailure?: Error | undefined;
+
+  /**
+   * The stream messages (gRPC) or HTTP round trips this pipeline cost. It is the number that the
+   * pipeline exists to lower.
+   */
+  readonly exchanges: number;
+}
+
+/** The first thing that went wrong in a pipeline, in step order, or `undefined`. */
+export function firstPipelineFailure(result: PipelineTransportResult): Error | undefined {
+  if (result.startFailure !== undefined) return result.startFailure;
+
+  for (const outcome of result.statements) {
+    if (outcome.failure !== undefined) return outcome.failure;
+  }
+
+  return result.commitFailure;
+}
+
 /** A statement the server registered: the placeholder names it declares, in binding order. */
 export interface PreparedStatementInfo {
   readonly parameterNames: readonly string[];
@@ -208,6 +318,17 @@ export interface CamusTransport {
   executeNonQuery(request: TransportSqlRequest): Promise<NonQueryTransportResult>;
 
   /**
+   * Runs several statements of one transaction and answers them together. The `BEGIN` can come
+   * first and a commit can come last.
+   *
+   * A transport that can send the request as one exchange does so. Any other runs it one exchange
+   * per step, with `runSequentialPipeline`. A failed step is reported in the result and not thrown,
+   * because every step gets an outcome. Only a failure of the whole call is thrown. By design, this
+   * is not "exactly one round trip" like the other methods: the result reports the exchange count.
+   */
+  executePipeline(request: TransportPipelineRequest): Promise<PipelineTransportResult>;
+
+  /**
    * Inserts one row through the server's typed row-level surface — the same operation `INSERT INTO`
    * performs, written as a table plus a column-to-value map instead of SQL text.
    */
@@ -248,6 +369,9 @@ export interface CamusTransport {
 
   /** A liveness check. Reports true when the server answers. */
   ping(endpoint: string, timeoutSeconds: number, signal?: AbortSignal): Promise<boolean>;
+
+  /** The disk, CPU, and memory of the node at `endpoint`. */
+  getNodeStats(endpoint: string, timeoutSeconds: number, signal?: AbortSignal): Promise<CamusNodeStats>;
 
   /** Creates a database. It is a single attempt: the caller owns the transient-retry loop. */
   createDatabase(

@@ -12,6 +12,9 @@ The gRPC transport needs two more packages. Install them only if you use it:
 npm install @grpc/grpc-js @grpc/proto-loader
 ```
 
+Traces and metrics need `@opentelemetry/api`. Install it only if you collect them. See
+[OpenTelemetry](#opentelemetry).
+
 **Requirements**: Node.js 20.19 or later, or 22.12 or later. The package ships as ECMAScript
 modules with TypeScript declarations.
 
@@ -36,8 +39,10 @@ modules with TypeScript declarations.
 - [Databases and branches](#databases-and-branches)
 - [The query result cache](#the-query-result-cache)
 - [Backups](#backups)
+- [Node stats](#node-stats)
 - [Errors](#errors)
 - [Cancellation and deadlines](#cancellation-and-deadlines)
+- [OpenTelemetry](#opentelemetry)
 - [What a client shares](#what-a-client-shares)
 - [Security notes](#security-notes)
 - [Development](#development)
@@ -119,6 +124,7 @@ const b = CamusClient.fromConnectionString('Endpoint=http://localhost:8082;Datab
 | `coalescingDelayMs` | `CoalescingDelay` | No | gRPC only: milliseconds. Default `0`, which is off. |
 | `requestFrames` | `RequestFrames` | No | gRPC only: pack the operations that wait together into one stream message. Default `true`. |
 | `streamDrainTimeoutMs` | `StreamDrainTimeout` | No | gRPC only: milliseconds a rotated-out stream stays open for its transactions. Default `300000`. |
+| `httpVersion` | `HttpVersion` | No | The highest HTTP version for REST calls. Only `1.1` (the default) is accepted. See the note below. |
 | `backupEndpoint` | `BackupEndpoint` | No | The HTTP endpoint for the backup admin API. Required with `grpc`. |
 | `backupTimeoutSeconds` | `BackupTimeout` | No | The backup request timeout in seconds. Default `300`. |
 | `allowInsecureCredentials` | `AllowInsecureCredentials` | No | Waives the refusal to send credentials to a remote plaintext endpoint. |
@@ -127,6 +133,13 @@ const b = CamusClient.fromConnectionString('Endpoint=http://localhost:8082;Datab
 | `routingMaxHintAgeMs` | `RoutingMaxHintAge` | No | The ceiling on how long a learned route is reused. Default `5000`. |
 | `defaultTransactionOptions` | `IsolationLevel`, `TransactionMode`, `Locking` | No | Concurrency defaults for every transaction and autocommit statement. |
 | `int64` | `Int64` | No | `auto` (the default), `number`, or `bigint`. See [Types](#types). |
+| `traceQueryText` | `TraceQueryText` | No | Put the SQL text on the driver's spans as `db.query.text`. Default `false`. See [OpenTelemetry](#opentelemetry). |
+
+**`HttpVersion`.** The .NET driver reads `HttpVersion=1.1|2|3` and can send REST calls over HTTP/2
+or HTTP/3. Node's `fetch` sends HTTP/1.1 only. So this driver accepts `1.1`, and it refuses `2` and
+`3` (also `2.0` and `3.0`) with a `CamusError` when the client is built. Remove the key, or set it
+to `1.1`, in a connection string that you share with a .NET service. Any other value reads as `1.1`,
+as in .NET. The key does not apply to `protocol: 'grpc'`, which always uses HTTP/2.
 
 ### How a connection string is parsed
 
@@ -693,6 +706,10 @@ await client.transaction(work, {
 - **`locking`** — `Pessimistic` (the default) takes locks up front. `Optimistic` stages the writes
   and detects a conflict only at commit; a losing transaction fails its commit and must be retried.
   It does not protect against phantoms.
+- **`deferBegin`** — `true` sends `BEGIN` with the first statement, and not from
+  `beginTransaction`. When that first statement is a pipeline send, `BEGIN` travels inside the same
+  exchange. With learned routing on, `BEGIN` is deferred already. The transaction identity reads as
+  zero until the first statement, and a failure to begin comes from that statement.
 
 Every knob is optional. A knob left unset falls back to the client's `defaultTransactionOptions`,
 then to the connection-string defaults, then to the server default.
@@ -705,6 +722,63 @@ A commit can come back saying its outcome is not known yet (`CADB0509`). The tra
 dead, so the driver re-issues the **same** commit on the **same** handle, backing off up to ten
 times. It never replays the work from the start, because that could apply an already-durable commit
 a second time. This is handled inside the driver; you do not write it.
+
+### Pipelined transactions
+
+A transaction that awaits each statement pays one round trip for each statement: six for a bank
+transfer (`BEGIN`, two reads, two writes, `COMMIT`). At high concurrency, those round trips set the
+latency, and the statements do not. A pipeline sends the statements whose inputs are known as one
+stream message, and it settles the promise of each statement from its own answer.
+
+```ts
+const txn = await client.beginTransaction({
+  locking: CamusLocking.Optimistic,
+  deferBegin: true, // BEGIN travels inside the first send
+});
+
+const pipeline = txn.pipeline();
+
+// Exchange 1: [BEGIN, SELECT a, SELECT b]
+const readA = pipeline.query<{ balance: number }>('SELECT balance FROM accounts WHERE id = @id', { id: a });
+const readB = pipeline.query<{ balance: number }>('SELECT balance FROM accounts WHERE id = @id', { id: b });
+await pipeline.send();
+
+const fromBalance = (await readA).rows[0]!.balance;
+const toBalance = (await readB).rows[0]!.balance;
+
+// Exchange 2: [UPDATE a, UPDATE b, COMMIT]. The commit happens only if both updates succeed.
+pipeline.execute('UPDATE accounts SET balance = @v WHERE id = @id', { v: fromBalance - amount, id: a });
+pipeline.execute('UPDATE accounts SET balance = @v WHERE id = @id', { v: toBalance + amount, id: b });
+await pipeline.commit();
+
+console.log(`${pipeline.exchanges} round trips`); // 2 over gRPC
+```
+
+- **Results.** `query` returns the promise of a `QueryResult`, and `execute` returns the promise of
+  an `ExecuteResult`, as the client methods do. A write with `RETURNING` in `query` gives its rows
+  and `affectedRows`. `send` and `commit` also reject with the first failure, so a caller that awaits
+  only the send still learns of it. A queued promise that nobody awaits is never reported as an
+  unhandled rejection.
+- **Failure.** The statements after a failed one in the same exchange still get an answer. The
+  transaction has ended, so they fail too, and `commit` rejects with the first failure and does not
+  commit. The server rolled the transaction back, so `rollback` is then a harmless call. To retry,
+  run the whole transaction again from `BEGIN`, as for any failed statement.
+- **Commit.** After a successful `pipeline.commit()`, the transaction is committed. A later
+  `txn.rollback()` does nothing, and a later `txn.commit()` throws. Inside `client.transaction`, the
+  helper sees the pipeline commit and does not commit a second time.
+- **Order.** The queued statements run in queue order, after every statement of the transaction
+  sent before them. A pipeline can be sent more than once on one transaction, and an ordinary
+  statement can run between two sends. One send at a time for each pipeline.
+- **Exchanges.** `pipeline.exchanges` gives the round trips used. Over gRPC, to a server that
+  announces frame contract version 2 or higher, it is one for each send. Over REST, with
+  `requestFrames: false`, or against an older server, the driver runs the same statements one
+  exchange per step, with the same results, and the count shows it. The driver never sends an
+  older server something that it could misread.
+- **Routing.** With learned routing on, a pipelined statement asks for routing advice, and the
+  driver learns the route from its reply, as for a lone statement. So the next deferred transaction
+  begins on the node that the advice names.
+- **What cannot be queued.** DDL, which does not run inside the transaction, and `TRUNCATE`. These
+  throw a `CamusError` at queue time, and the pipeline stays usable.
 
 ---
 
@@ -844,6 +918,10 @@ Statements that wait together travel together. When several statements are issue
 frame, and the fixed cost of a message is paid once instead of six times. A frame never waits for
 more statements. A lone statement stays a plain single message, and a server that does not announce
 frames never receives one. Set `requestFrames` to `false` to turn frames off.
+
+A whole transaction can travel as one frame too: a pipeline puts the `BEGIN`, the statements, and a
+conditional commit in one stream message. That needs a server that announces frame contract version
+2. See [Pipelined transactions](#pipelined-transactions).
 
 A stream carries its bearer token once, in the metadata it opens with, and gRPC gives no way to
 change it later. The token provider renews the token every few minutes, so a long-lived stream
@@ -1066,6 +1144,39 @@ HTTP endpoint; the driver refuses to guess rather than send HTTP at a gRPC port.
 
 ---
 
+## Node stats
+
+`client.nodeStats()` returns the disk, CPU, and memory of one node. It works over REST
+(`GET /v1/admin/stats`) and gRPC (`GetNodeStats`).
+
+```ts
+const stats = await client.nodeStats(); // the next endpoint in the rotation
+const data = stats.dataVolume!; // the volume that holds data_dir
+
+console.log(`${data.availableBytes} bytes free of ${data.totalBytes}`);
+console.log(`writes refused (below min_free_disk_bytes): ${data.belowWatermark}`);
+
+for (const endpoint of client.endpoints) {
+  const node = await client.nodeStats(endpoint); // one call for each node of a cluster
+  console.log(`${node.address}: ${node.cpu.processCpuPercent}% CPU, ${node.memory.hostAvailableBytes} bytes free`);
+}
+```
+
+- **Each node answers for itself.** `address` names the configured endpoint that answered.
+  `nodeStats(endpoint)` accepts only an endpoint from `client.endpoints`, so the client's credentials
+  never go to another address. Any other endpoint throws a `TypeError`.
+- **`-1` means unknown.** A value that the node could not read is `-1`, and `errors` names the field
+  and the reason. One failed probe never fails the call. A value that an older server does not send
+  is `-1` too.
+- **`belowWatermark` is the answer of the write gate.** While it is `true`, writes on that node fail
+  with `CADB0536`.
+- **`MONITOR`, not superuser.** With authentication on, the account needs the superuser attribute or
+  the `MONITOR` privilege: `GRANT MONITOR ON *.* TO monitoring;`. Other accounts get `CADB0517`.
+- **Cheap enough to poll.** The server answers from caches and a background sampler, so one call
+  each minute from several monitors costs nothing measurable.
+
+---
+
 ## Errors
 
 Every database-level failure is a `CamusError` carrying the server's `CADBxxxx` code.
@@ -1114,6 +1225,88 @@ await client.query('SELECT * FROM robots', undefined, {
 
 A cancellation you asked for is re-thrown as it is. It is not a database failure and the node is
 not marked unreachable.
+
+---
+
+## OpenTelemetry
+
+The driver reports traces and metrics through `@opentelemetry/api`, which is an optional peer
+dependency. Install it, and register an OpenTelemetry SDK as usual. The driver needs no plugin and
+no extra setting:
+
+```shell
+npm install @opentelemetry/api @opentelemetry/sdk-node
+```
+
+```ts
+import { NodeSDK } from '@opentelemetry/sdk-node';
+
+new NodeSDK({ /* exporters */ }).start();
+
+// Every client reports from now on, under the instrumentation scope 'camusdb' (CAMUS_TELEMETRY_NAME).
+```
+
+Without the package, the driver reports nothing and loads nothing for telemetry. The driver loads
+the package with `require` on the first operation, so the first operation is reported too. Register
+the SDK before the first database call.
+
+**Spans.** The driver records one client span for each of these operations:
+
+- A statement: `query` (and so `queryOne`, `scalar`, and `nextSequenceValue`), `queryStream`,
+  `execute`, `executeDdl`, `evictCache`, and `evictAllCache`.
+- A typed insert (`insert`).
+- `BEGIN`, `COMMIT`, and `ROLLBACK`. One `COMMIT` span covers all the retries of an unresolved
+  commit (`CADB0509`), with one `camusdb.retry` event for each retry.
+- A pipeline exchange, as one `BATCH` span with `db.operation.batch.size` and
+  `camusdb.pipeline.commit`.
+
+The span name is `{operation} {target}`, for example `SELECT shop`. The target is the table for a
+typed insert, and the database for all other operations. The span has these attributes from the
+[OpenTelemetry database conventions](https://opentelemetry.io/docs/specs/semconv/database/):
+
+| Attribute | Value |
+| --- | --- |
+| `db.system.name` | `camusdb` |
+| `db.namespace` | The database of the client. |
+| `db.operation.name` | The first keyword of the SQL text, if it is a known verb (`SELECT`, `INSERT`, `UPDATE`, `DELETE`, `CREATE`, `ALTER`, `DROP`, `TRUNCATE`, and others), or `BEGIN`, `COMMIT`, `ROLLBACK`, `BATCH`. |
+| `db.collection.name` | The table of a typed insert. |
+| `server.address`, `server.port` | The endpoint that received the operation, after routing. |
+| `db.query.text` | The SQL text. Only with `traceQueryText: true`. |
+| `error.type`, `db.response.status_code` | The `CADBxxxx` code of a failed operation, or the error name when there is no code. |
+| `camusdb.transport` | `rest` or `grpc`. |
+
+The span is a child of the active span. While the operation runs, the driver span is the active
+span, so the HTTP or gRPC spans of the transport are its children. This needs a context manager,
+which `NodeSDK` registers.
+
+**Duration metric.** The driver records the `db.client.operation.duration` histogram, in seconds,
+for the same operations. Its attributes are `db.system.name`, `db.namespace`, `db.operation.name`,
+`server.address`, `server.port`, `error.type`, and `db.response.status_code`. The SQL text is never
+an attribute.
+
+**Driver metrics.** The same meter also has these metrics:
+
+| Metric | Type | Attributes | What it counts |
+| --- | --- | --- | --- |
+| `camusdb.client.operation.retries` | Counter | `camusdb.retry.kind`, `error.type`, and `db.namespace` and `db.operation.name` when known | Each time the driver sends an operation again. The kinds are `finalize` (a `COMMIT` or `ROLLBACK` after `CADB0509`), `autocommit` (`withRetry`), `transaction` (`client.transaction` from `BEGIN`), `token_renewal` (a call sent again with a new token after `CADB0516`), and `create_database`. When a driver span is active, the retry is also a `camusdb.retry` event on it. |
+| `camusdb.client.endpoint.quarantines` | Counter | `server.address`, `server.port` | Each time an endpoint fails at the transport level and the driver sets it aside for 30 seconds. |
+| `camusdb.client.endpoint.quarantined` | Gauge | `server.address`, `server.port` | `1` while the endpoint is set aside, `0` while it takes traffic. |
+| `camusdb.client.prepared_statement.lookups` | Counter | `db.namespace`, `camusdb.prepared_statement.result` | Each execution of a preparable statement: `hit` (already prepared), `registered` (prepared by this execution), or `miss` (sent as SQL text). |
+| `camusdb.client.prepared_statement.registrations` | Counter | `db.namespace`, `camusdb.prepared_statement.result`, `error.type` | Each request to prepare a statement that got an answer: `success`, `refused` (the statement runs as SQL text from then on), or `unsupported` (the server has no prepared statements, so automatic preparation stops). |
+| `camusdb.client.prepared_statement.evictions` | Counter | `db.namespace` | Each prepared statement released to make room for one used more recently. See `maxAutoPrepare`. |
+| `camusdb.client.prepared_statement.count` | UpDownCounter | `db.namespace` | The statements kept prepared now. |
+
+If `count` stays at `maxAutoPrepare` and `evictions` keeps growing, `maxAutoPrepare` is too small
+for the workload.
+
+- **The SQL text is opt-in.** SQL text with literal values can contain sensitive data, so set
+  `traceQueryText: true` (or `TraceQueryText=true`) to record it. The driver never records
+  parameter values.
+- **A stream ends its span at the last row.** For `queryStream`, the span ends when the iteration
+  reaches the last row, when a read fails, or when the stream is closed.
+- **A provider registered later.** The metrics API has no proxy provider, so the driver makes its
+  instruments again when the global meter provider changes. Spans go through the proxy tracer of the
+  API, so a tracer provider registered later gets them too.
 
 ---
 

@@ -9,7 +9,7 @@ import type { GrpcBatchOptions } from '../../config.js';
 import { CamusError } from '../../errors.js';
 import { CamusErrorCode } from '../../error-codes.js';
 import { sanitizeErrorText } from '../error-text.js';
-import { FRAME_MAX_BYTES, FRAME_MAX_ITEMS, frameCost } from './batch-frames.js';
+import { FRAME_MAX_BYTES, FRAME_MAX_ITEMS, FRAME_PIPELINE_VERSION, frameCost } from './batch-frames.js';
 import { decodeCacheMetadata, decodeRoutingAdvice, fromWire } from './codec.js';
 import type {
   GrpcBatchExecuteRequest,
@@ -78,19 +78,48 @@ export class PreparedStatementStaleError extends Error {
   }
 }
 
+/**
+ * One operation of a pipeline handed to `enqueuePipeline`, before the batcher gives it a request
+ * id. `expectedTransportId` is the stream that a prepared execution's handle lives on, as for a
+ * lone operation.
+ */
+export interface PipelineOp {
+  readonly kind: GrpcBatchStatementKind;
+  readonly request: GrpcSqlRequest;
+  readonly expectedTransportId?: number | undefined;
+}
+
+/**
+ * Raised on every operation of a pipeline that the batcher refused to write as one frame, before
+ * any of it was written. The causes are a server that announced a contract version below
+ * `FRAME_PIPELINE_VERSION`, frames that are off, or a pipeline that does not fit one frame.
+ * Nothing ran, so the caller can run the same operations one exchange at a time.
+ */
+export class PipelineUnsupportedError extends Error {
+  override readonly name = 'PipelineUnsupportedError';
+
+  readonly reason: string;
+
+  constructor(reason: string) {
+    super(`The pipeline cannot be written as one frame on this stream: ${reason}.`);
+    this.reason = reason;
+  }
+}
+
 /** One `BatchExecute` duplex call, behind an interface a test can substitute for. */
 export interface BatchStream {
   /** Identifies this stream. A handle registered on it is invalid on any other. */
   readonly id: number;
 
   /**
-   * True once this stream's server announced that it reads request frames.
+   * The frame contract version this stream's server announced, or 0 while it announced nothing.
    *
-   * It never blocks, and it never goes back to false. It is false until the announcement arrives,
-   * and it stays false against a server that makes none. It belongs to one stream, so a rebuilt
-   * stream negotiates again on its own.
+   * It never blocks, and it never goes down. It is 0 until the announcement arrives, and it stays
+   * 0 against a server that makes none. It belongs to one stream, so a rebuilt stream negotiates
+   * again on its own. Version 1 lets the batcher write frames. `FRAME_PIPELINE_VERSION` lets it
+   * write a whole transaction as one frame.
    */
-  readonly framesAnnounced: boolean;
+  readonly announcedVersion: number;
 
   send(request: GrpcBatchExecuteRequest): void;
 
@@ -115,6 +144,16 @@ interface PendingOp {
    * answered.
    */
   readonly transaction: string | undefined;
+
+  /**
+   * For an operation of a pipeline that names its start instead of a handle: that start. Its
+   * `mintedHandle` is the transaction this operation belongs to. The start is always answered
+   * before this operation's own answer arrives.
+   */
+  startRef?: PendingOp | undefined;
+
+  /** The handle key a start was answered with, so the operations that named it find it. */
+  mintedHandle?: string | undefined;
 
   resolve: Resolver;
   reject: (error: Error) => void;
@@ -161,6 +200,32 @@ interface QueuedItem {
   readonly request: GrpcBatchExecuteRequest;
   readonly op: PendingOp;
   readonly expectedTransportId: number | undefined;
+
+  /**
+   * The pipeline this operation belongs to. The inbox holds one entry for a whole pipeline, and
+   * each operation of it carries the group too, so the flush keeps them together.
+   */
+  readonly group?: PipelineGroup | undefined;
+}
+
+/** The operations of one `enqueuePipeline` call, staged and written together. */
+interface PipelineGroup {
+  readonly items: QueuedItem[];
+
+  /** The one signal that covers the whole pipeline. */
+  readonly signal: AbortSignal | undefined;
+
+  /**
+   * True when the group holds a start that its followers name, or a conditional commit. Such a
+   * group can only be written as one frame, to a server of `FRAME_PIPELINE_VERSION` or higher.
+   */
+  needsPipelineContract: boolean;
+
+  /**
+   * Set by the flush when one operation of the group was cancelled after it was staged. The rest
+   * are then left out and faulted too. Only the slot's pump touches it.
+   */
+  broken: boolean;
 }
 
 /**
@@ -220,6 +285,13 @@ interface Slot {
  * operations that already sit in the inbox, and a lone operation stays the plain single message it
  * always was. It is a transport optimization alone. It gives no atomicity and no ordering that the
  * stream does not already give.
+ *
+ * A whole transaction can travel as one frame. `enqueuePipeline` takes the operations of one
+ * transaction — a start that its followers name instead of a handle, statements, and a conditional
+ * commit — and places them on the inbox together, so they are written as one frame or not at all.
+ * The two items that make this possible are contract version 2. A stream whose server announced
+ * less gets none of them: the pipeline faults before any byte is written, and the caller runs the
+ * same operations one exchange at a time.
  *
  * A stream that faults is rebuilt by the next write, and every operation that was in flight on the
  * old one is failed so its caller can decide whether to replay it. Prepared statements are scoped
@@ -363,6 +435,104 @@ export class GrpcBatcher {
     signal: AbortSignal | undefined,
   ): Promise<void> {
     await this.enqueue<unknown>(GrpcBatchStatementKind.Rollback, request, slotIndex, signal);
+  }
+
+  /**
+   * Enqueues the operations of one transaction so that they travel as one frame, in the given
+   * order: an optional start at the head, statements, and an optional conditional commit at the
+   * end. Every operation after a start names it by `txnStartRef`, because its handle does not
+   * exist yet.
+   *
+   * It returns one promise per operation. Each one settles with that operation's own answer — a
+   * `GrpcTxnHandle`, a `BatchQueryResult`, a `BatchNonQueryResult`, or a `BatchCausalToken` — or
+   * with its own error, as a lone operation's does.
+   *
+   * The operations go on the slot's inbox together, so no other operation of the same transaction
+   * can come between them. They are written together or not at all. A named start and a
+   * conditional commit are contract version 2. So on a stream whose server announced less, with
+   * frames off, or when the pipeline does not fit one frame, nothing is written and every promise
+   * rejects with `PipelineUnsupportedError`. A pipeline of plain statements on a known handle needs
+   * no version, and is staged as those operations would be alone, still in order.
+   *
+   * One signal covers the whole pipeline. A pipeline with a cancelled member is left out whole,
+   * because to write the rest could commit a transaction that is missing one of its statements.
+   */
+  enqueuePipeline(
+    ops: readonly PipelineOp[],
+    slotIndex: number,
+    signal: AbortSignal | undefined,
+  ): Promise<unknown>[] {
+    if (ops.length === 0) return [];
+
+    if (this.disposed) {
+      const closed = new CamusError(CamusErrorCode.Generic, 'This gRPC transport is closed.');
+      return ops.map(() => Promise.reject(closed));
+    }
+
+    if (signal?.aborted === true) {
+      return ops.map(() => Promise.reject(signal.reason as Error));
+    }
+
+    const items: QueuedItem[] = [];
+    const promises: Promise<unknown>[] = [];
+    const group: PipelineGroup = { items, signal, needsPipelineContract: false, broken: false };
+
+    let start: PendingOp | undefined;
+    let conditionalCommit = false;
+
+    for (let i = 0; i < ops.length; i++) {
+      const source = ops[i]!;
+      const requestId = ++this.requestIdSeq;
+      const wire: GrpcBatchExecuteRequest = { requestId, kind: source.kind, request: source.request };
+
+      let op!: PendingOp;
+
+      promises.push(
+        new Promise<unknown>((resolve, reject) => {
+          op = {
+            requestId,
+            kind: source.kind,
+            transaction: handleKey(source.request.txnHandle),
+            settled: false,
+            transportId: 0,
+            lease: undefined,
+            resolve,
+            reject,
+          };
+        }),
+      );
+
+      if (i === 0 && source.kind === GrpcBatchStatementKind.Start) {
+        start = op;
+      } else if (start !== undefined) {
+        // Named by request id: the start mints the handle after this is written.
+        op.startRef = start;
+        wire.txnStartRef = start.requestId;
+      }
+
+      conditionalCommit ||= source.kind === GrpcBatchStatementKind.CommitIfOk;
+
+      if (signal !== undefined) {
+        const pending = op;
+
+        op.signal = signal;
+        op.onAbort = () => this.fault(pending, signal.reason as Error);
+        signal.addEventListener('abort', op.onAbort, { once: true });
+      }
+
+      this.pending.set(requestId, op);
+      items.push({ request: wire, op, expectedTransportId: source.expectedTransportId, group });
+    }
+
+    // A lone start, or a run of statements by handle with no conditional commit, is ordinary work.
+    group.needsPipelineContract = (start !== undefined && ops.length > 1) || conditionalCommit;
+
+    const slot = this.slots[slotIndex]!;
+
+    slot.inbox.push(items[0]!);
+    this.schedule(slot);
+
+    return promises;
   }
 
   // ─── Prepared statements ──────────────────────────────────────────────────
@@ -589,7 +759,9 @@ export class GrpcBatcher {
           const item = slot.inbox.shift();
           if (item === undefined) break;
 
-          this.stage(slot, item);
+          if (item.group !== undefined) this.stageGroup(slot, item.group);
+          else this.stage(slot, item);
+
           drained++;
         }
 
@@ -665,10 +837,15 @@ export class GrpcBatcher {
       return;
     }
 
+    this.place(slot, item, lease);
+  }
+
+  /** Writes a routed operation alone, or adds it to the slot's run so it shares the next frame. */
+  private place(slot: Slot, item: QueuedItem, lease: StreamLease): void {
     // A frame goes only to a server that announced one on this very stream. The announcement is
     // read, never awaited: until it arrives, and for good against a server that makes none, every
     // operation is its own message.
-    const framed = this.options.requestFrames && lease.stream.framesAnnounced;
+    const framed = this.options.requestFrames && lease.stream.announcedVersion >= 1;
 
     if (slot.run.length > 0 && (!framed || slot.runLease !== lease)) this.flush(slot);
 
@@ -707,6 +884,98 @@ export class GrpcBatcher {
   }
 
   /**
+   * Stages a pipeline.
+   *
+   * The group is routed as one, because its operations are one transaction and so use one stream,
+   * and that stream is held for every operation. A group that needs the pipeline contract goes into
+   * the slot's run whole. The run is flushed first when it is for another stream or has no room for
+   * the whole group. A group that needs no contract version is placed one operation at a time, as
+   * lone operations are, still in order. A group that cannot be written as one frame faults whole,
+   * before anything is held or written.
+   */
+  private stageGroup(slot: Slot, group: PipelineGroup): void {
+    const items = group.items;
+    let lease: StreamLease;
+    let cost = 0;
+
+    try {
+      // All or nothing, before anything is held. A group with a cancelled member is left out
+      // whole, because to write the rest could commit a transaction that is missing a statement.
+      if (items.some((item) => !this.mustStillBeWritten(item))) throw cancelledError(group.signal);
+
+      lease = this.route(slot, items[0]!.op);
+
+      for (const item of items) {
+        if (item.expectedTransportId !== undefined && lease.stream.id !== item.expectedTransportId) {
+          throw new PreparedStatementStaleError();
+        }
+      }
+
+      if (group.needsPipelineContract) {
+        const announced = lease.stream.announcedVersion;
+
+        if (!this.options.requestFrames) throw new PipelineUnsupportedError('request frames are off');
+
+        if (announced < FRAME_PIPELINE_VERSION) {
+          throw new PipelineUnsupportedError(
+            `the server announced frame contract version ${String(announced)}, below ${String(FRAME_PIPELINE_VERSION)}`,
+          );
+        }
+
+        if (items.length > FRAME_MAX_ITEMS) {
+          throw new PipelineUnsupportedError(
+            `${String(items.length)} operations exceed the ${String(FRAME_MAX_ITEMS)}-item frame limit`,
+          );
+        }
+
+        for (const item of items) cost += frameCost(item.request);
+
+        if (cost > FRAME_MAX_BYTES) {
+          throw new PipelineUnsupportedError(
+            `${String(cost)} bytes exceed the ${String(FRAME_MAX_BYTES)}-byte frame limit`,
+          );
+        }
+      }
+
+      for (const item of items) {
+        item.op.transportId = lease.stream.id;
+        lease.inFlight++;
+        item.op.lease = lease;
+      }
+    } catch (error) {
+      const failure = toError(error);
+
+      for (const item of items) this.fault(item.op, failure);
+      return;
+    }
+
+    if (!group.needsPipelineContract) {
+      for (const item of items) this.place(slot, item, lease);
+      return;
+    }
+
+    if (slot.run.length > 0) {
+      if (slot.runBytes < 0) slot.runBytes = frameCost(slot.run[0]!.request);
+
+      if (
+        slot.runLease !== lease ||
+        slot.run.length + items.length > FRAME_MAX_ITEMS ||
+        slot.runBytes + cost > FRAME_MAX_BYTES
+      ) {
+        this.flush(slot);
+      }
+    }
+
+    if (slot.run.length === 0) {
+      slot.runLease = lease;
+      slot.runBytes = 0;
+    }
+
+    slot.run.push(...items);
+    slot.runBytes += cost;
+  }
+
+  /**
    * Writes the slot's run: one frame, or the plain single message when one operation is left in
    * it, so a quiet stream stays byte-identical to a stream without frames.
    *
@@ -724,8 +993,22 @@ export class GrpcBatcher {
 
     if (run.length === 0 || lease === undefined) return;
 
-    // Cancelled since it was staged: nothing awaits an answer, so leave it out.
-    const items = run.filter((item) => this.mustStillBeWritten(item)).map((item) => item.request);
+    // A pipeline travels whole or not at all. When one of its operations was cancelled after it
+    // was staged, the others are left out too, and faulted, so a conditional commit never commits
+    // a transaction that is missing a statement.
+    for (const item of run) {
+      if (item.group !== undefined && !item.group.broken && !this.mustStillBeWritten(item)) {
+        item.group.broken = true;
+      }
+    }
+
+    const items: GrpcBatchExecuteRequest[] = [];
+
+    for (const item of run) {
+      // Cancelled since it was staged: nothing awaits an answer, so leave it out.
+      if (item.group?.broken === true) this.fault(item.op, cancelledError(item.group.signal));
+      else if (this.mustStillBeWritten(item)) items.push(item.request);
+    }
 
     if (items.length === 0) return;
 
@@ -1039,9 +1322,12 @@ export class GrpcBatcher {
     if (op.kind === GrpcBatchStatementKind.Start) {
       const handle = result as GrpcTxnHandle | undefined;
 
-      if (handle !== undefined) this.transactionBegan(handleKey(handle)!, op.lease);
+      if (handle !== undefined) {
+        op.mintedHandle = handleKey(handle)!;
+        this.transactionBegan(op.mintedHandle, op.lease);
+      }
     } else if (this.finalizesTransaction(op)) {
-      this.transactionEnded(op.transaction);
+      this.transactionEnded(transactionOf(op));
     }
 
     this.release(op);
@@ -1054,14 +1340,18 @@ export class GrpcBatcher {
     // Only an answer from the server ends a transaction. A commit that timed out, or that its
     // caller cancelled, may still be open there, and the rollback that usually follows it must
     // find its stream.
-    if (CamusError.is(error) && this.finalizesTransaction(op)) this.transactionEnded(op.transaction);
+    if (CamusError.is(error) && this.finalizesTransaction(op)) this.transactionEnded(transactionOf(op));
 
     this.release(op);
     op.reject(error);
   }
 
   private finalizesTransaction(op: PendingOp): boolean {
-    return op.kind === GrpcBatchStatementKind.Commit || op.kind === GrpcBatchStatementKind.Rollback;
+    return (
+      op.kind === GrpcBatchStatementKind.Commit ||
+      op.kind === GrpcBatchStatementKind.CommitIfOk ||
+      op.kind === GrpcBatchStatementKind.Rollback
+    );
   }
 
   private settle(op: PendingOp): boolean {
@@ -1129,8 +1419,20 @@ function handleKey(handle: GrpcTxnHandle | null | undefined): string | undefined
     : transactionKey(handle.txnIdPt, handle.txnIdCounter);
 }
 
+/** The transaction an operation finishes: by the handle it carries, or by the start it names. */
+function transactionOf(op: PendingOp): string | undefined {
+  return op.transaction ?? op.startRef?.mintedHandle;
+}
+
 function streamClosedError(): CamusError {
   return new CamusError(CamusErrorCode.Generic, 'The gRPC batch stream closed.');
+}
+
+/** The failure of a pipeline operation that was left out because another one was cancelled. */
+function cancelledError(signal: AbortSignal | undefined): Error {
+  if (signal?.aborted === true) return toError(signal.reason);
+
+  return new CamusError(CamusErrorCode.Generic, 'The pipeline was cancelled before it was written.');
 }
 
 function toError(error: unknown): Error {

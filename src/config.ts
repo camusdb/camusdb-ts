@@ -22,6 +22,14 @@ import { CamusIsolationLevel, CamusLocking, CamusTransactionMode } from './optio
 import { isValidDatabaseName } from './sql-syntax.js';
 import type { DecodeOptions, Int64Mode } from './values/decode.js';
 
+/**
+ * The highest HTTP version that the REST calls ask for, as the .NET driver's `HttpVersion=` names
+ * it. Node's `fetch` sends HTTP/1.1 only, so `1.1` is the only value a client accepts. `2` and `3`
+ * are part of the type so that the refusal is a clear error at run time, and not a surprise in a
+ * connection string shared with a .NET service.
+ */
+export type CamusHttpVersion = '1.1' | '2' | '3';
+
 /** The wire protocol a client speaks. */
 export const CamusProtocol = {
   /** The REST and JSON HTTP API. This is the default. */
@@ -174,6 +182,13 @@ export interface CamusClientOptions {
    */
   readonly requestFrames?: boolean;
 
+  /**
+   * The highest HTTP version for the REST calls. Default `1.1`, which is the only version that
+   * Node's `fetch` sends. The key exists so that a .NET connection string reads the same here, and
+   * `2` and `3` are refused. See `CamusHttpVersion`.
+   */
+  readonly httpVersion?: CamusHttpVersion;
+
   /** The HTTP endpoint for the backup admin API. It is required when `protocol` is `grpc`. */
   readonly backupEndpoint?: string;
 
@@ -201,6 +216,12 @@ export interface CamusClientOptions {
 
   /** How an `int64` column reaches a caller. Default `auto`. */
   readonly int64?: Int64Mode;
+
+  /**
+   * Whether the driver's spans carry the SQL text as `db.query.text`. Default false, because SQL
+   * text with literal values can contain sensitive data. Parameter values are never recorded.
+   */
+  readonly traceQueryText?: boolean;
 }
 
 /** The settings a client actually runs on, after both input forms are resolved. */
@@ -214,6 +235,10 @@ export interface ResolvedConfig {
   readonly maxAutoPrepare: number;
   readonly autoPrepareMinUsages: number;
   readonly batch: GrpcBatchOptions;
+
+  /** Always `1.1`: a configuration that asks for more is refused when it is resolved. */
+  readonly httpVersion: '1.1';
+
   readonly backupEndpoint: string | undefined;
   readonly backupTimeoutSeconds: number;
   readonly allowInsecureCredentials: boolean;
@@ -222,6 +247,9 @@ export interface ResolvedConfig {
   readonly routingMaxHintAgeMs: number;
   readonly defaultTransactionOptions: CamusTransactionOptions;
   readonly decode: DecodeOptions;
+
+  /** Whether the driver's spans carry the SQL text. */
+  readonly traceQueryText: boolean;
 
   /** The connection string as written, when the client was built from one. */
   readonly connectionString: string | undefined;
@@ -273,6 +301,7 @@ export function resolveOptions(options: CamusClientOptions): ResolvedConfig {
       ),
       requestFrames: options.requestFrames ?? DEFAULT_BATCH_OPTIONS.requestFrames,
     },
+    httpVersion: resolveHttpVersion(options.httpVersion),
     backupEndpoint: options.backupEndpoint,
     backupTimeoutSeconds: positiveOr(options.backupTimeoutSeconds, DEFAULT_BACKUP_TIMEOUT_SECONDS),
     allowInsecureCredentials: options.allowInsecureCredentials === true,
@@ -281,6 +310,7 @@ export function resolveOptions(options: CamusClientOptions): ResolvedConfig {
     routingMaxHintAgeMs: atLeastOr(options.routingMaxHintAgeMs, 1, 5000),
     defaultTransactionOptions: options.defaultTransactionOptions ?? {},
     decode: { int64: options.int64 ?? 'auto' },
+    traceQueryText: options.traceQueryText === true,
     connectionString: undefined,
   };
 
@@ -340,6 +370,7 @@ export function resolveConnectionString(connectionString: string): ResolvedConfi
       ),
       requestFrames: parseBool(settings.get('RequestFrames'), DEFAULT_BATCH_OPTIONS.requestFrames),
     },
+    httpVersion: resolveHttpVersion(settings.get('HttpVersion')),
     backupEndpoint: settings.first('BackupEndpoint'),
     backupTimeoutSeconds: parsePositiveInt(settings.get('BackupTimeout'), DEFAULT_BACKUP_TIMEOUT_SECONDS),
     allowInsecureCredentials: settings.get(ALLOW_INSECURE_CREDENTIALS_KEY)?.toLowerCase() === 'true',
@@ -352,6 +383,7 @@ export function resolveConnectionString(connectionString: string): ResolvedConfi
       locking: parseEnum(settings.get('Locking'), CamusLocking, undefined),
     },
     decode: { int64: parseInt64Mode(settings.get('Int64')) },
+    traceQueryText: parseBool(settings.get('TraceQueryText'), false),
     connectionString,
   };
 
@@ -546,6 +578,27 @@ function parseEnum<T extends Record<string, string>, D>(
   }
 
   return fallback;
+}
+
+/**
+ * Reads `HttpVersion=` as the .NET driver does: `2` and `2.0` ask for HTTP/2, `3` and `3.0` for
+ * HTTP/3, and any other value, or none, for HTTP/1.1.
+ *
+ * Node's `fetch` sends HTTP/1.1 only. So a request for HTTP/2 or HTTP/3 is refused here, before
+ * the client is used, and is not changed to HTTP/1.1 without a word.
+ */
+function resolveHttpVersion(raw: string | undefined): '1.1' {
+  const text = raw?.trim();
+
+  if (text === '2' || text === '2.0' || text === '3' || text === '3.0') {
+    throw new CamusError(
+      CamusErrorCode.Generic,
+      `HttpVersion=${text} is not supported: Node's fetch sends HTTP/1.1 only. Remove HttpVersion, ` +
+        'or set it to 1.1. A gRPC client uses HTTP/2 on its own.',
+    );
+  }
+
+  return '1.1';
 }
 
 function parseInt64Mode(raw: string | undefined): Int64Mode {

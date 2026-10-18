@@ -29,8 +29,19 @@ export type {
 } from './client.js';
 
 export { CamusTransaction } from './transaction.js';
+export { CamusPipeline } from './pipeline.js';
+export type { PipelineQueryOptions } from './pipeline.js';
 export { CamusQueryStream } from './query-stream.js';
 export { CamusBackupClient } from './backup.js';
+export { CamusDiskVolumeRole } from './node-stats.js';
+export type {
+  CamusCpuStats,
+  CamusDiskVolumeStats,
+  CamusMemoryStats,
+  CamusNodeIdentity,
+  CamusNodeStats,
+  CamusNodeStatsError,
+} from './node-stats.js';
 export type {
   CamusBackupGcDeletion,
   CamusBackupGcOrphan,
@@ -41,7 +52,7 @@ export type {
 // ─── Configuration ──────────────────────────────────────────────────────────
 
 export { CamusProtocol, CamusRoutingMode, DEFAULT_BATCH_OPTIONS } from './config.js';
-export type { CamusClientOptions, GrpcBatchOptions, ResolvedConfig } from './config.js';
+export type { CamusClientOptions, CamusHttpVersion, GrpcBatchOptions, ResolvedConfig } from './config.js';
 
 export { parseConnectionString, redactConnectionString } from './connection-string.js';
 
@@ -116,6 +127,10 @@ export type { CamusCacheMetadata } from './cache.js';
 
 export { CamusRoutingDisposition, ROUTING_ACCEPT_VERSION } from './routing/advice.js';
 export type { CamusRoutingAdvice } from './routing/advice.js';
+
+// ─── Telemetry ──────────────────────────────────────────────────────────────
+
+export { CAMUS_TELEMETRY_NAME } from './telemetry.js';
 
 // ─── Clocks ─────────────────────────────────────────────────────────────────
 

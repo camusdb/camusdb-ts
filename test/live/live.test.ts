@@ -26,6 +26,10 @@
  *                             reports an array column's element type in a REST result: without it,
  *                             REST reads a date, bytes, or a whole-numbered float element as a
  *                             plain JSON value
+ *   CAMUS_LIVE_PIPELINE       set to true to run the pipelined-transaction cases, which need a server
+ *                             that announces frame contract version 2 for the one-frame count
+ *   CAMUS_LIVE_NODE_STATS     set to true to run the node stats cases, which need a server with
+ *                             GetNodeStats and GET /v1/admin/stats
  *
  * Every case creates its own table and drops it afterwards, so the suite leaves nothing behind and
  * two runs never collide.
@@ -58,6 +62,8 @@ const SEQUENCES = process.env.CAMUS_LIVE_SEQUENCES?.toLowerCase() === 'true';
 const RETURNING = process.env.CAMUS_LIVE_RETURNING?.toLowerCase() === 'true';
 const NUMERIC = process.env.CAMUS_LIVE_NUMERIC?.toLowerCase() === 'true';
 const ARRAY_ELEMENT_TYPES = process.env.CAMUS_LIVE_ARRAY_ELEMENT_TYPES?.toLowerCase() === 'true';
+const PIPELINE = process.env.CAMUS_LIVE_PIPELINE?.toLowerCase() === 'true';
+const NODE_STATS = process.env.CAMUS_LIVE_NODE_STATS?.toLowerCase() === 'true';
 
 const CREDENTIALS =
   process.env.CAMUS_LIVE_USER === undefined
@@ -1598,6 +1604,142 @@ describe.runIf(ARRAY_ELEMENT_TYPES)('typed arrays', () => {
         expect((await client.query(sql)).rows).toEqual([expected]);
         expect(await (await client.queryStream(sql)).toArray()).toEqual([expected]);
       });
+    });
+  }
+});
+
+describe.runIf(PIPELINE)('pipelined transactions', () => {
+  for (const [name, options, sendExchanges] of [
+    // gRPC sends each pipeline as one stream message. REST runs one request per step.
+    ['REST transport', { protocol: 'rest', endpoint: REST_ENDPOINT }, [3, 3]],
+    ['gRPC transport', { protocol: 'grpc', endpoint: GRPC_ENDPOINT }, [1, 1]],
+  ] as const) {
+    describe(name, () => {
+      let client: CamusClient;
+      const tables: string[] = [];
+
+      async function createAccounts(): Promise<string> {
+        const table = uniqueName('accounts');
+
+        await client.executeDdl(
+          `CREATE TABLE ${table} (id INT64 PRIMARY KEY NOT NULL, balance INT64 NOT NULL)`,
+        );
+        await client.execute(`INSERT INTO ${table} (id, balance) VALUES (1, 100), (2, 50)`);
+
+        tables.push(table);
+        return table;
+      }
+
+      beforeAll(async () => {
+        client = new CamusClient({ database: DATABASE, timeoutSeconds: 30, ...CREDENTIALS, ...options });
+        await client.createDatabase(undefined, { ifNotExists: true });
+      });
+
+      afterAll(async () => {
+        for (const table of tables) {
+          await client.executeDdl(`DROP TABLE ${table}`).catch(() => undefined);
+        }
+
+        await client.close();
+      });
+
+      it('moves money in two exchanges, with BEGIN in the first and COMMIT in the second', async () => {
+        const table = await createAccounts();
+        const select = `SELECT balance FROM ${table} WHERE id = @id`;
+        const update = `UPDATE ${table} SET balance = @balance WHERE id = @id`;
+
+        const txn = await client.beginTransaction({ deferBegin: true });
+        const pipeline = txn.pipeline();
+
+        const readA = pipeline.query<{ balance: number }>(select, { id: 1 });
+        const readB = pipeline.query<{ balance: number }>(select, { id: 2 });
+
+        await pipeline.send();
+
+        expect(pipeline.exchanges).toBe(sendExchanges[0]);
+        expect(txn.isStarted).toBe(true);
+
+        const from = (await readA).rows[0]!.balance;
+        const to = (await readB).rows[0]!.balance;
+
+        const debit = pipeline.execute(update, { balance: from - 30, id: 1 });
+        const credit = pipeline.execute(update, { balance: to + 30, id: 2 });
+
+        await pipeline.commit();
+
+        expect(pipeline.exchanges).toBe(sendExchanges[0] + sendExchanges[1]);
+        expect((await debit).affectedRows).toBe(1);
+        expect((await credit).affectedRows).toBe(1);
+        expect(txn.isFinalized).toBe(true);
+
+        const balances = await client.query<{ id: number; balance: number }>(
+          `SELECT id, balance FROM ${table} ORDER BY id`,
+        );
+
+        expect(balances.rows).toEqual([
+          { id: 1, balance: 70 },
+          { id: 2, balance: 80 },
+        ]);
+      });
+
+      it('commits nothing when one statement fails, and reports the failure on what follows it', async () => {
+        const table = await createAccounts();
+
+        const txn = await client.beginTransaction({ deferBegin: true });
+        const pipeline = txn.pipeline();
+
+        const first = pipeline.execute(`UPDATE ${table} SET balance = 0 WHERE id = 1`);
+        const duplicate = pipeline.execute(`INSERT INTO ${table} (id, balance) VALUES (2, 1)`);
+        const after = pipeline.execute(`UPDATE ${table} SET balance = 0 WHERE id = 2`);
+
+        await expect(pipeline.commit()).rejects.toBeInstanceOf(CamusError);
+
+        expect((await first).affectedRows).toBe(1);
+        await expect(duplicate).rejects.toBeInstanceOf(CamusError);
+        await expect(after).rejects.toBeInstanceOf(CamusError);
+
+        await txn.rollback();
+
+        const balances = await client.query<{ balance: number }>(`SELECT balance FROM ${table} ORDER BY id`);
+
+        expect(balances.rows.map((row) => row.balance)).toEqual([100, 50]);
+      });
+
+      it('runs inside client.transaction, which then does not commit again', async () => {
+        const table = await createAccounts();
+
+        await client.transaction(async (txn) => {
+          const pipeline = txn.pipeline();
+
+          void pipeline.execute(`UPDATE ${table} SET balance = balance + 1 WHERE id = 1`);
+          await pipeline.commit();
+        });
+
+        expect(await client.scalar(`SELECT balance FROM ${table} WHERE id = 1`)).toBe(101);
+      });
+    });
+  }
+});
+
+describe.runIf(NODE_STATS)('node stats', () => {
+  for (const [name, options] of [
+    ['REST transport', { protocol: 'rest', endpoint: REST_ENDPOINT }],
+    ['gRPC transport', { protocol: 'grpc', endpoint: GRPC_ENDPOINT }],
+  ] as const) {
+    it(`reads the node's disk, CPU, and memory over ${name}`, async () => {
+      const client = new CamusClient({ database: DATABASE, timeoutSeconds: 30, ...CREDENTIALS, ...options });
+
+      const stats = await client.nodeStats();
+
+      expect(stats.address).toBe(options.endpoint);
+      expect(stats.node.version.length).toBeGreaterThan(0);
+      expect(stats.node.sampledAtUnixMs).toBeGreaterThan(0);
+      expect(stats.dataVolume).toBeDefined();
+      expect(stats.dataVolume!.totalBytes).toBeGreaterThan(0);
+      expect(stats.cpu.processorCount).toBeGreaterThan(0);
+      expect(stats.memory.processWorkingSetBytes).toBeGreaterThan(0);
+
+      await client.close();
     });
   }
 });

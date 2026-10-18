@@ -8,6 +8,7 @@
 import { CamusError } from './errors.js';
 import { CamusErrorCode } from './error-codes.js';
 import { SharedRegistry } from './shared-registry.js';
+import { recordQuarantine } from './telemetry.js';
 
 /**
  * The endpoints one deployment's clients rotate through, and which of them are set aside after
@@ -42,6 +43,32 @@ export class CamusEndpointPool {
   /** @internal Test hook: drops every shared pool. */
   static resetShared(): void {
     CamusEndpointPool.shared.clear();
+  }
+
+  /**
+   * Every endpoint of the shared pools, with whether one of the pools has it in quarantine now. Two
+   * pools can list the same endpoint, and it counts as set aside when one of them set it aside. It
+   * feeds the `camusdb.client.endpoint.quarantined` gauge.
+   *
+   * @internal
+   */
+  static collectQuarantine(): Map<string, boolean> {
+    const byKey = new Map<string, { endpoint: string; quarantined: boolean }>();
+
+    for (const pool of CamusEndpointPool.shared.values()) {
+      const now = pool.clock();
+
+      pool.endpoints.forEach((endpoint, i) => {
+        const key = endpoint.toLowerCase();
+        const quarantined = pool.quarantinedUntil[i]! > now;
+        const seen = byKey.get(key);
+
+        if (seen === undefined) byKey.set(key, { endpoint, quarantined });
+        else seen.quarantined ||= quarantined;
+      });
+    }
+
+    return new Map([...byKey.values()].map(({ endpoint, quarantined }) => [endpoint, quarantined]));
   }
 
   private readonly endpoints: string[];
@@ -127,6 +154,8 @@ export class CamusEndpointPool {
     if (index < 0) return;
 
     this.quarantinedUntil[index] = this.clock() + CamusEndpointPool.QUARANTINE_PERIOD_MS;
+
+    recordQuarantine(this.endpoints[index]!);
   }
 
   private indexOf(endpoint: string): number {

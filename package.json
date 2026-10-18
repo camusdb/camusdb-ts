@@ -1,7 +1,7 @@
 {
   "name": "camusdb",
-  "version": "0.6.0",
-  "description": "CamusDB connector for Node.js — REST and gRPC transports, transactions, prepared statements, learned routing, and online backups.",
+  "version": "0.7.0",
+  "description": "CamusDB connector for Node.js — REST and gRPC transports, transactions, pipelines, prepared statements, learned routing, OpenTelemetry, and online backups.",
   "license": "MIT",
   "author": "CamusDB",
   "homepage": "https://github.com/camusdb/camusdb-ts",
@@ -18,7 +18,8 @@
     "sql",
     "driver",
     "connector",
-    "grpc"
+    "grpc",
+    "opentelemetry"
   ],
   "type": "module",
   "main": "./dist/index.js",
@@ -58,7 +59,8 @@
   },
   "peerDependencies": {
     "@grpc/grpc-js": "^1.12.0",
-    "@grpc/proto-loader": "^0.7.13"
+    "@grpc/proto-loader": "^0.7.13",
+    "@opentelemetry/api": "^1.4.0"
   },
   "peerDependenciesMeta": {
     "@grpc/grpc-js": {
@@ -66,12 +68,16 @@
     },
     "@grpc/proto-loader": {
       "optional": true
+    },
+    "@opentelemetry/api": {
+      "optional": true
     }
   },
   "devDependencies": {
     "@eslint/js": "^9.15.0",
     "@grpc/grpc-js": "^1.12.2",
     "@grpc/proto-loader": "^0.7.13",
+    "@opentelemetry/api": "^1.9.1",
     "@types/node": "^22.9.0",
     "@vitest/coverage-v8": "^4.1.11",
     "eslint": "^9.15.0",

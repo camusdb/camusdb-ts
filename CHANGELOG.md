@@ -9,6 +9,46 @@ numbers follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Pipelined transactions. `CamusTransaction.pipeline()` returns a `CamusPipeline`. `query` and
+  `execute` queue a statement and return the promise of its result. `send` runs what is queued as
+  one exchange, and `commit` adds a commit that the server does only if every statement of the
+  transaction succeeded. Each promise settles with its own result or error, and the send rejects
+  with the first failure. A queued promise that nobody awaits is not an unhandled rejection.
+  `exchanges` gives the round trips used. Over gRPC, to a server that announces frame contract
+  version 2, a send is one stream message. Over REST, with `requestFrames: false`, or against an
+  older server, the same statements run one exchange per step with the same results. DDL and
+  `TRUNCATE` throw at queue time. After a pipeline commit, `rollback` does nothing, `commit` throws,
+  and `client.transaction` does not commit a second time.
+- `CamusTransactionOptions.deferBegin`. It sends `BEGIN` with the first statement, or inside the
+  first pipeline send, also with learned routing off.
+- Frame contract version 2 on the gRPC `BatchExecute` stream: `BatchExecuteRequest.txn_start_ref`
+  and `BATCH_STATEMENT_KIND_COMMIT_IF_OK`. The batcher writes a pipeline as one frame or not at all.
+  It checks the version that the stream's server announced and the frame limits before any byte
+  leaves. A pipeline with a cancelled member is left out whole. The client now announces version 2
+  in `camusdb-batch-frames-accept`.
+- A pipelined statement asks for routing advice when learned routing is on, and the driver learns
+  the route from its reply. So the next deferred transaction begins on the node that the advice
+  names, and not on the pool's rotation.
+- `client.nodeStats(endpoint?)` reads the disk, CPU, and memory of one node, over REST
+  (`GET /v1/admin/stats`) and gRPC (`GetNodeStats`). The new `CamusNodeStats` model has `-1` for a
+  value that the node could not read or did not send, and `dataVolume` for the volume that the write
+  gate watches. `client.endpoints` lists the configured endpoints, and `nodeStats` refuses any other
+  endpoint. With authentication on, the account needs superuser or `MONITOR`. `camus_sql.proto`
+  matches the server copy again.
+- OpenTelemetry traces and metrics through `@opentelemetry/api`, a new optional peer dependency.
+  Without it, the driver reports nothing. The driver records one client span for each statement,
+  typed insert, `BEGIN`, `COMMIT` or `ROLLBACK` (one span over all finalize retries), and pipeline
+  `BATCH`, with the attributes of the OpenTelemetry database conventions. A `queryStream` span ends
+  at the last row, at a failed read, or at `close`. The metrics are `db.client.operation.duration`,
+  `camusdb.client.operation.retries` (kinds `finalize`, `autocommit`, `transaction`,
+  `token_renewal`, `create_database`), `camusdb.client.endpoint.quarantines`,
+  `camusdb.client.endpoint.quarantined`, and the `camusdb.client.prepared_statement.*` lookups,
+  registrations, evictions, and count. The names match the .NET driver. `traceQueryText` (key
+  `TraceQueryText`) adds `db.query.text`. It is off by default.
+- `httpVersion` (key `HttpVersion`), so that a connection string shared with the .NET driver reads
+  the same. Node's `fetch` sends HTTP/1.1 only, so `1.1` is accepted, and `2` or `3` throws a
+  `CamusError` when the client is built. Any other value reads as `1.1`, as in .NET.
+
 - `NUMERIC` (alias `DECIMAL`): an exact decimal with precision 38 and scale 9. `ColumnType.Numeric`
   is wire type 12. The value is its decimal text in `strValue` on REST and in `numeric_value` on
   gRPC. `camus_sql.proto` matches the server copy again. A `NUMERIC` column reads as a `string` with

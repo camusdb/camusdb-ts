@@ -16,6 +16,8 @@ import { CamusError } from '../errors.js';
 import { CamusErrorCode } from '../error-codes.js';
 import type { CamusHlcTimestamp } from '../hlc.js';
 import { asBigInt, asNumber, parseLossless } from '../json.js';
+import type { CamusNodeStats } from '../node-stats.js';
+import { nodeStatsFromWire } from '../node-stats.js';
 import type { CamusTransactionOptions } from '../options.js';
 import { setOwn } from '../own-record.js';
 import { bindPositional } from '../prepared/binder.js';
@@ -37,13 +39,16 @@ import type {
   CamusBranchRow,
   CamusTransport,
   NonQueryTransportResult,
+  PipelineTransportResult,
   PreparedStatementInfo,
   QueryTransportResult,
   StartTransactionResult,
   TransportInsertRequest,
+  TransportPipelineRequest,
   TransportSqlRequest,
 } from './transport.js';
 import { hasTransaction } from './transport.js';
+import { runSequentialPipeline } from './sequential-pipeline.js';
 
 /** The `{status, code, message}` envelope every REST route wraps its reply in. */
 interface StatusEnvelope {
@@ -242,6 +247,11 @@ export class RestTransport implements CamusTransport {
     return this.withPrepared(request, (binding) => this.executeNonQueryCore(request, binding));
   }
 
+  /** REST has no frame to pack a transaction into, so a pipeline costs one request per step here. */
+  executePipeline(request: TransportPipelineRequest): Promise<PipelineTransportResult> {
+    return runSequentialPipeline(this, request);
+  }
+
   private async executeNonQueryCore(
     request: TransportSqlRequest,
     binding: PreparedBinding | undefined,
@@ -323,6 +333,31 @@ export class RestTransport implements CamusTransport {
     });
 
     return body.status === 'ok';
+  }
+
+  /**
+   * Reads `GET /v1/admin/stats`. The server answers with the `{status, code, message}` envelope
+   * and the stats fields beside it.
+   */
+  async getNodeStats(
+    endpoint: string,
+    timeoutSeconds: number,
+    signal?: AbortSignal,
+  ): Promise<CamusNodeStats> {
+    const body = await sendJson<StatusEnvelope>(this.pool, {
+      endpoint,
+      path: ['v1', 'admin', 'stats'],
+      method: 'GET',
+      token: await this.token(signal),
+      timeoutSeconds,
+      signal,
+    });
+
+    if (body.status !== 'ok') {
+      throw new CamusError(body.code ?? CamusErrorCode.Generic, body.message ?? 'Node stats failed');
+    }
+
+    return nodeStatsFromWire(endpoint, body);
   }
 
   // ─── Database administration ──────────────────────────────────────────────

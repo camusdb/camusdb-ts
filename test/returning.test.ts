@@ -309,7 +309,7 @@ describe('RETURNING over gRPC', () => {
   class FakeStream implements BatchStream {
     readonly sent: GrpcBatchExecuteRequest[] = [];
 
-    framesAnnounced = false;
+    announcedVersion = 0;
 
     closed = false;
 

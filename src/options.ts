@@ -76,6 +76,17 @@ export interface CamusTransactionOptions {
    * Set it when the transaction's hot statement is not its first one.
    */
   readonly affinity?: string | undefined;
+
+  /**
+   * Send `BEGIN` with the transaction's first statement, or inside its first `CamusPipeline` send
+   * as part of the same stream message, and not from `beginTransaction`. A pipelined transaction
+   * then costs no exchange for its `BEGIN`.
+   *
+   * With learned routing on, `BEGIN` is deferred already, and this changes nothing. The visible
+   * results are those of the routed deferral: the identity reads as zero until the first
+   * statement, and a failure to begin comes from that statement.
+   */
+  readonly deferBegin?: boolean | undefined;
 }
 
 /** No knob set: every one deferred to a lower level of defaults. */
@@ -104,5 +115,6 @@ export function withDefaults(
     mode: options.mode ?? fallback.mode,
     locking: options.locking ?? fallback.locking,
     affinity: options.affinity ?? fallback.affinity,
+    deferBegin: options.deferBegin === true || fallback.deferBegin === true ? true : undefined,
   };
 }

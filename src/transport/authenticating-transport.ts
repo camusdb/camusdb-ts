@@ -7,18 +7,22 @@
 
 import type { CamusTokenProvider } from '../auth/token-provider.js';
 import type { CamusProtocol } from '../config.js';
+import type { CamusNodeStats } from '../node-stats.js';
 import { CamusError } from '../errors.js';
 import { CamusErrorCode } from '../error-codes.js';
 import type { CamusTransactionOptions } from '../options.js';
 import type { CamusRowSource } from '../row-source.js';
+import { CamusRetryKind, recordRetry } from '../telemetry.js';
 import type {
   CamusBranchRow,
   CamusTransport,
   NonQueryTransportResult,
+  PipelineTransportResult,
   PreparedStatementInfo,
   QueryTransportResult,
   StartTransactionResult,
   TransportInsertRequest,
+  TransportPipelineRequest,
   TransportSqlRequest,
 } from './transport.js';
 
@@ -105,6 +109,15 @@ export class AuthenticatingTransport implements CamusTransport {
     return this.run(() => this.inner.executeNonQuery(request));
   }
 
+  /**
+   * A pipeline whose `BEGIN` was refused for its token throws and does not report it, so that this
+   * replay can happen: none of it ran. A token refused later in the pipeline is reported in the
+   * result and not replayed, because the transaction it began is gone either way.
+   */
+  executePipeline(request: TransportPipelineRequest): Promise<PipelineTransportResult> {
+    return this.run(() => this.inner.executePipeline(request));
+  }
+
   insert(request: TransportInsertRequest): Promise<number> {
     return this.run(() => this.inner.insert(request));
   }
@@ -133,6 +146,10 @@ export class AuthenticatingTransport implements CamusTransport {
 
   ping(endpoint: string, timeoutSeconds: number, signal?: AbortSignal): Promise<boolean> {
     return this.run(() => this.inner.ping(endpoint, timeoutSeconds, signal));
+  }
+
+  getNodeStats(endpoint: string, timeoutSeconds: number, signal?: AbortSignal): Promise<CamusNodeStats> {
+    return this.run(() => this.inner.getNodeStats(endpoint, timeoutSeconds, signal));
   }
 
   createDatabase(
@@ -215,6 +232,7 @@ export class AuthenticatingTransport implements CamusTransport {
       if (presented === undefined) throw error;
 
       this.auth.invalidate(presented);
+      recordRetry(CamusRetryKind.TokenRenewal, error);
     }
 
     return operation();

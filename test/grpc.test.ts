@@ -171,8 +171,8 @@ describe('the value codec', () => {
 class FakeStream implements BatchStream {
   readonly sent: GrpcBatchExecuteRequest[] = [];
 
-  /** Set before the batcher writes to it, to play a server that announced frames. */
-  framesAnnounced = false;
+  /** Set before the batcher writes to it, to play a server that announced a frame contract version. */
+  announcedVersion = 0;
 
   private handlers:
     { onMessage: (response: GrpcBatchExecuteResponse) => void; onClose: (error: Error) => void } | undefined;
@@ -733,13 +733,13 @@ describe('the batch stream frames', () => {
   function framed(
     answer: (request: GrpcBatchExecuteRequest, stream: FakeStream) => void,
     overrides: Partial<GrpcBatchOptions> = {},
-    announced = true,
+    announced: boolean | number = true,
   ): { subject: GrpcBatcher; streams: FakeStream[] } {
     const streams: FakeStream[] = [];
 
     const subject = new GrpcBatcher({ ...DEFAULT_BATCH_OPTIONS, channelPoolSize: 1, ...overrides }, (id) => {
       const stream = new FakeStream(id, answer);
-      stream.framesAnnounced = announced;
+      stream.announcedVersion = announced === true ? 1 : announced === false ? 0 : announced;
       streams.push(stream);
       return stream;
     });

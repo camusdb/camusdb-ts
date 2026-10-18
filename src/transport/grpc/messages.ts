@@ -230,6 +230,15 @@ export const GrpcBatchStatementKind = {
    * built before them runs an unknown kind as a non-query, and would execute the probe as SQL.
    */
   Frame: 8,
+  /**
+   * A conditional commit. It commits the transaction that `request.txnHandle` or `txnStartRef`
+   * names only when every earlier operation of that transaction on this stream succeeded. If not,
+   * the server rolls the transaction back and answers with the first failure. It is what lets a
+   * commit share a frame with the statements it depends on. Contract version 2: never send one to
+   * a stream whose server announced a lower version, which would run it as a non-query and leave
+   * the transaction open.
+   */
+  CommitIfOk: 9,
 } as const;
 
 export type GrpcBatchStatementKind = (typeof GrpcBatchStatementKind)[keyof typeof GrpcBatchStatementKind];
@@ -244,6 +253,13 @@ export interface GrpcBatchExecuteRequest {
    * read: a frame reads `items` alone, every other kind reads `request` alone.
    */
   items?: GrpcBatchExecuteRequest[];
+
+  /**
+   * On an item of a frame only (contract version 2): the request id of a `Start` earlier in the
+   * same frame, whose transaction this operation joins. The handle does not exist yet when the
+   * frame is written, so the operation names the start instead. Zero, or unset, everywhere else.
+   */
+  txnStartRef?: number;
 }
 
 /** Which branch of `BatchExecuteResponse.payload` is set. */

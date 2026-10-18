@@ -366,11 +366,13 @@ class ScriptedTransport implements CamusTransport {
   executeQuery = (_request: TransportSqlRequest) => this.run<never>();
   executeQueryStream = () => this.run<never>();
   executeNonQuery = () => this.run<never>();
+  executePipeline = () => this.run<never>();
   insert = () => this.run<number>();
   executeDdl = () => this.run<boolean>();
   prepare = () => this.run<never>();
   closePrepared = () => Promise.resolve();
   ping = () => this.run<boolean>();
+  getNodeStats = () => this.run<never>();
   createDatabase = () => this.run<void>();
   createBranchDatabase = () => this.run<void>();
   dropDatabase = () => this.run<void>();

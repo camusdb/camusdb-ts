@@ -7,6 +7,7 @@
 
 import { CamusError } from './errors.js';
 import { CamusErrorCode } from './error-codes.js';
+import { CamusRetryKind, recordRetry } from './telemetry.js';
 
 /**
  * Which failures a caller may retry, and a loop that does it.
@@ -83,9 +84,23 @@ export interface RetryOptions {
  * The delay grows exponentially from 20 ms, caps at 400 ms, and carries 25% jitter, so a set of
  * clients that conflicted do not retry in step.
  */
-export async function withRetry<T>(
+export function withRetry<T>(
   operation: (attempt: number) => Promise<T>,
   options: RetryOptions = {},
+): Promise<T> {
+  return retryLoop(operation, options, CamusRetryKind.Autocommit);
+}
+
+/**
+ * The loop of `withRetry`. `kind` is what each retry counts as on the
+ * `camusdb.client.operation.retries` counter.
+ *
+ * @internal
+ */
+export async function retryLoop<T>(
+  operation: (attempt: number) => Promise<T>,
+  options: RetryOptions,
+  kind: CamusRetryKind,
 ): Promise<T> {
   const maxAttempts = Math.max(1, options.maxAttempts ?? 5);
 
@@ -94,6 +109,8 @@ export async function withRetry<T>(
       return await operation(attempt);
     } catch (error) {
       if (attempt >= maxAttempts || !isRetryable(error)) throw error;
+
+      recordRetry(kind, error);
 
       await delay(computeDelayMs(attempt), options.signal);
     }

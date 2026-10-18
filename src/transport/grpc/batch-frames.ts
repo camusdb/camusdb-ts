@@ -38,8 +38,24 @@ export const FRAME_HEADER = 'camusdb-batch-frames';
  */
 export const FRAME_ACCEPT_HEADER = 'camusdb-batch-frames-accept';
 
-/** The contract version this client writes, and the highest it reads. */
-export const FRAME_VERSION = 1;
+/**
+ * The contract version this client writes, and the highest it reads.
+ *
+ * Version 1 is frames. Version 2 adds what lets a whole transaction travel in one frame: an item
+ * can name the `Start` earlier in its frame (`txnStartRef`) instead of a handle that does not exist
+ * yet, and a `CommitIfOk` item commits only when every earlier operation of its transaction
+ * succeeded.
+ */
+export const FRAME_VERSION = 2;
+
+/**
+ * The lowest announced version on which a pipelined transaction can be written.
+ *
+ * A server below it ignores `txnStartRef` and runs the operation as an autocommit statement, and
+ * it runs `CommitIfOk` as a non-query and leaves the transaction open. So the batcher never writes
+ * either one to such a stream, and the transport runs the pipeline one exchange per step instead.
+ */
+export const FRAME_PIPELINE_VERSION = 2;
 
 /** The most operations one frame carries. A server refuses the operations past it. */
 export const FRAME_MAX_ITEMS = 256;
@@ -54,21 +70,29 @@ export const FRAME_MAX_ITEMS = 256;
  */
 export const FRAME_MAX_BYTES = 1024 * 1024;
 
+/** True when a header value announces a contract version that this client can write frames to. */
+export function announcesFrames(value: string | undefined): boolean {
+  return announcedFrameVersion(value) >= 1;
+}
+
 /**
- * True when a header value announces a contract version this client writes.
+ * The contract version a header value announces, or 0 for no announcement.
  *
  * The whole value must be digits. `Number.parseInt` stops at the first character it cannot read,
  * so it would read `1x` as version 1 and treat a header this client does not understand as an
- * announcement.
+ * announcement. A server that announces a version above `FRAME_VERSION` still reads everything
+ * this client writes, so the value is kept as announced and not clamped.
  */
-export function announcesFrames(value: string | undefined): boolean {
-  if (value === undefined) return false;
+export function announcedFrameVersion(value: string | undefined): number {
+  if (value === undefined) return 0;
 
   const text = value.trim();
 
-  if (!/^\d+$/.test(text)) return false;
+  if (!/^\d+$/.test(text)) return 0;
 
-  return Number(text) >= FRAME_VERSION;
+  const version = Number(text);
+
+  return Number.isSafeInteger(version) && version >= 1 ? version : 0;
 }
 
 /**

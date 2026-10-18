@@ -18,6 +18,7 @@ concurrency:
 env:
   # The newest published server, so each run tests the driver against the current release.
   # Large-value storage and sequences need 0.13.3 or later. INSERT … RETURNING needs 0.14.1 or later.
+  # Pipelined transactions (frame contract version 2) and node stats pass on the image built 2026-10-16.
   CAMUS_IMAGE: ${{ inputs.image || 'camusdb/camusdb:latest' }}
   CAMUS_LIVE_ENDPOINT: http://localhost:5095
   CAMUS_LIVE_GRPC_ENDPOINT: http://localhost:5096
@@ -26,6 +27,8 @@ env:
   CAMUS_LIVE_SEQUENCES: 'true'
   CAMUS_LIVE_RETURNING: 'true'
   CAMUS_LIVE_NUMERIC: 'true'
+  CAMUS_LIVE_PIPELINE: 'true'
+  CAMUS_LIVE_NODE_STATS: 'true'
 
 jobs:
   live:

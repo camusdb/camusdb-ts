@@ -31,7 +31,10 @@ import type { CamusRoutingAdvice } from './routing/advice.js';
 import { ROUTING_ACCEPT_VERSION } from './routing/advice.js';
 import { CamusRouteOpKind } from './routing/route-cache.js';
 import type { CamusStatementRouter } from './routing/router.js';
+import { BufferedRowSource } from './row-source.js';
 import {
+  callStatement,
+  isCallStatement,
   isDdlStatement,
   isWriteReturning,
   isPreparableStatement,
@@ -267,6 +270,9 @@ export class CamusClient implements AsyncDisposable {
    * All the `RETURNING` rows arrive in one reply. On gRPC the server refuses a reply larger than
    * 4 MiB with `CADB0550`, before the commit, so the statement stores nothing. Use `queryStream` for
    * a large result, such as an `INSERT … SELECT … RETURNING` or an `UPDATE` of many rows.
+   *
+   * A `CALL` goes to the non-query route, because the server runs a procedure only there. The
+   * result has no rows, and `affectedRows` is the number of rows that the procedure's SQL changed.
    */
   query<T = Record<string, unknown>>(
     sql: string,
@@ -284,7 +290,9 @@ export class CamusClient implements AsyncDisposable {
     options: AutocommitStatementOptions,
     operation: CamusOperation | undefined,
   ): Promise<QueryResult<T>> {
-    if (isWriteReturning(sql)) return this.queryWriteReturning<T>(sql, parameters, options, operation);
+    if (isWriteReturning(sql) || isCallStatement(sql)) {
+      return this.queryNonQueryRoute<T>(sql, parameters, options, operation);
+    }
 
     const encoded = encodeParameters(parameters);
     const transaction = options.transaction;
@@ -381,6 +389,10 @@ export class CamusClient implements AsyncDisposable {
    * the same streaming query endpoint. Use this method for a `RETURNING` result that is too large
    * for `query`. The server sends no row before the commit, so a conflict never surfaces mid-read
    * for it. The stream reports no written-row count, so count the rows as you read them.
+   *
+   * A `CALL` goes to the non-query route, because the server runs a procedure only there. The
+   * procedure runs before this returns. The stream has no rows, and `affectedRows` is the number of
+   * rows that the procedure's SQL changed.
    */
   async queryStream<T = Record<string, unknown>>(
     sql: string,
@@ -407,6 +419,13 @@ export class CamusClient implements AsyncDisposable {
     options: AutocommitStatementOptions,
     operation: CamusOperation | undefined,
   ): Promise<CamusQueryStream<T>> {
+    if (isCallStatement(sql)) {
+      const result = await this.executeNonQueryCore(sql, parameters, options, false, operation);
+      const source = new BufferedRowSource(result.returning ?? CamusResultSet.EMPTY, result.affectedRows);
+
+      return new CamusQueryStream<T>(source, this.decodeOptions(options), operation);
+    }
+
     const encoded = encodeParameters(parameters);
     const transaction = options.transaction;
     const writeReturning = isWriteReturning(sql);
@@ -465,6 +484,32 @@ export class CamusClient implements AsyncDisposable {
     }
 
     return this.executeNonQuery(sql, parameters, options);
+  }
+
+  /**
+   * Runs a procedure that a C# extension on the server defines, and reports how many rows the
+   * procedure's SQL changed.
+   *
+   * ```ts
+   * const { affectedRows } = await client.call('transfer', { from: 'alice', to: 'bob', amount: 30 });
+   * // runs CALL transfer(@from, @to, @amount)
+   * ```
+   *
+   * It sends `CALL procedure(@a, @b, ...)` with the parameters in the order of the object's keys,
+   * because a procedure takes its arguments by position. A procedure has no output parameters and
+   * no return value. The same statement as text also runs through `execute`, `query`, and
+   * `queryStream`. A `CALL` is not prepared, and it runs inside `options.transaction` when one is
+   * given.
+   *
+   * @throws {TypeError} when `procedure` is not a plain identifier: a letter or `_`, then letters,
+   * digits, or `_`. The driver sends nothing.
+   */
+  async call(
+    procedure: string,
+    parameters?: Parameters,
+    options: AutocommitStatementOptions = {},
+  ): Promise<ExecuteResult> {
+    return this.executeNonQuery(callStatement(procedure, parameters), parameters, options);
   }
 
   /**
@@ -1039,8 +1084,11 @@ export class CamusClient implements AsyncDisposable {
     });
   }
 
-  /** Runs a write with `RETURNING` on the non-query route and maps the rows it sent back. */
-  private async queryWriteReturning<T>(
+  /**
+   * Runs a write with `RETURNING`, or a `CALL`, on the non-query route and maps the rows it sent
+   * back. A `CALL` sends back none.
+   */
+  private async queryNonQueryRoute<T>(
     sql: string,
     parameters: Parameters | undefined,
     options: AutocommitStatementOptions,

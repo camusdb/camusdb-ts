@@ -14,7 +14,7 @@ import { CamusResultSet, RowMapper } from './result-set.js';
 import { ROUTING_ACCEPT_VERSION } from './routing/advice.js';
 import { CamusRouteOpKind } from './routing/route-cache.js';
 import type { ClientRuntime } from './runtime.js';
-import { isDdlStatement, isDmlStatement, runsInOwnTransaction } from './statements.js';
+import { callStatement, isDdlStatement, isDmlStatement, runsInOwnTransaction } from './statements.js';
 import type { CamusOperation } from './telemetry.js';
 import { traced } from './telemetry.js';
 import type { CamusTransaction, StartClaim } from './transaction.js';
@@ -121,7 +121,8 @@ export class CamusPipeline {
   /**
    * Queues a statement that returns rows, and reports the promise for them. That is a `SELECT`, or
    * an `INSERT`, `UPDATE`, or `DELETE` with a `RETURNING` list. A write reports its written-row
-   * count in `affectedRows`. The promise settles when the pipeline is sent and the statement is
+   * count in `affectedRows`. A `CALL` is also accepted: it has no rows, and it reports in
+   * `affectedRows` the number of rows that the procedure's SQL changed. The promise settles when the pipeline is sent and the statement is
    * answered.
    *
    * @throws {CamusError} at once, for a statement that cannot run inside the transaction (DDL and
@@ -149,6 +150,18 @@ export class CamusPipeline {
     const statement = this.add(sql, parameters, false, undefined);
 
     return statement.promise as Promise<ExecuteResult>;
+  }
+
+  /**
+   * Queues `CALL procedure(@a, @b, ...)` for a procedure that a C# extension on the server defines,
+   * and reports the promise for the number of rows that the procedure's SQL changed. The arguments
+   * follow the order of the parameter object's keys, as in `CamusClient.call`.
+   *
+   * @throws {TypeError} at once, when `procedure` is not a plain identifier.
+   * @throws {CamusError} at once, while a send is in progress.
+   */
+  call(procedure: string, parameters?: Parameters): Promise<ExecuteResult> {
+    return this.execute(callStatement(procedure, parameters), parameters);
   }
 
   /**

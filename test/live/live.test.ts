@@ -30,6 +30,10 @@
  *                             that announces frame contract version 2 for the one-frame count
  *   CAMUS_LIVE_NODE_STATS     set to true to run the node stats cases, which need a server with
  *                             GetNodeStats and GET /v1/admin/stats
+ *   CAMUS_LIVE_EXTENSIONS     set to true to run the C# extension cases, which need a server that
+ *                             loads the server repository's test fixture
+ *                             CamusDB.Tests.Extensions/Fixture.Good (extension_assemblies), and a
+ *                             superuser for CALL
  *
  * Every case creates its own table and drops it afterwards, so the suite leaves nothing behind and
  * two runs never collide.
@@ -64,6 +68,7 @@ const NUMERIC = process.env.CAMUS_LIVE_NUMERIC?.toLowerCase() === 'true';
 const ARRAY_ELEMENT_TYPES = process.env.CAMUS_LIVE_ARRAY_ELEMENT_TYPES?.toLowerCase() === 'true';
 const PIPELINE = process.env.CAMUS_LIVE_PIPELINE?.toLowerCase() === 'true';
 const NODE_STATS = process.env.CAMUS_LIVE_NODE_STATS?.toLowerCase() === 'true';
+const EXTENSIONS = process.env.CAMUS_LIVE_EXTENSIONS?.toLowerCase() === 'true';
 
 const CREDENTIALS =
   process.env.CAMUS_LIVE_USER === undefined
@@ -1740,6 +1745,134 @@ describe.runIf(NODE_STATS)('node stats', () => {
       expect(stats.memory.processWorkingSetBytes).toBeGreaterThan(0);
 
       await client.close();
+    });
+  }
+});
+
+describe.runIf(EXTENSIONS)('C# extensions', () => {
+  for (const [name, options] of [
+    ['REST transport', { protocol: 'rest', endpoint: REST_ENDPOINT }],
+    ['gRPC transport', { protocol: 'grpc', endpoint: GRPC_ENDPOINT }],
+  ] as const) {
+    describe(name, () => {
+      const databases: string[] = [];
+      const clients: CamusClient[] = [];
+
+      /**
+       * The fixture procedure fx_transfer writes to a table named `accounts`, so each case that
+       * calls it works in a database of its own.
+       */
+      async function openWithAccounts(): Promise<CamusClient> {
+        const database = uniqueName('ext');
+        const client = new CamusClient({ database, timeoutSeconds: 30, ...CREDENTIALS, ...options });
+
+        clients.push(client);
+        databases.push(database);
+
+        await client.createDatabase();
+        await client.executeDdl(
+          'CREATE TABLE accounts (id OID PRIMARY KEY NOT NULL, name STRING NOT NULL, balance INT64 NOT NULL)',
+        );
+        await client.execute(
+          "INSERT INTO accounts (id, name, balance) VALUES (GEN_ID(), 'alice', 100), (GEN_ID(), 'bob', 0)",
+        );
+
+        return client;
+      }
+
+      function balance(client: CamusClient, account: string): Promise<number | undefined> {
+        return client.scalar<number>('SELECT balance FROM accounts WHERE name = @name', { name: account });
+      }
+
+      afterAll(async () => {
+        for (const [index, client] of clients.entries()) {
+          await client.dropDatabase(databases[index]).catch(() => undefined);
+          await client.close();
+        }
+      });
+
+      it('runs a procedure through CALL text, query, and queryStream', async () => {
+        const client = await openWithAccounts();
+
+        expect((await client.execute("CALL fx_transfer('alice', 'bob', 30)")).affectedRows).toBe(2);
+
+        const result = await client.query("CALL fx_transfer('alice', 'bob', 5)");
+
+        expect(result.rows).toEqual([]);
+        expect(result.affectedRows).toBe(2);
+
+        await using stream = await client.queryStream("CALL fx_transfer('alice', 'bob', 5)");
+
+        expect(stream.affectedRows).toBe(2);
+        expect(await stream.toArray()).toEqual([]);
+
+        expect(await balance(client, 'alice')).toBe(60);
+        expect(await balance(client, 'bob')).toBe(40);
+      });
+
+      it('runs a procedure through call, also inside a transaction', async () => {
+        const client = await openWithAccounts();
+
+        const result = await client.call('fx_transfer', { from: 'alice', to: 'bob', amount: 10n });
+
+        expect(result.affectedRows).toBe(2);
+
+        await client.transaction(async (transaction) => {
+          await client.call('fx_transfer', { from: 'alice', to: 'bob', amount: 20n }, { transaction });
+        });
+
+        expect(await balance(client, 'alice')).toBe(70);
+      });
+
+      it('rolls back a failed procedure and keeps its error code', async () => {
+        const client = await openWithAccounts();
+
+        await expect(client.execute("CALL fx_transfer('alice', 'bob', 500)")).rejects.toMatchObject({
+          code: 'CADB0822',
+        });
+
+        expect(await balance(client, 'alice')).toBe(100);
+      });
+
+      it('creates and drops a trigger that fires on insert', async () => {
+        const client = await openWithAccounts();
+        const table = uniqueName('ext_people');
+
+        await client.executeDdl(
+          'CREATE TABLE audit_log (id OID PRIMARY KEY NOT NULL DEFAULT (GEN_ID()), op STRING, timing STRING, tbl STRING, detail STRING)',
+        );
+        await client.executeDdl(`CREATE TABLE ${table} (id OID PRIMARY KEY NOT NULL, name STRING NOT NULL)`);
+
+        await client.execute(
+          `CREATE TRIGGER audit ON ${table} AFTER INSERT, DELETE EXTERNAL NAME 'CamusDB.Fixtures.Good.AuditTrigger'`,
+        );
+        await client.execute(`INSERT INTO ${table} (id, name) VALUES (GEN_ID(), 'ann')`);
+
+        const audited = `SELECT count(*) FROM audit_log WHERE tbl = '${table}'`;
+
+        expect(Number(await client.scalar(`${audited} AND detail = 'ann'`))).toBe(1);
+
+        await client.execute(`DROP TRIGGER audit ON ${table}`);
+        await client.execute(`INSERT INTO ${table} (id, name) VALUES (GEN_ID(), 'bo')`);
+
+        expect(Number(await client.scalar(audited))).toBe(1);
+      });
+
+      it('calls an extension function in SQL like a built-in function', async () => {
+        const client = await openWithAccounts();
+        const table = uniqueName('ext_posts');
+
+        await client.executeDdl(`CREATE TABLE ${table} (id OID PRIMARY KEY NOT NULL, title STRING NOT NULL)`);
+        await client.execute(
+          `INSERT INTO ${table} (id, title) VALUES (GEN_ID(), 'Hello World'), (GEN_ID(), 'Other')`,
+        );
+
+        const result = await client.query<{ tag: string }>(
+          `SELECT fx_tag(title) AS tag FROM ${table} WHERE fx_slugify(title) = 'hello-world'`,
+        );
+
+        expect(result.rows).toEqual([{ tag: '[Hello World]' }]);
+      });
     });
   }
 });

@@ -466,6 +466,7 @@ const KNOWN_OPERATIONS = new Set([
   'GRANT',
   'REVOKE',
   'SET',
+  'CALL',
 ]);
 
 /**

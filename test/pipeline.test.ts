@@ -807,6 +807,46 @@ describe('CamusPipeline over REST', () => {
     expect(http.callCount('commit-transaction')).toBe(1);
   });
 
+  it('queues CALL on the non-query route, from query, execute, and call', async () => {
+    restRoutes();
+
+    const client = restClient();
+    const txn = await client.beginTransaction({ deferBegin: true });
+    const pipeline = txn.pipeline();
+
+    const read = pipeline.query("CALL transfer('alice', 'bob', 30)");
+    const write = pipeline.execute('CALL refresh_totals()');
+    const call = pipeline.call('transfer', { from: 'alice', to: 'bob', amount: 30 });
+
+    expect(() => pipeline.call('CALL transfer')).toThrow(TypeError);
+    expect(pipeline.size).toBe(3);
+
+    await pipeline.commit();
+
+    expect(await read).toMatchObject({ rows: [], affectedRows: 1 });
+    expect((await write).affectedRows).toBe(1);
+    expect((await call).affectedRows).toBe(1);
+    expect(http.callCount('execute-sql-query')).toBe(0);
+    expect(
+      http.requestsTo('execute-sql-non-query').map((request) => (request.body as { sql: string }).sql),
+    ).toEqual([
+      "CALL transfer('alice', 'bob', 30)",
+      'CALL refresh_totals()',
+      'CALL transfer(@from, @to, @amount)',
+    ]);
+  });
+
+  it('refuses trigger DDL at queue time', async () => {
+    restRoutes();
+
+    const client = restClient();
+    const txn = await client.beginTransaction({ deferBegin: true });
+
+    expect(() => txn.pipeline().execute('DROP TRIGGER audit ON robots')).toThrow(CamusError);
+
+    await txn.rollback();
+  });
+
   it('is not committed a second time by the transaction helper', async () => {
     restRoutes();
 

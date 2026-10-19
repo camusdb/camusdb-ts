@@ -7,6 +7,22 @@ numbers follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.8.0] — 2026-10-19
+
+### Added
+
+- C# extension procedures, triggers, and functions. `CALL` goes to the non-query route from
+  `execute`, `query`, `queryOne`, `scalar`, `queryStream`, and a pipeline, because the server runs a
+  procedure only there. The result has no rows, and `affectedRows` is the number of rows that the
+  procedure's SQL changed. The new `client.call(procedure, parameters?, options?)` and
+  `CamusPipeline.call(procedure, parameters?)` send `CALL procedure(@a, @b, ...)` with the
+  parameters in key order. They throw `TypeError` for a name that is not a plain identifier.
+  `CamusQueryStream.affectedRows` gives the count for a stream over `CALL`. `CALL` is not prepared,
+  and it is the `CALL` operation in telemetry. `CREATE TRIGGER` and `DROP TRIGGER` go to the DDL
+  route.
+
+## [0.7.0] — 2026-10-18
+
 ### Added
 
 - Pipelined transactions. `CamusTransaction.pipeline()` returns a `CamusPipeline`. `query` and
@@ -48,6 +64,27 @@ numbers follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `httpVersion` (key `HttpVersion`), so that a connection string shared with the .NET driver reads
   the same. Node's `fetch` sends HTTP/1.1 only, so `1.1` is accepted, and `2` or `3` throws a
   `CamusError` when the client is built. Any other value reads as `1.1`, as in .NET.
+
+## [0.6.0] — 2026-10-12
+
+### Fixed
+
+- An array element reads as its element type over REST, as it does over gRPC. The driver reads the
+  type from the `elementType` field of the result's `columns`. An older server does not send the
+  field. Then a `[high, low]` pair reads as a uuid, and an array that holds a fraction or a negative
+  zero reads every number as a float. A `Date`, `DateTime`, or `Bytes` element, and a `Float64`
+  array of whole numbers, still read as their wire values from such a server.
+- A `Float32` value read over REST is the single-precision number that the server stored, also on
+  the streaming endpoint.
+- A negative zero keeps its sign in both directions. A bound `-0` is sent as `-0`, not `0`, and it
+  binds as `Float64`, not `Integer64`.
+- `COMMENT ON SEQUENCE` goes to the DDL route. A released server refuses it on the data route.
+- A statement prefix with two or more keywords matches across any run of white space, a line break
+  included. So `COMMENT  ON\nSEQUENCE` goes to the same route as `COMMENT ON SEQUENCE`.
+
+## [0.5.0] — 2026-10-11
+
+### Added
 
 - `NUMERIC` (alias `DECIMAL`): an exact decimal with precision 38 and scale 9. `ColumnType.Numeric`
   is wire type 12. The value is its decimal text in `strValue` on REST and in `numeric_value` on

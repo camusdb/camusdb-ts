@@ -136,6 +136,15 @@ export function validateBareName(name: string, maxLength: number, parameterName:
   }
 }
 
+/**
+ * True when the name is a plain identifier: a letter or `_`, then letters, digits, or `_`, all ASCII.
+ * The server reads the procedure name of `CALL` only in this form, not delimited, so such a name is
+ * emitted as written and any other name has no spelling.
+ */
+export function isPlainIdentifier(name: string): boolean {
+  return /^[A-Za-z_][A-Za-z0-9_]*$/.test(name);
+}
+
 const RETURNING = 'RETURNING';
 
 /**

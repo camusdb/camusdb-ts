@@ -72,6 +72,14 @@ export class CamusQueryStream<T = Record<string, unknown>> implements AsyncItera
     return this.mapper.columnKeys;
   }
 
+  /**
+   * The number of rows that a `CALL` changed, or `undefined` for a query. A stream over a `CALL` has
+   * no rows.
+   */
+  get affectedRows(): number | undefined {
+    return this.source.recordsAffected >= 0 ? this.source.recordsAffected : undefined;
+  }
+
   async *[Symbol.asyncIterator](): AsyncIterator<T> {
     if (this.consumed) {
       throw new Error('This query stream was already iterated. Run the query again for a second pass.');

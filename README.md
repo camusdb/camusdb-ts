@@ -614,6 +614,63 @@ same transaction, `SELECT currval('…')` returns the value again. The server ac
 where it can count the values before the statement runs, so a `nextval` in a derived table fails
 with `CADB0547`.
 
+### C# extensions: procedures, triggers, and functions
+
+The server can run C# code from an extension assembly as stored procedures, row triggers, and scalar
+functions. The operator deploys the assembly and lists it in the server configuration. The driver
+needs no setup.
+
+Run a procedure with `CALL`. A procedure returns no result set. `execute` reports the number of rows
+that the procedure's SQL changed:
+
+```ts
+const { affectedRows } = await client.execute('CALL transfer(@from, @to, @amount)', {
+  from: 'alice',
+  to: 'bob',
+  amount: 30,
+});
+```
+
+`call` takes the procedure name only. It sends `CALL name(@a, @b, ...)` with the parameters in the
+order of the object's keys, because a procedure takes its arguments by position:
+
+```ts
+await client.call('transfer', { from: 'alice', to: 'bob', amount: 30 });
+// runs CALL transfer(@from, @to, @amount)
+```
+
+- The procedure name must be a plain identifier: a letter or `_`, then letters, digits, or `_`. Any
+  other text throws `TypeError` before the driver sends the call.
+- JavaScript puts a key that is a whole number, such as `'0'`, before the other keys. So give the
+  parameters names.
+- Only input parameters are supported. A procedure has no output parameters and no return value.
+- `query`, `queryOne`, `scalar`, and `queryStream` also send `CALL` to the non-query route. The
+  result has no rows, and `affectedRows` is the changed-row count. On a stream, `affectedRows` is
+  `undefined` for a query.
+- A pipeline accepts `CALL` through `query`, `execute`, and `call`.
+- `CALL` is not prepared. It runs inside the `transaction` option, if there is one, and an error
+  rolls back everything that the procedure wrote.
+- `CALL` needs a superuser in this server version.
+
+`CREATE TRIGGER` and `DROP TRIGGER` go to the DDL route, as other schema statements do:
+
+```ts
+await client.execute(
+  "CREATE TRIGGER audit ON orders AFTER INSERT, UPDATE, DELETE EXTERNAL NAME 'MyCompany.Ext.AuditTrigger'",
+);
+```
+
+An extension function is called in SQL like a built-in function, for example
+`SELECT slugify(title) FROM posts`. `SHOW EXTENSIONS` lists the assemblies that a node loaded. It
+needs a superuser.
+
+The server reports extension errors with `CADB08xx` codes in `CamusError.code`. For example,
+`CADB0822` means that a procedure threw, and `CADB0818` means that a trigger threw. `CADB0817` means
+that this node does not load the trigger's extension, or loads another build of it. The driver does
+not retry `CADB0817`, because the cause is the deployment, not a conflict. The server can run a
+statement again after a serializable conflict, so a trigger or a procedure can run more than once.
+See `docs/csharp-extensions.md` in the server repository for the full rules.
+
 ---
 
 ## Streaming

@@ -5,7 +5,10 @@
  * file that was distributed with this source code.
  */
 
-import { hasReturningKeyword } from './sql-syntax.js';
+import { CamusError } from './errors.js';
+import { CamusErrorCode } from './error-codes.js';
+import { hasReturningKeyword, isPlainIdentifier } from './sql-syntax.js';
+import type { Parameters } from './values/encode.js';
 
 /**
  * Classifies a statement by its leading keywords.
@@ -55,9 +58,22 @@ const DDL_PREFIXES = [
   'DROP SEQUENCE',
   'ALTER SEQUENCE',
   'COMMENT ON SEQUENCE',
+  // Row triggers that run C# extension code. TRIGGER is not a reserved word, but no other
+  // statement starts with these two words.
+  'CREATE TRIGGER',
+  'DROP TRIGGER',
 ];
 
-const DML_PREFIXES = ['INSERT', 'UPDATE', 'DELETE'];
+/**
+ * The statements that run on the non-query route and report an affected-row count.
+ *
+ * `CALL` runs a procedure that a C# extension on the server defines. The server runs it only on the
+ * non-query route, and answers it with an affected-row count and no result set, as it does a write
+ * without `RETURNING`.
+ */
+const DML_PREFIXES = ['INSERT', 'UPDATE', 'DELETE', 'CALL'];
+
+const CALL_PREFIXES = ['CALL'];
 
 /**
  * The statements the server accepts a registration for: the repeatable data statements, whose
@@ -87,13 +103,49 @@ export function isDmlStatement(sql: string): boolean {
   return startsWithAny(sql, DML_PREFIXES);
 }
 
+/** True when the statement is a `CALL`, which the server runs only on the non-query route. */
+export function isCallStatement(sql: string): boolean {
+  return startsWithAny(sql, CALL_PREFIXES);
+}
+
 /**
  * True when the statement is an `INSERT`, `UPDATE`, or `DELETE` with a `RETURNING` list, which
  * sends back the rows it wrote. The keyword test skips literals, comments, delimited names, and
  * placeholders.
  */
 export function isWriteReturning(sql: string): boolean {
-  return isDmlStatement(sql) && hasReturningKeyword(sql);
+  return isDmlStatement(sql) && !isCallStatement(sql) && hasReturningKeyword(sql);
+}
+
+/**
+ * Composes `CALL name(@a, @b, ...)` for a procedure that a C# extension on the server defines.
+ *
+ * The arguments follow the order of the parameter object's keys, because a procedure takes its
+ * arguments by position. A key that is a whole number, such as `'0'`, comes first in JavaScript
+ * whatever its place in the object literal, so use names. The server reads the procedure name only
+ * as a plain identifier, so any other name is refused here, before a request.
+ *
+ * @throws {TypeError} when the procedure name is not a plain identifier.
+ */
+export function callStatement(procedure: string, parameters?: Parameters): string {
+  const name = procedure.trim();
+
+  if (!isPlainIdentifier(name)) {
+    throw new TypeError(
+      `'${name}' is not a procedure name. The procedure name must be a plain identifier: a letter ` +
+        "or '_', then letters, digits, or '_'.",
+    );
+  }
+
+  const placeholders = Object.keys(parameters ?? {}).map((key) => {
+    if (key.length === 0) {
+      throw new CamusError(CamusErrorCode.InvalidParameter, 'A parameter name cannot be empty.');
+    }
+
+    return key.startsWith('@') ? key : `@${key}`;
+  });
+
+  return `CALL ${name}(${placeholders.join(', ')})`;
 }
 
 /** True when the statement may be registered as a prepared statement. */

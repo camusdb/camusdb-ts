@@ -376,9 +376,11 @@ export class CamusClient implements AsyncDisposable {
    * }
    * ```
    *
-   * It is genuinely incremental over REST. Over gRPC the data plane multiplexes results over
-   * shared streams that decode a whole result before returning, so this buffers and replays: the
-   * caller's code is the same, but the memory saving is not there.
+   * It is incremental on both transports. Over REST it reads the streaming query endpoint. Over
+   * gRPC it reads the server-streaming `ExecuteQuery` RPC, on a call of its own outside the shared
+   * batch streams. On gRPC the statement timeout bounds each wait for the next row, not the whole
+   * read, and the statement is always sent inline, because a prepared handle belongs to the batch
+   * streams.
    *
    * A serializable conflict is reported to the caller here, as it is on the buffered `query` path:
    * neither path retries a statement on its own. Rows can reach this side before the statement's

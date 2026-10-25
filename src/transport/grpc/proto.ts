@@ -63,6 +63,26 @@ export interface GrpcDuplexCall<TRequest, TResponse> {
   removeAllListeners: () => void;
 }
 
+/**
+ * A server-streaming call as grpc-js hands it back: an object-mode `Readable`. Its async iterator
+ * reads one message at a time, and a read is what asks the call for the next message, so a reader
+ * that stops makes the server wait.
+ */
+export interface GrpcServerStreamCall<TResponse> extends AsyncIterable<TResponse> {
+  /** The messages already received and not yet read. */
+  readonly readableLength: number;
+  cancel: () => void;
+  on: ((event: 'status', listener: (status: GrpcCallStatus) => void) => void) &
+    ((event: 'error', listener: (error: GrpcStatusError) => void) => void);
+}
+
+/** The final status of a call. On success, its metadata are the call's trailers. */
+export interface GrpcCallStatus {
+  readonly code: number;
+  readonly details?: string | undefined;
+  readonly metadata?: GrpcMetadata | undefined;
+}
+
 /** A gRPC failure as grpc-js raises it. */
 export interface GrpcStatusError extends Error {
   readonly code?: number;

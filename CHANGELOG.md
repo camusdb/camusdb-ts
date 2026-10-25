@@ -7,6 +7,18 @@ numbers follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.9.0] — 2026-10-25
+
+### Changed
+
+- `queryStream` is now incremental over gRPC. It reads the server-streaming `ExecuteQuery` RPC one
+  message at a time, on a call of its own outside the `BatchExecute` streams. Before, the batcher
+  completed the operation only after the last row, so the whole result was held in memory. HTTP/2
+  flow control now makes the server wait when the reader stops. On gRPC, `timeoutSeconds` bounds
+  each wait for the next row, not the whole read, and the statement always runs inline, because a
+  prepared handle belongs to the batch streams. The causal token of an autocommit statement comes
+  from the trailers of the call. A stream that is closed early cancels the call.
+
 ## [0.8.0] — 2026-10-19
 
 ### Added

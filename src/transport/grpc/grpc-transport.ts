@@ -21,7 +21,6 @@ import { CamusIsolationLevel, CamusLocking, CamusTransactionMode } from '../../o
 import { bindPositional } from '../../prepared/binder.js';
 import type { CamusResultSet } from '../../result-set.js';
 import type { CamusRowSource } from '../../row-source.js';
-import { BufferedRowSource } from '../../row-source.js';
 import { sanitizeErrorText } from '../error-text.js';
 import {
   createBranchDatabaseSql,
@@ -63,6 +62,7 @@ import {
 } from './batcher.js';
 import { buildResultSet, encodeValue, fromWire, toWire } from './codec.js';
 import { indicatesEndpointDown, isEndpointUnreachable } from './endpoint-health.js';
+import { GrpcStreamRowSource } from './grpc-stream-row-source.js';
 import type {
   GrpcBatchExecuteRequest,
   GrpcBatchExecuteResponse,
@@ -71,6 +71,7 @@ import type {
   GrpcLoginReply,
   GrpcNonQueryReply,
   GrpcPingReply,
+  GrpcQueryStreamMessage,
   GrpcSqlRequest,
   GrpcTxnHandle,
   GrpcValue,
@@ -85,6 +86,7 @@ import type {
   GrpcDuplexCall,
   GrpcMetadata,
   GrpcRuntime,
+  GrpcServerStreamCall,
   GrpcServiceClient,
   GrpcStatusError,
 } from './proto.js';
@@ -226,14 +228,37 @@ export class GrpcTransport implements CamusTransport, CamusLoginClient {
   }
 
   /**
-   * The gRPC data plane multiplexes over shared streams that decode a whole result before
-   * returning, so this buffers and replays through the same interface. The caller's API is uniform
-   * across transports even though only REST is truly incremental; the streaming endpoint this
-   * feature targets is REST-only.
+   * Streams a query over the server-streaming `ExecuteQuery` RPC on a call of its own, not through
+   * the batcher. A `BatchExecute` stream completes an operation only once every row has arrived,
+   * so a streamed read through it held the whole result in memory. See `GrpcStreamRowSource`.
+   *
+   * The statement is always sent inline. A prepared handle is scoped to the `BatchExecute` stream
+   * that registered it, and the unary RPCs refuse one. The parse it saves is small next to a result
+   * large enough to stream.
+   *
+   * Inside a transaction the call carries the handle, as `insert` does. The caller keeps the
+   * statement order, because it reads a result before the next statement runs.
+   *
+   * The call has no deadline, because a deadline would bound the whole result. The source bounds
+   * each wait for the next message instead.
    */
   async executeQueryStream(request: TransportSqlRequest): Promise<CamusRowSource> {
-    const result = await this.executeQuery(request);
-    return new BufferedRowSource(result.resultSet);
+    const token = await this.auth.getToken(request.signal);
+    const entry = await this.entryFor(request.endpoint);
+
+    const call = (
+      entry.sql.executeQuery as (
+        request: GrpcSqlRequest,
+        metadata: GrpcMetadata,
+      ) => GrpcServerStreamCall<GrpcQueryStreamMessage>
+    ).call(entry.sql, this.buildSqlRequest(request), this.buildMetadata(token));
+
+    return GrpcStreamRowSource.create(call, {
+      timeoutSeconds: request.timeoutSeconds,
+      signal: request.signal,
+      translate: (error) => this.translate(request.endpoint, error),
+      observeTrailers: (trailers) => this.observeTrailerToken(trailers),
+    });
   }
 
   async executeNonQuery(request: TransportSqlRequest): Promise<NonQueryTransportResult> {
@@ -1081,6 +1106,20 @@ export class GrpcTransport implements CamusTransport, CamusLoginClient {
   }
 
   /**
+   * Merges the causal token an autocommit `ExecuteQuery` leaves in its trailers. A statement in an
+   * explicit transaction leaves none, and an absent or malformed token changes nothing.
+   */
+  private observeTrailerToken(trailers: GrpcMetadata): void {
+    const n = headerValue(trailers, 'camus-causal-token-n');
+    const l = headerValue(trailers, 'camus-causal-token-l');
+    const c = headerValue(trailers, 'camus-causal-token-c');
+
+    if (!isInteger(n) || !isInteger(l) || !isInteger(c)) return;
+
+    this.observeToken({ n: Number(n), l: BigInt(l), c: BigInt(c) });
+  }
+
+  /**
    * Runs one operation under a deadline linked to the caller's own cancellation, so a wedged
    * stream cannot hang a caller forever.
    */
@@ -1138,6 +1177,10 @@ function isStaleRegistration(error: unknown): boolean {
     error instanceof PreparedStatementStaleError ||
     (CamusError.is(error) && error.code === CamusErrorCode.UnknownPreparedStatement)
   );
+}
+
+function isInteger(text: string | undefined): text is string {
+  return text !== undefined && /^-?\d+$/.test(text);
 }
 
 function toError(error: unknown): Error {

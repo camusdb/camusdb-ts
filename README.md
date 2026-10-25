@@ -692,11 +692,16 @@ The iteration owns the underlying response and releases it when it ends — whet
 last row, was left with `break`, or was ended by a throw. A stream that is never iterated must be
 released with `await using`, or with `stream.close()`.
 
-Two limits are worth knowing:
+Things worth knowing:
 
-- **It is incremental over REST only.** The gRPC data plane multiplexes results over shared streams
-  that decode a whole result before returning, so gRPC buffers and replays. Your code is the same;
-  the memory saving is not there.
+- **It is incremental on both transports.** REST reads the streaming query endpoint. gRPC uses the
+  server-streaming `ExecuteQuery` RPC, on a call of its own outside the shared batch streams. Rows
+  arrive one message at a time, and the server waits when you stop reading. Two things differ from
+  `query` on gRPC:
+  - `timeoutSeconds` limits each wait for the next row, not the whole read. A slow reader does not
+    time out, but a server that stops sending rows does.
+  - The statement always runs inline, also when it is prepared, because a prepared handle belongs
+    to the batch streams.
 - **A lost conflict surfaces while you read.** Rows can reach you before the statement's own short
   transaction commits, so a conflict that surfaces late is raised from the iteration rather than
   from the call. The driver retries no autocommit statement, `query` included: run the work in
@@ -956,7 +961,7 @@ Both transports carry the same features, and the client API does not change betw
 | | REST | gRPC |
 | --- | --- | --- |
 | Calls per statement | One HTTP request | Multiplexed over shared streams |
-| Row-incremental streaming | Yes | No — it buffers and replays |
+| Row-incremental streaming | Yes | Yes — on its own `ExecuteQuery` call |
 | Prepared statements | Node-local handles | Stream-scoped handles |
 | Backup admin API | Yes | No — set `backupEndpoint` |
 | Extra packages | None | `@grpc/grpc-js`, `@grpc/proto-loader` |

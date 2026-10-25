@@ -97,7 +97,7 @@ function uniqueName(prefix: string): string {
  * Runs the whole suite against one transport.
  *
  * Both transports carry the same features, so the assertions are the same for each. The few places
- * they genuinely differ — only streaming is incremental over REST — are noted where they arise.
+ * they genuinely differ are noted where they arise.
  */
 function suite(name: string, options: Partial<CamusClientOptions>): void {
   describe(name, () => {
@@ -452,6 +452,33 @@ function suite(name: string, options: Partial<CamusClientOptions>): void {
 
       // A second query on the same client proves the response was released rather than left open.
       expect(await client.scalar<number>(`SELECT COUNT(*) FROM ${table}`)).toBe(10);
+    });
+
+    it('streams the uncommitted writes of its own transaction', async () => {
+      const table = await createRobotsTable();
+
+      await insertRobot(table, { name: 'committed' });
+
+      // On gRPC the stream runs on a call of its own, outside the batch stream that the transaction
+      // is pinned to. It must still see the writes of the transaction, and the commit must follow.
+      await client.transaction(async (txn) => {
+        await client.execute(
+          `INSERT INTO ${table} (id, name) VALUES (@id, @name)`,
+          { id: camus.id(CamusObjectId.generateAsString()), name: 'pending' },
+          { transaction: txn },
+        );
+
+        await using stream = await client.queryStream<Robot>(`SELECT name FROM ${table}`, undefined, {
+          transaction: txn,
+        });
+
+        const names: string[] = [];
+        for await (const row of stream) names.push(row.name);
+
+        expect(names.sort()).toEqual(['committed', 'pending']);
+      });
+
+      expect(await client.scalar<number>(`SELECT COUNT(*) FROM ${table}`)).toBe(2);
     });
 
     // ─── Transactions ───────────────────────────────────────────────────────

@@ -300,9 +300,8 @@ export interface CamusTransport {
    * Runs a `SELECT` and reports a source whose rows are pulled as the caller advances, so a large
    * result never fully materializes on this side.
    *
-   * REST streams the NDJSON body row by row. gRPC multiplexes its data plane over shared streams
-   * that decode a whole result before returning, so it buffers and replays through the same
-   * interface: correct, and uniform for the caller, but not incremental.
+   * REST streams the NDJSON body row by row. gRPC reads the server-streaming `ExecuteQuery` RPC
+   * message by message, on a call of its own outside the shared batch streams.
    *
    * A serializable conflict is reported to the caller. No transport path retries an autocommit
    * statement on its own; the buffered path does not either. Rows can reach the caller before the

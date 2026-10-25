@@ -167,6 +167,29 @@ export function buildResultSet(
   schema: GrpcResultSchema | undefined,
   rows: readonly GrpcResultRow[],
 ): CamusResultSet {
+  const { names, types } = readResultSchema(schema);
+  const columnCount = types.length;
+
+  const cells: ColumnValue[] = new Array<ColumnValue>(rows.length * columnCount).fill(NULL_VALUE);
+
+  for (let r = 0; r < rows.length; r++) {
+    const values = rows[r]!.values;
+    const base = r * columnCount;
+    const limit = Math.min(columnCount, values.length);
+
+    for (let c = 0; c < limit; c++) {
+      cells[base + c] = decodeCell(values[c]!, types[c]!);
+    }
+  }
+
+  return new CamusResultSet(names, types, cells, rows.length);
+}
+
+/** The column names and types of a schema message. A type this driver does not know reads as `Null`. */
+export function readResultSchema(schema: GrpcResultSchema | undefined): {
+  names: string[];
+  types: ColumnType[];
+} {
   const columns = schema?.columns ?? [];
   const columnCount = columns.length;
 
@@ -179,20 +202,13 @@ export function buildResultSet(
     types[i] = isColumnType(column.type) ? column.type : ColumnType.Null;
   }
 
-  const cells: ColumnValue[] = new Array<ColumnValue>(rows.length * columnCount).fill(NULL_VALUE);
+  return { names, types };
+}
 
-  for (let r = 0; r < rows.length; r++) {
-    const values = rows[r]!.values;
-    const base = r * columnCount;
-    const limit = Math.min(columnCount, values.length);
-
-    for (let c = 0; c < limit; c++) {
-      const cell = decodeValue(values[c]!);
-      cells[base + c] = types[c] === ColumnType.Numeric ? asNumericCell(cell) : cell;
-    }
-  }
-
-  return new CamusResultSet(names, types, cells, rows.length);
+/** One cell of a row, read against the type its schema declares for the column. */
+export function decodeCell(value: GrpcValue, type: ColumnType): ColumnValue {
+  const cell = decodeValue(value);
+  return type === ColumnType.Numeric ? asNumericCell(cell) : cell;
 }
 
 /**

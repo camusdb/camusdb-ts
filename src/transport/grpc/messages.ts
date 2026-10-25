@@ -292,6 +292,18 @@ export interface GrpcBatchExecuteResponse {
   frame?: GrpcBatchResponseFrame;
 }
 
+/**
+ * One message of the server-streaming `ExecuteQuery` RPC: exactly one schema first, then zero or
+ * more rows, then the optional cache verdict and routing advice.
+ */
+export interface GrpcQueryStreamMessage {
+  payload?: 'schema' | 'row' | 'cacheMetadata' | 'routingAdvice' | undefined;
+  schema?: GrpcResultSchema;
+  row?: GrpcResultRow;
+  cacheMetadata?: GrpcCacheMetadata;
+  routingAdvice?: GrpcRoutingAdviceMessage;
+}
+
 /** Several responses in one stream message. A wrapper, because a `oneof` holds no repeated field. */
 export interface GrpcBatchResponseFrame {
   items: GrpcBatchExecuteResponse[];

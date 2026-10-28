@@ -9,6 +9,7 @@ import { createHmac, randomBytes } from 'node:crypto';
 
 import { CamusError } from '../errors.js';
 import { CamusErrorCode } from '../error-codes.js';
+import { delay } from '../retry.js';
 import { SharedRegistry } from '../shared-registry.js';
 import { CamusLoginMode, recordLogin, runDetached } from '../telemetry.js';
 import type { CamusCredentials } from './credentials.js';
@@ -33,6 +34,18 @@ const USABLE_SHARE_OF_REPORTED_LIFETIME = 0.95;
 export const BACKGROUND_RENEWAL_RETRY_DELAY_MS = 5000;
 
 /**
+ * The waits, in milliseconds, before each new attempt of a login that the server refused as busy
+ * (`CADB0518`). The server refuses a login rather than queue it when every key-derivation slot is
+ * in use, and a refused login runs no statement, so sending it again is always safe. Only the
+ * driver can do that: the login runs inside the statement that needed the token, and that statement
+ * can belong to an explicit transaction that cannot be replayed alone. The list is short because
+ * the same code also reports the per-account login rate limit, which a few seconds do not clear.
+ * Each wait is randomized between half and one and a half times its value, so many clients that
+ * the server refused together do not return together.
+ */
+export const DEFAULT_BUSY_LOGIN_RETRY_DELAYS_MS: readonly number[] = [250, 750, 1500];
+
+/**
  * Owns a client's bearer token: mints it from the configured credentials on first use, hands the
  * same token to every request until it goes stale, and mints a new one when it does.
  *
@@ -52,6 +65,10 @@ export const BACKGROUND_RENEWAL_RETRY_DELAY_MS = 5000;
  * past it. That proactive renewal is the primary path. `invalidate`, driven by a `CADB0516` from
  * a real request, is the backstop for what a clock cannot predict: a rotated password, a dropped
  * user, a logout from elsewhere, or a server whose token lifetime is shorter than the fallback.
+ *
+ * **Busy server.** A login that the server refuses as busy (`CADB0518`) is sent again after a short,
+ * randomized wait, a few times, before the refusal reaches the caller. See
+ * `DEFAULT_BUSY_LOGIN_RETRY_DELAYS_MS`.
  *
  * A token supplied directly is used as written and never renewed — the driver has no password to
  * mint a replacement with — so a `CADB0516` on that path reaches the caller rather than a retry.
@@ -130,6 +147,9 @@ export class CamusTokenProvider {
 
   /** @internal Test hook: the wall clock this provider reads. */
   clock: () => number = () => Date.now();
+
+  /** @internal Test hook: the waits this provider uses; see `DEFAULT_BUSY_LOGIN_RETRY_DELAYS_MS`. */
+  busyLoginRetryDelaysMs: readonly number[] = DEFAULT_BUSY_LOGIN_RETRY_DELAYS_MS;
 
   constructor(init: {
     credentials: CamusCredentials;
@@ -334,18 +354,37 @@ export class CamusTokenProvider {
     const generation = this.generation;
 
     const client = await this.resolveLoginClient();
+    const retryDelays = this.busyLoginRetryDelaysMs;
 
-    // Both deadlines count from before the request, so the time the login takes is charged to the
-    // token.
-    const requestedAt = this.clock();
+    let requestedAt: number;
+    let minted: CamusLoginResult;
 
-    const minted: CamusLoginResult = await client.login(
-      this.resolveEndpoint(),
-      credentials.user!,
-      credentials.password!,
-      this.resolveTimeoutSeconds(),
-      signal,
-    );
+    for (let attempt = 0; ; attempt++) {
+      // Both deadlines count from before the request, so the time the login takes is charged to
+      // the token.
+      requestedAt = this.clock();
+
+      try {
+        minted = await client.login(
+          this.resolveEndpoint(),
+          credentials.user!,
+          credentials.password!,
+          this.resolveTimeoutSeconds(),
+          signal,
+        );
+        break;
+      } catch (error) {
+        if (
+          !CamusError.is(error) ||
+          error.code !== CamusErrorCode.TooManyAuthAttempts ||
+          attempt >= retryDelays.length
+        ) {
+          throw error;
+        }
+
+        await delay(jitter(retryDelays[attempt]!), signal);
+      }
+    }
 
     // A `login()` call during the round trip replaced the credentials this token was minted with.
     // The caller that asked for it still receives it; it does not become the cached token.
@@ -378,4 +417,9 @@ export class CamusTokenProvider {
 
     return { renewAfterMs, expiresAfterMs };
   }
+}
+
+/** A wait randomized between half and one and a half times `delayMs`. */
+function jitter(delayMs: number): number {
+  return delayMs <= 0 ? 0 : delayMs * (0.5 + Math.random());
 }

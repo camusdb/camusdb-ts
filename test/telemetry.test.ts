@@ -283,6 +283,8 @@ describe('the operation name', () => {
     expect(operationName('select 1')).toBe('SELECT');
     expect(operationName('  (SELECT 1) UNION (SELECT 2)')).toBe('SELECT');
     expect(operationName('INSERT INTO t VALUES (1)')).toBe('INSERT');
+    expect(operationName('upsert into t values (1)')).toBe('UPSERT');
+    expect(operationName('(SELECT a FROM t LIMIT 1) UNION SELECT b FROM u')).toBe('SELECT');
     expect(operationName('EVICT CACHE x')).toBeUndefined();
     expect(operationName('')).toBeUndefined();
   });

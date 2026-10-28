@@ -194,6 +194,9 @@ describe('CamusTokenProvider', () => {
 
     const auth = provider(client);
 
+    // This test is about the renewal delay, not about the busy-login retry.
+    auth.busyLoginRetryDelaysMs = [];
+
     let now = 0;
     auth.clock = () => now;
 
@@ -220,6 +223,85 @@ describe('CamusTokenProvider', () => {
     await settled(auth);
 
     expect(await auth.getToken()).toBe('token-3');
+  });
+
+  it('sends a login that the server refused as busy again, up to three times', async () => {
+    let logins = 0;
+
+    const client: CamusLoginClient = {
+      async login() {
+        logins++;
+        if (logins <= 3) throw new CamusError('CADB0518', 'busy');
+        return { token: `token-${String(logins)}` };
+      },
+      async logout() {},
+    };
+
+    const auth = provider(client);
+    auth.busyLoginRetryDelaysMs = [0, 0, 0];
+
+    expect(await auth.getToken()).toBe('token-4');
+    expect(logins).toBe(4);
+  });
+
+  it('passes the busy refusal to the caller after the last retry', async () => {
+    let logins = 0;
+
+    const client: CamusLoginClient = {
+      async login() {
+        logins++;
+        throw new CamusError('CADB0518', 'busy');
+      },
+      async logout() {},
+    };
+
+    const auth = provider(client);
+    auth.busyLoginRetryDelaysMs = [0, 0, 0];
+
+    await expect(auth.getToken()).rejects.toMatchObject({ code: 'CADB0518' });
+    expect(logins).toBe(4);
+  });
+
+  it('does not send again a login that failed for another reason', async () => {
+    let logins = 0;
+
+    const client: CamusLoginClient = {
+      async login() {
+        logins++;
+        throw new CamusError('CADB0516', 'bad password');
+      },
+      async logout() {},
+    };
+
+    const auth = provider(client);
+    auth.busyLoginRetryDelaysMs = [0, 0, 0];
+
+    await expect(auth.getToken()).rejects.toMatchObject({ code: 'CADB0516' });
+    expect(logins).toBe(1);
+  });
+
+  it('stops the wait before a new attempt when the signal ends', async () => {
+    let logins = 0;
+
+    const client: CamusLoginClient = {
+      async login() {
+        logins++;
+        throw new CamusError('CADB0518', 'busy');
+      },
+      async logout() {},
+    };
+
+    const auth = provider(client);
+    auth.busyLoginRetryDelaysMs = [60_000];
+
+    const controller = new AbortController();
+    const pending = auth.getToken(controller.signal);
+
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    controller.abort(new Error('stopped'));
+
+    await expect(pending).rejects.toThrow('stopped');
+    expect(logins).toBe(1);
   });
 
   it('lets a caller whose token expired join the background renewal in flight', async () => {

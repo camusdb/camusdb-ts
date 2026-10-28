@@ -500,6 +500,42 @@ commit. The stream reports no written-row count, so count the rows as you read t
 
 See `docs/returning.md` in the server repository for the full rules.
 
+### `INSERT … ON CONFLICT` and `UPSERT`
+
+An `INSERT` can say what to do with a row whose unique key is already taken: skip the row
+(`DO NOTHING`), or update the stored row (`DO UPDATE`). `UPSERT INTO` is a short form that updates
+on the primary key. In `SET`, a bare column is the stored row, and `excluded.c` is the proposed row:
+
+```ts
+const hits = await client.scalar<number>(
+  `INSERT INTO counters (k, n) VALUES (@k, 1)
+   ON CONFLICT (k) DO UPDATE SET n = counters.n + excluded.n
+   RETURNING n`,
+  { k: 'hits' },
+); // 1 the first time, then 2, 3, …
+
+await client.execute('UPSERT INTO counters (k, n) VALUES (@k, @n)', { k: 'misses', n: 0 });
+```
+
+- Both forms are writes, the same as `INSERT`, on every entry point: `execute`, `query`,
+  `queryOne`, `scalar`, `queryStream`, a pipeline, and a prepared statement. They use the
+  `transactionOptions` of an autocommit write.
+- The row count is the number of inserted rows plus the number of updated rows. A skipped row
+  counts nothing and returns no `RETURNING` row.
+- `DO UPDATE` and `UPSERT` need the `INSERT` and the `UPDATE` privilege.
+- When two transactions write the same new key, the second one fails with a retryable code
+  (`CADB0502`, or `CADB0504` at the lock-wait deadline). `withRetry` sends an autocommit statement
+  again as usual. A duplicate on a unique index that is not the conflict target still fails with
+  the duplicate-key error, which is not retried.
+- `insert` has no upsert form, because the server's typed insert route does not support it. Use
+  SQL.
+- Before 0.11.0, the driver sent an `UPSERT … RETURNING` from `query`, `queryOne`, or `scalar` to the
+  query route. It ran without the `transactionOptions` and reported no `affectedRows`.
+  `INSERT … ON CONFLICT` was not affected.
+
+See `docs/insert-on-conflict.md` in the server repository for the full rules: the conflict target,
+triggers, and the error when one statement changes the same row two times.
+
 ### `TRUNCATE`
 
 `TRUNCATE` commits a replicated schema entry that a rollback cannot undo, so the server refuses it
@@ -883,6 +919,10 @@ client.isPrepared('SELECT * FROM robots WHERE year = @year'); // true
 client.preparedStatementCount;                                // 1
 ```
 
+Only `SELECT`, `INSERT`, `UPSERT`, `UPDATE`, `DELETE`, and `SHOW` are preparable, and a query that
+starts with a parenthesis, such as `(SELECT …) UNION SELECT …`. `prepare` on a schema or
+administration statement does nothing, and the statement runs inline.
+
 Preparing is an optimization and never the reason a working statement fails. A registration that is
 refused — schema statements, a full server-side cap, a server with no support at all — leaves the
 statement running inline, and `prepare` reports no error for it.
@@ -946,6 +986,12 @@ replacement with — so a rejection reaches you rather than being retried.
   that reports no lifetime the driver falls back to `tokenLifetimeSeconds`: it renews at 80% of it,
   and never sends a token past it. An application idle for longer than the lifetime still waits for
   one login on its first statement.
+- **A busy server gets a few more tries.** The server refuses a login with `CADB0518` when every
+  key-derivation slot is in use, and when the account is at its login rate limit. The driver sends
+  such a login again up to three times, after about 250 ms, 750 ms, and 1.5 s. Each wait is
+  randomized between half and one and a half times its value. A refused login runs no statement,
+  so a new attempt is always safe, also inside a transaction. After the last try, the `CADB0518`
+  reaches the statement.
 - **A rejection is the backstop.** A `CADB0516` from a real request discards the token and replays
   the statement once with a fresh one. That covers what a clock cannot predict: a rotated password,
   a dropped user, a logout from elsewhere, a server restart.
@@ -1341,7 +1387,7 @@ has these attributes from the
 | --- | --- |
 | `db.system.name` | `camusdb` |
 | `db.namespace` | The database of the client. |
-| `db.operation.name` | The first keyword of the SQL text, if it is a known verb (`SELECT`, `INSERT`, `UPDATE`, `DELETE`, `CREATE`, `ALTER`, `DROP`, `TRUNCATE`, and others), or `BEGIN`, `COMMIT`, `ROLLBACK`, `BATCH`. |
+| `db.operation.name` | The first keyword of the SQL text, if it is a known verb (`SELECT`, `INSERT`, `UPSERT`, `UPDATE`, `DELETE`, `CREATE`, `ALTER`, `DROP`, `TRUNCATE`, and others), or `BEGIN`, `COMMIT`, `ROLLBACK`, `BATCH`. |
 | `db.collection.name` | The table, when the statement names exactly one. A typed insert always names its table. |
 | `db.query.summary` | The operation and the tables, each once and in the order of the SQL text, at most 255 characters. Only when the statement names a table. |
 | `server.address`, `server.port` | The endpoint that received the operation, after routing. |

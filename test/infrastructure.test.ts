@@ -623,12 +623,23 @@ describe('statement classification', () => {
 
   it('recognizes a write statement', () => {
     expect(isDmlStatement('insert into robots values ()')).toBe(true);
+    expect(isDmlStatement('UPSERT INTO counters (k, n) VALUES (1, 2)')).toBe(true);
+    expect(isDmlStatement('  upsert into counters (k, n) values (1, 2)')).toBe(true);
     expect(isDmlStatement('SELECT 1')).toBe(false);
   });
 
   it('recognizes a statement worth preparing', () => {
     expect(isPreparableStatement('SELECT 1')).toBe(true);
     expect(isPreparableStatement('SHOW BRANCHES FROM x')).toBe(true);
+    expect(isPreparableStatement('UPSERT INTO counters (k, n) VALUES (@k, @n)')).toBe(true);
+    expect(
+      isPreparableStatement('(SELECT k FROM counters ORDER BY k LIMIT 2) UNION ALL SELECT k FROM archive'),
+    ).toBe(true);
+    expect(
+      isPreparableStatement(
+        'INSERT INTO counters (k, n) VALUES (@k, @n) ON CONFLICT (k) DO UPDATE SET n = excluded.n',
+      ),
+    ).toBe(true);
     expect(isPreparableStatement('CREATE TABLE t (id id)')).toBe(false);
   });
 

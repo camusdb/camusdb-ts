@@ -7,6 +7,26 @@ numbers follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.11.0] — 2026-10-28
+
+### Added
+
+- A login that the server refuses as busy (`CADB0518`) is sent again up to three times, after
+  randomized waits of about 250 ms, 750 ms, and 1.5 s, before the refusal reaches the statement.
+  The server refuses a login when every key-derivation slot is in use. A refused login runs no
+  statement, so a new attempt is safe, also inside a transaction. The same code also reports the
+  per-account login rate limit, so the list of waits is short.
+- `UPSERT INTO` and a query that starts with a parenthesis, such as `(SELECT …) UNION SELECT …`, are
+  preparable. `INSERT … ON CONFLICT` was preparable already.
+- `UPSERT` is a `db.operation.name`, and it is the first word of the `db.query.summary`.
+
+### Fixed
+
+- `UPSERT INTO` is a write, the same as `INSERT`. Before, an `UPSERT … RETURNING` from `query`,
+  `queryOne`, or `scalar` went to the query route. It ran without the autocommit
+  `transactionOptions` and reported no `affectedRows`. `queryStream` sent it with no autocommit
+  options, and a pipeline queued it as a read. `INSERT … ON CONFLICT` was not affected.
+
 ## [0.10.0] — 2026-10-27
 
 ### Added

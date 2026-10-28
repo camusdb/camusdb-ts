@@ -67,11 +67,16 @@ const DDL_PREFIXES = [
 /**
  * The statements that run on the non-query route and report an affected-row count.
  *
+ * `UPSERT INTO` is an `INSERT … ON CONFLICT (primary key) DO UPDATE`, so it is a write like
+ * `INSERT`. Sent as a query, the server refuses it without `RETURNING` (`CADB0407`), and with
+ * `RETURNING` it would run without the autocommit options and report no row count. `UPSERT` is not a
+ * reserved word, but no other statement starts with it.
+ *
  * `CALL` runs a procedure that a C# extension on the server defines. The server runs it only on the
  * non-query route, and answers it with an affected-row count and no result set, as it does a write
  * without `RETURNING`.
  */
-const DML_PREFIXES = ['INSERT', 'UPDATE', 'DELETE', 'CALL'];
+const DML_PREFIXES = ['INSERT', 'UPSERT', 'UPDATE', 'DELETE', 'CALL'];
 
 const CALL_PREFIXES = ['CALL'];
 
@@ -79,8 +84,11 @@ const CALL_PREFIXES = ['CALL'];
  * The statements the server accepts a registration for: the repeatable data statements, whose
  * whole point is running many times with different values. Schema and administration statements
  * are one-shot and are excluded on the server too, so this list mirrors that rather than guessing.
+ *
+ * A statement that starts with a parenthesis is a query: a set operation whose first operand has
+ * its own `ORDER BY` or `LIMIT`, as in `(SELECT …) UNION SELECT …`.
  */
-const PREPARABLE_PREFIXES = ['SELECT', 'INSERT', 'UPDATE', 'DELETE', 'SHOW'];
+const PREPARABLE_PREFIXES = ['SELECT', '(', 'INSERT', 'UPSERT', 'UPDATE', 'DELETE', 'SHOW'];
 
 /**
  * The statements that own their internal transaction, which the server refuses inside an explicit
@@ -109,7 +117,7 @@ export function isCallStatement(sql: string): boolean {
 }
 
 /**
- * True when the statement is an `INSERT`, `UPDATE`, or `DELETE` with a `RETURNING` list, which
+ * True when the statement is an `INSERT`, `UPSERT`, `UPDATE`, or `DELETE` with a `RETURNING` list, which
  * sends back the rows it wrote. The keyword test skips literals, comments, delimited names, and
  * placeholders.
  */

@@ -18,6 +18,13 @@ describe('queryTables', () => {
     ['UPDATE `players` SET `name` = @p0 WHERE `id` = @p1', 'players'],
     ['DELETE FROM sessions WHERE expires < 100', 'sessions'],
     ['INSERT INTO t (id) VALUES (1) ON CONFLICT (id) DO UPDATE SET id = 2', 't'],
+    [
+      'INSERT INTO t (k, n) VALUES (1, 2) ON CONFLICT ON CONSTRAINT t_pkey DO UPDATE SET n = t.n + excluded.n',
+      't',
+    ],
+    ['UPSERT INTO `counters` (`k`, `n`) VALUES (@p0, @p1) RETURNING n', 'counters'],
+    ['SELECT a FROM t UNION SELECT b FROM u EXCEPT SELECT c FROM v', 't,u,v'],
+    ['(SELECT a FROM t ORDER BY a LIMIT 5) UNION ALL SELECT b FROM u ORDER BY 1', 't,u'],
     ['CREATE TABLE IF NOT EXISTS robots (id OID PRIMARY KEY)', 'robots'],
     ['DROP TABLE IF EXISTS robots', 'robots'],
     ['TRUNCATE robots', 'robots'],

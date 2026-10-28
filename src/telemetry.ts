@@ -508,6 +508,7 @@ export async function traced<T>(
 const KNOWN_OPERATIONS = new Set([
   'SELECT',
   'INSERT',
+  'UPSERT',
   'UPDATE',
   'DELETE',
   'CREATE',

@@ -56,6 +56,12 @@ describe('the RETURNING keyword scan', () => {
     expect(isWriteReturning('delete from t where a = 1 returning *')).toBe(true);
   });
 
+  it('accepts an UPSERT', () => {
+    expect(isWriteReturning('UPSERT INTO t (k, n) VALUES (1, 2) RETURNING n')).toBe(true);
+    expect(isWriteReturning('  upsert into t (k, n) values (1, 2) returning *')).toBe(true);
+    expect(isWriteReturning('UPSERT INTO t (k, n) VALUES (1, 2)')).toBe(false);
+  });
+
   it('refuses a statement that is not a write with RETURNING', () => {
     expect(isWriteReturning('UPDATE t SET a = 1')).toBe(false);
     expect(isWriteReturning('DELETE FROM t WHERE a = 1')).toBe(false);
@@ -168,6 +174,27 @@ describe('RETURNING over REST', () => {
     expect(server.requestsTo('execute-sql-non-query')[0]!.body).toMatchObject({
       isolationLevel: 'Serializable',
       locking: 'Optimistic',
+    });
+  });
+
+  it('sends an UPSERT with RETURNING to the non-query endpoint, with the autocommit options', async () => {
+    server.json('execute-sql-non-query', {
+      status: 'ok',
+      rows: 1,
+      columns: [{ name: 'n', type: ColumnType.Integer64 }],
+      returningRows: [[7]],
+    });
+
+    const result = await client(';IsolationLevel=Serializable').query<{ n: number }>(
+      'UPSERT INTO counters (k, n) VALUES (@k, 7) RETURNING n',
+      { k: 'a' },
+    );
+
+    expect(result.rows).toEqual([{ n: 7 }]);
+    expect(result.affectedRows).toBe(1);
+    expect(server.callCount('execute-sql-query')).toBe(0);
+    expect(server.requestsTo('execute-sql-non-query')[0]!.body).toMatchObject({
+      isolationLevel: 'Serializable',
     });
   });
 

@@ -21,7 +21,7 @@ import { FakeCamusServer, respondJson, respondNdjson } from './support/fake-serv
 type AttributeMap = Record<string, unknown>;
 
 interface RecordedSpan {
-  readonly name: string;
+  name: string;
   readonly kind: number | undefined;
   readonly parent: RecordedSpan | undefined;
   readonly attributes: AttributeMap;
@@ -80,7 +80,8 @@ class FakeSpan {
     return this;
   }
 
-  updateName(): this {
+  updateName(name: string): this {
+    this.record.name = name;
     return this;
   }
 
@@ -297,13 +298,15 @@ describe('spans', () => {
 
     const span = spans[0]!;
 
-    expect(span.name).toBe(`SELECT ${database()}`);
+    expect(span.name).toBe('SELECT t');
     expect(span.kind).toBe(2);
     expect(span.ended).toBe(true);
     expect(span.attributes).toEqual({
       'db.system.name': 'camusdb',
       'db.namespace': database(),
       'db.operation.name': 'SELECT',
+      'db.collection.name': 't',
+      'db.query.summary': 'SELECT t',
       'camusdb.transport': 'rest',
       'server.address': '127.0.0.1',
       'server.port': port(),
@@ -316,7 +319,61 @@ describe('spans', () => {
     await client({ traceQueryText: true }).execute('UPDATE t SET n = 1');
 
     expect(spans[0]!.attributes['db.query.text']).toBe('UPDATE t SET n = 1');
-    expect(spans[0]!.name).toBe(`UPDATE ${database()}`);
+    expect(spans[0]!.name).toBe('UPDATE t');
+  });
+
+  it('records the SQL text without its literal values with traceQueryText sanitized', async () => {
+    routes();
+
+    await client({ traceQueryText: 'sanitized' }).query(
+      'SELECT `o`.`id` FROM `orders` AS `o` JOIN customers c ON c.id = `o`.`customer_id` ' +
+        "WHERE `o`.`email` = 'player@example.com' AND `o`.`total` > 10.5 AND `o`.`region` = @region",
+      { region: 'PH' },
+    );
+
+    const span = spans[0]!;
+
+    expect(span.name).toBe('SELECT orders customers');
+    expect(span.attributes['db.query.text']).toBe(
+      'SELECT `o`.`id` FROM `orders` AS `o` JOIN customers c ON c.id = `o`.`customer_id` ' +
+        'WHERE `o`.`email` = ? AND `o`.`total` > ? AND `o`.`region` = @region',
+    );
+
+    // Two tables: a summary, but no single collection.
+    expect(span.attributes['db.query.summary']).toBe('SELECT orders customers');
+    expect(span.attributes['db.collection.name']).toBeUndefined();
+  });
+
+  it('keeps the database as the target of a statement that names no table', async () => {
+    routes();
+
+    await client({ traceQueryText: 'sanitized' }).query('SELECT 1');
+
+    const span = spans[0]!;
+
+    expect(span.name).toBe(`SELECT ${database()}`);
+    expect(span.attributes['db.query.summary']).toBeUndefined();
+    expect(span.attributes['db.collection.name']).toBeUndefined();
+    expect(span.attributes['db.query.text']).toBe('SELECT ?');
+  });
+
+  it.each([
+    ['TraceQueryText=false', undefined],
+    ['TraceQueryText=true', "SELECT n FROM t WHERE name = 'x'"],
+    ['TraceQueryText=Sanitized', 'SELECT n FROM t WHERE name = ?'],
+    ['TraceQueryText=sanitized', 'SELECT n FROM t WHERE name = ?'],
+    ['TraceQueryText=yes', undefined],
+    ['', undefined],
+  ])('reads %j from a connection string', async (option, expected) => {
+    routes();
+
+    const subject = new CamusClient(
+      `Endpoint=${http.endpoint};Database=${database()};MaxAutoPrepare=0;${option}`,
+    );
+
+    await subject.query("SELECT n FROM t WHERE name = 'x'");
+
+    expect(spans[0]!.attributes['db.query.text']).toBe(expected);
   });
 
   it('reads TraceQueryText from a connection string', async () => {
@@ -524,9 +581,46 @@ describe('metrics', () => {
     const retries = measured('camusdb.client.operation.retries');
 
     expect(retries.map((retry) => retry.attributes['camusdb.retry.kind'])).toEqual(['token_renewal']);
-    expect(spans[0]!.events.map((event) => event.attributes['camusdb.retry.kind'])).toEqual([
-      'token_renewal',
+    expect(
+      spans[0]!.events
+        .filter((event) => event.name === 'camusdb.retry')
+        .map((event) => event.attributes['camusdb.retry.kind']),
+    ).toEqual(['token_renewal']);
+  });
+
+  it('counts each login by its mode, and adds a blocking login to the statement span', async () => {
+    routes();
+
+    let now = 0;
+
+    http.on('login', (_request, response, call) => {
+      respondJson(response, 200, { status: 'ok', token: `token-${String(call)}`, expiresInSeconds: 100 });
+    });
+
+    const subject = client({ user: 'app', password: 'secret' });
+
+    await subject.query('SELECT 1');
+
+    expect(spans[0]!.events).toEqual([
+      { name: 'camusdb.login', attributes: { 'camusdb.login.mode': 'blocking' } },
     ]);
+
+    // Past 80% of the lifetime the statement does not wait: the login runs in the background, on
+    // no statement's span.
+    const auth = (subject as unknown as { runtime: { auth: CamusTokenProvider } }).runtime.auth;
+    auth.clock = () => now;
+    now = Date.now() + 85_000;
+
+    await subject.query('SELECT 1');
+
+    while (auth.loginInFlight) await new Promise((resolve) => setTimeout(resolve, 1));
+
+    expect(spans[1]!.events).toEqual([]);
+    expect(measured('camusdb.client.auth.logins').map((login) => login.attributes)).toEqual([
+      { 'camusdb.login.mode': 'blocking' },
+      { 'camusdb.login.mode': 'background' },
+    ]);
+    expect(http.callCount('login')).toBe(2);
   });
 
   it('counts the retries of withRetry and of client.transaction apart', async () => {

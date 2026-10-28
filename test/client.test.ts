@@ -533,6 +533,78 @@ describe('transactions', () => {
     expect(server.callCount('rollback-transaction')).toBe(0);
   });
 
+  it('does not roll back again when a rolled-back transaction leaves its block', async () => {
+    transactionRoutes();
+
+    const subject = client();
+
+    {
+      await using transaction = await subject.beginTransaction();
+      await transaction.rollback();
+    }
+
+    expect(server.callCount('rollback-transaction')).toBe(1);
+  });
+
+  it('rolls back once, however many times the transaction is disposed', async () => {
+    transactionRoutes();
+
+    const transaction = await client().beginTransaction();
+
+    await transaction[Symbol.asyncDispose]();
+    await transaction[Symbol.asyncDispose]();
+
+    expect(server.callCount('rollback-transaction')).toBe(1);
+  });
+
+  it('sends nothing when a deferred transaction that ran no statement leaves its block', async () => {
+    transactionRoutes();
+
+    const subject = client();
+
+    {
+      await using transaction = await subject.beginTransaction({ deferBegin: true });
+
+      expect(transaction.isStarted).toBe(false);
+    }
+
+    // No BEGIN only to roll it back: nothing exists on the server.
+    expect(server.callCount('start-transaction')).toBe(0);
+    expect(server.callCount('rollback-transaction')).toBe(0);
+  });
+
+  it('rolls back a deferred transaction that started when it leaves its block', async () => {
+    transactionRoutes();
+
+    const subject = client();
+
+    {
+      await using transaction = await subject.beginTransaction({ deferBegin: true });
+      await subject.execute('UPDATE t SET a = 1', undefined, { transaction });
+
+      expect(transaction.isStarted).toBe(true);
+    }
+
+    expect(server.callCount('start-transaction')).toBe(1);
+    expect(server.callCount('rollback-transaction')).toBe(1);
+  });
+
+  it('does not let a failed rollback escape from the block', async () => {
+    transactionRoutes();
+
+    // The server answers the rollback with an error, for example for a transaction it already aborted.
+    server.json('rollback-transaction', { status: 'failed', code: 'CADB0502', message: 'aborted' }, 500);
+
+    const subject = client();
+
+    {
+      await using transaction = await subject.beginTransaction();
+      await subject.execute('UPDATE t SET a = 1', undefined, { transaction });
+    }
+
+    expect(server.callCount('rollback-transaction')).toBe(1);
+  });
+
   it('refuses a second finalize', async () => {
     transactionRoutes();
 

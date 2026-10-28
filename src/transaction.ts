@@ -69,6 +69,9 @@ export class CamusTransaction {
 
   private finalized = false;
 
+  /** True once `[Symbol.asyncDispose]` ran, so that a second dispose does not roll back again. */
+  private disposed = false;
+
   /**
    * True once a pipeline committed this transaction, so that a later finalize does not ask the
    * server about a transaction it no longer knows.
@@ -348,11 +351,20 @@ export class CamusTransaction {
 
   /**
    * Rolls the transaction back if it was neither committed nor rolled back, so a `using` block
-   * cannot leave one open. A rollback that itself fails is swallowed: the block is unwinding, and
-   * the server ends an abandoned transaction on its own session timeout.
+   * cannot leave one open, with its locks. A rollback that itself fails is swallowed: the block is
+   * unwinding, and the usual cause is a transaction that the server already aborted, which has
+   * nothing to undo. Only the first dispose rolls back.
    */
   async [Symbol.asyncDispose](): Promise<void> {
+    if (this.disposed) return;
+
+    this.disposed = true;
+
     if (this.finalized) return;
+
+    // A deferred transaction that ran no statement sent nothing, so there is nothing to undo. A
+    // rollback would send a `BEGIN` only to finalize it.
+    if (!this.startedValue && this.startPromise === undefined) return;
 
     try {
       await this.rollback();

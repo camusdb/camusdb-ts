@@ -60,6 +60,11 @@ class PerUserLoginClient implements CamusLoginClient {
   }
 }
 
+/** Waits until the login in flight, a background renewal included, settled. */
+async function settled(auth: CamusTokenProvider): Promise<void> {
+  while (auth.loginInFlight) await new Promise((resolve) => setTimeout(resolve, 1));
+}
+
 function provider(
   client: CamusLoginClient,
   credentials = credentialsFromPassword('app', 'secret'),
@@ -103,7 +108,7 @@ describe('CamusTokenProvider', () => {
     expect(client.logins).toBe(1);
   });
 
-  it('renews at 80% of the lifetime the server reported', async () => {
+  it('renews in the background at 80% of the lifetime the server reported', async () => {
     const client = new ScriptedLoginClient(1000);
     const auth = provider(client);
 
@@ -114,13 +119,39 @@ describe('CamusTokenProvider', () => {
 
     now = 799;
     expect(await auth.getToken()).toBe('token-1');
+    expect(auth.loginInFlight).toBe(false);
 
+    // Past the renewal point the caller gets the current token at once, and one login starts.
     now = 801;
+    expect(await auth.getToken()).toBe('token-1');
+    expect(auth.loginInFlight).toBe(true);
+    expect(await auth.getToken()).toBe('token-1');
+
+    await settled(auth);
+
     expect(await auth.getToken()).toBe('token-2');
     expect(client.logins).toBe(2);
   });
 
-  it('falls back to its own lifetime when the server reports none', async () => {
+  it('waits for a login once the token reached 95% of the reported lifetime', async () => {
+    const client = new ScriptedLoginClient(1000);
+    const auth = provider(client);
+
+    let now = 0;
+    auth.clock = () => now;
+
+    await auth.getToken();
+
+    now = 949;
+    expect(auth.currentToken).toBe('token-1');
+
+    // No renewal ran in time: the old token is not sent any more, and the caller waits.
+    now = 951;
+    expect(await auth.getToken()).toBe('token-2');
+    expect(client.logins).toBe(2);
+  });
+
+  it('falls back to its own lifetime when the server reports none, and never sends a token past it', async () => {
     const client = new ScriptedLoginClient();
     const auth = provider(client);
 
@@ -129,11 +160,83 @@ describe('CamusTokenProvider', () => {
 
     await auth.getToken();
 
-    now = 599_999;
+    now = 479_999;
+    expect(await auth.getToken()).toBe('token-1');
+    expect(auth.loginInFlight).toBe(false);
+
+    now = 480_001;
+    expect(await auth.getToken()).toBe('token-1');
+    expect(auth.loginInFlight).toBe(true);
+    await settled(auth);
+
+    // The renewed token counts from the login that minted it.
+    now = 480_001 + 599_999;
+    expect(await auth.getToken()).toBe('token-2');
+
+    now = 480_001 + 600_001;
+    expect(await auth.getToken()).toBe('token-3');
+    expect(client.logins).toBe(3);
+  });
+
+  it('keeps the old token after a failed background renewal, and tries again after the delay', async () => {
+    let logins = 0;
+    let fail = false;
+
+    const client: CamusLoginClient = {
+      async login() {
+        logins++;
+        await new Promise((resolve) => setTimeout(resolve, 1));
+        if (fail) throw new CamusError('CADB0518', 'rate limited');
+        return { token: `token-${String(logins)}`, expiresInMs: 1000 };
+      },
+      async logout() {},
+    };
+
+    const auth = provider(client);
+
+    let now = 0;
+    auth.clock = () => now;
+
+    await auth.getToken();
+
+    fail = true;
+    now = 801;
+    expect(await auth.getToken()).toBe('token-1');
+    await settled(auth);
+    expect(logins).toBe(2);
+
+    // Inside the delay no statement starts another login.
+    now = 802;
+    expect(await auth.getToken()).toBe('token-1');
+    expect(auth.loginInFlight).toBe(false);
+    expect(logins).toBe(2);
+
+    // After the delay the next statement starts one. Before it, the token expired at 950 on this
+    // clock, so the delay is cut short here to see the retry while the token is still valid.
+    (auth as unknown as { renewalRetryAfter: number }).renewalRetryAfter = 900;
+    fail = false;
+    now = 901;
+    expect(await auth.getToken()).toBe('token-1');
+    await settled(auth);
+
+    expect(await auth.getToken()).toBe('token-3');
+  });
+
+  it('lets a caller whose token expired join the background renewal in flight', async () => {
+    const client = new ScriptedLoginClient(1000);
+    const auth = provider(client);
+
+    let now = 0;
+    auth.clock = () => now;
+
+    await auth.getToken();
+
+    now = 801;
     expect(await auth.getToken()).toBe('token-1');
 
-    now = 600_001;
+    now = 951;
     expect(await auth.getToken()).toBe('token-2');
+    expect(client.logins).toBe(2);
   });
 
   it('mints a new token after the one it held was rejected', async () => {
@@ -188,7 +291,7 @@ describe('CamusTokenProvider', () => {
     auth.clock = () => now;
 
     // Force the cache past its deadline without a password to renew with.
-    (auth as unknown as { renewAfter: number }).renewAfter = -1;
+    (auth as unknown as { expiresAt: number }).expiresAt = -1;
 
     await expect(auth.getToken()).rejects.toMatchObject({ code: 'CADB0516' });
   });

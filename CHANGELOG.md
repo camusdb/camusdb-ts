@@ -7,6 +7,39 @@ numbers follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.10.0] — 2026-10-27
+
+### Added
+
+- The driver's spans name the tables of each statement. `db.collection.name` is the table when the
+  SQL text names exactly one. `db.query.summary` is the operation and the tables, for example
+  `SELECT orders customers`, and it is also the span name. A statement that names no table keeps
+  the name `{operation} {database}`. The tables come from a scan of the SQL text, not a parse, and
+  the scan runs only for a sampled span.
+- `traceQueryText: 'sanitized'` (or `TraceQueryText=Sanitized`) records the SQL text as
+  `db.query.text` with each string, number and bytes literal replaced by `?` and each comment
+  removed. `CamusQueryTextMode` names the three modes.
+- The `camusdb.client.auth.logins` counter, with `camusdb.login.mode` = `blocking`, `background` or
+  `explicit`. A blocking login is also a `camusdb.login` event on the statement span.
+
+### Changed
+
+- The bearer token is renewed in the background. At 80% of the token's lifetime the driver returns
+  the cached token at once and starts one background login through the same single flight. A
+  statement waits for a login only when there is no token, or when the token reached 95% of its
+  lifetime before a renewal succeeded. A failed background renewal keeps the old token and is tried
+  again after 5 seconds. The renewal does not carry the trace context of the statement that started
+  it. Without a lifetime from the server, the driver never sends a token past `tokenLifetimeSeconds`.
+- `ResolvedConfig.traceQueryText` is now a `CamusQueryTextMode` (`'off'`, `'raw'` or `'sanitized'`),
+  not a boolean.
+
+### Fixed
+
+- A deferred transaction that ran no statement sends nothing when it is disposed. Before, the
+  dispose sent a `BEGIN` only to roll it back.
+- A transaction rolls back only on its first dispose. Before, a second dispose after a failed
+  rollback sent the rollback again.
+
 ## [0.9.0] — 2026-10-25
 
 ### Changed

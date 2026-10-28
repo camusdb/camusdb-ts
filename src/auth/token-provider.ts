@@ -10,12 +10,27 @@ import { createHmac, randomBytes } from 'node:crypto';
 import { CamusError } from '../errors.js';
 import { CamusErrorCode } from '../error-codes.js';
 import { SharedRegistry } from '../shared-registry.js';
+import { CamusLoginMode, recordLogin, runDetached } from '../telemetry.js';
 import type { CamusCredentials } from './credentials.js';
 import { canRenew, credentialsFromPassword, hasCredentials } from './credentials.js';
 import type { CamusLoginClient, CamusLoginResult } from './login-client.js';
 
 /** The fallback token lifetime, comfortably inside the server's 15-minute default. */
 export const DEFAULT_TOKEN_LIFETIME_MS = 600_000;
+
+/**
+ * The share of the server-reported lifetime the driver sends a token for. The lifetime starts when
+ * the server issues the token, and the driver starts its count before it sends the login, so the
+ * count is early. The remaining 5% is for the request that carries the token to reach the server.
+ */
+const USABLE_SHARE_OF_REPORTED_LIFETIME = 0.95;
+
+/**
+ * How long the provider waits before it starts another background renewal after one failed. The
+ * token is still valid, so the wait costs nothing. Without the wait, every statement after a failed
+ * renewal would start a new login, against a server that is down or rate-limits this account.
+ */
+export const BACKGROUND_RENEWAL_RETRY_DELAY_MS = 5000;
 
 /**
  * Owns a client's bearer token: mints it from the configured credentials on first use, hands the
@@ -29,9 +44,12 @@ export const DEFAULT_TOKEN_LIFETIME_MS = 600_000;
  * **Single flight.** Concurrent callers that find no usable token await one promise; the winner
  * logs in and the rest observe its result instead of issuing their own login.
  *
- * **Renewal.** The login reply reports how long the token is good for, and the provider renews at
- * 80% of that. Against a server that predates the field it falls back to its own conservative
- * lifetime. That proactive renewal is the primary path. `invalidate`, driven by a `CADB0516` from
+ * **Renewal.** The login reply reports how long the token is good for. At 80% of that the provider
+ * starts one login in the background and keeps handing out the current token, so no statement waits
+ * for a login it does not need yet. A statement waits only when there is no token, or when the token
+ * reached 95% of its lifetime before a renewal succeeded. Against a server that predates the field
+ * it falls back to its own conservative lifetime: it renews at 80% of that, and never sends a token
+ * past it. That proactive renewal is the primary path. `invalidate`, driven by a `CADB0516` from
  * a real request, is the backstop for what a clock cannot predict: a rotated password, a dropped
  * user, a logout from elsewhere, or a server whose token lifetime is shorter than the fallback.
  *
@@ -84,7 +102,14 @@ export class CamusTokenProvider {
 
   private token: string | undefined;
 
+  /** From this time the token is still sent, and a background login replaces it. */
   private renewAfter: number;
+
+  /** From this time the token is not sent any more, and a statement waits for the login. */
+  private expiresAt: number;
+
+  /** No background renewal starts before this time, after a failed one. */
+  private renewalRetryAfter = 0;
 
   private readonly resolveLoginClient: () => CamusLoginClient | Promise<CamusLoginClient>;
 
@@ -122,6 +147,7 @@ export class CamusTokenProvider {
     // A token supplied directly is the cached token, and never ages out on this side.
     this.token = init.credentials.accessToken;
     this.renewAfter = Number.POSITIVE_INFINITY;
+    this.expiresAt = Number.POSITIVE_INFINITY;
   }
 
   /**
@@ -146,17 +172,31 @@ export class CamusTokenProvider {
     return this.token;
   }
 
+  /** True while a login is in flight, a background renewal included. */
+  get loginInFlight(): boolean {
+    return this.inFlight !== undefined;
+  }
+
   /**
-   * A usable bearer token, logging in when there is none or the cached one has aged out. Reports
-   * `undefined` when no credentials are configured.
+   * A usable bearer token. A token past its renewal point but not yet expired is returned at once,
+   * and one background login replaces it, so a statement does not wait for a token it does not
+   * need yet. The caller waits for a login only when there is no token, or the token expired.
+   * Reports `undefined` when no credentials are configured.
    */
   async getToken(signal?: AbortSignal): Promise<string | undefined> {
     const cached = this.tryGetCached();
-    if (cached !== undefined) return cached;
+
+    if (cached !== undefined) {
+      if (this.clock() >= this.renewAfter && this.canRenew) this.startBackgroundRenewal();
+
+      return cached;
+    }
+
     if (!this.isEnabled) return undefined;
 
-    // A caller that arrives during a login awaits that login rather than issuing its own.
-    this.inFlight ??= this.startLogin(signal);
+    // A caller that arrives during a login awaits that login rather than issuing its own. That
+    // includes a background renewal that is still in flight when the token expires.
+    this.inFlight ??= this.startLogin(CamusLoginMode.Blocking, signal);
 
     return this.inFlight;
   }
@@ -175,6 +215,7 @@ export class CamusTokenProvider {
 
     this.token = undefined;
     this.renewAfter = 0;
+    this.expiresAt = 0;
   }
 
   /**
@@ -185,13 +226,14 @@ export class CamusTokenProvider {
     this.credentials = credentialsFromPassword(user, password);
     this.token = undefined;
     this.renewAfter = 0;
+    this.expiresAt = 0;
 
     // A login already in flight carries the credentials this call replaces. The new generation
     // stops it from publishing its token, and it is no longer the flight a queued caller joins.
     this.generation++;
     this.inFlight = undefined;
 
-    return this.startLogin(signal);
+    return this.startLogin(CamusLoginMode.Explicit, signal);
   }
 
   /**
@@ -204,6 +246,7 @@ export class CamusTokenProvider {
 
     this.token = undefined;
     this.renewAfter = 0;
+    this.expiresAt = 0;
 
     if (revoked === undefined || revoked.length === 0) return;
 
@@ -211,11 +254,33 @@ export class CamusTokenProvider {
     await client.logout(this.resolveEndpoint(), revoked, this.resolveTimeoutSeconds(), signal);
   }
 
+  /** The cached token while it can still be sent. */
   private tryGetCached(): string | undefined {
     if (!this.isEnabled) return undefined;
     if (this.token === undefined) return undefined;
 
-    return this.clock() < this.renewAfter ? this.token : undefined;
+    return this.clock() < this.expiresAt ? this.token : undefined;
+  }
+
+  /**
+   * Starts one login in the background to replace the current token, which is past its renewal
+   * point but still in use. At most one login is in flight per provider, and after a failed
+   * renewal the next starts only after `BACKGROUND_RENEWAL_RETRY_DELAY_MS`.
+   */
+  private startBackgroundRenewal(): void {
+    if (this.inFlight !== undefined) return;
+    if (this.clock() < this.renewalRetryAfter) return;
+
+    // The renewal belongs to no statement. Without this, it would carry the trace of the statement
+    // that started it, and its HTTP span would show as part of a request that did not wait for it.
+    const pending = runDetached(() => this.startLogin(CamusLoginMode.Background, undefined));
+
+    // The old token is still valid, so nothing has failed yet: statements keep sending it, and a
+    // later statement tries again after the delay. If the token expires first, the next statement
+    // logs in itself and surfaces the error. A statement that joined this flight gets the error.
+    pending.catch(() => {
+      this.renewalRetryAfter = this.clock() + BACKGROUND_RENEWAL_RETRY_DELAY_MS;
+    });
   }
 
   /**
@@ -226,20 +291,34 @@ export class CamusTokenProvider {
    * after it settles joins that flight rather than starting a third login against a rate-limited
    * endpoint.
    */
-  private startLogin(signal: AbortSignal | undefined): Promise<string> {
-    const pending: Promise<string> = this.loginOnce(signal).finally(() => {
-      if (this.inFlight === pending) this.inFlight = undefined;
-    });
+  private startLogin(mode: CamusLoginMode, signal: AbortSignal | undefined): Promise<string> {
+    const pending: Promise<string> = this.loginOnce(mode, signal)
+      .then(
+        (token) => {
+          recordLogin(mode);
+          return token;
+        },
+        (error: unknown) => {
+          recordLogin(mode, error);
+          throw error;
+        },
+      )
+      .finally(() => {
+        if (this.inFlight === pending) this.inFlight = undefined;
+      });
 
     this.inFlight = pending;
     return pending;
   }
 
-  private async loginOnce(signal: AbortSignal | undefined): Promise<string> {
+  private async loginOnce(mode: CamusLoginMode, signal: AbortSignal | undefined): Promise<string> {
     // Re-checked inside the single-flight gate: the caller that queued behind the winner finds the
-    // token it minted.
-    const cached = this.tryGetCached();
-    if (cached !== undefined) return cached;
+    // token it minted. A background renewal replaces a token that is still valid, so it does not
+    // check.
+    if (mode === CamusLoginMode.Blocking) {
+      const cached = this.tryGetCached();
+      if (cached !== undefined) return cached;
+    }
 
     if (!this.canRenew) {
       throw new CamusError(
@@ -256,6 +335,10 @@ export class CamusTokenProvider {
 
     const client = await this.resolveLoginClient();
 
+    // Both deadlines count from before the request, so the time the login takes is charged to the
+    // token.
+    const requestedAt = this.clock();
+
     const minted: CamusLoginResult = await client.login(
       this.resolveEndpoint(),
       credentials.user!,
@@ -267,25 +350,32 @@ export class CamusTokenProvider {
     // A `login()` call during the round trip replaced the credentials this token was minted with.
     // The caller that asked for it still receives it; it does not become the cached token.
     if (generation === this.generation) {
+      const { renewAfterMs, expiresAfterMs } = this.deadlines(minted.expiresInMs);
+
       this.token = minted.token;
-      this.renewAfter = this.clock() + this.renewalDelayMs(minted.expiresInMs);
+      this.renewAfter = requestedAt + renewAfterMs;
+      this.expiresAt = requestedAt + expiresAfterMs;
     }
 
     return minted.token;
   }
 
   /**
-   * When to mint the next token.
+   * When to start the next login, and when to stop sending the token.
    *
    * The server's reported lifetime is authoritative — its own setting is configurable and may be
-   * shorter than any value the driver defaults to — so the provider renews at 80% of it, leaving
-   * headroom for the request that carries the token to finish. Without a reported value it falls
-   * back to the configured lifetime, which is already conservative.
+   * shorter than any value the driver defaults to — so the provider renews at 80% of it, and sends
+   * the token until 95% of it. Without a reported value, the configured lifetime is the lifetime
+   * the driver assumes: it renews at 80% of it, and does not send the token past it.
    */
-  private renewalDelayMs(reported: number | undefined): number {
-    if (reported === undefined) return this.lifetimeMs;
+  private deadlines(reported: number | undefined): { renewAfterMs: number; expiresAfterMs: number } {
+    let expiresAfterMs =
+      reported === undefined ? this.lifetimeMs : reported * USABLE_SHARE_OF_REPORTED_LIFETIME;
+    let renewAfterMs = (reported ?? this.lifetimeMs) * 0.8;
 
-    const renewal = reported * 0.8;
-    return renewal > 0 ? renewal : 1000;
+    if (expiresAfterMs <= 0) expiresAfterMs = 1000;
+    if (renewAfterMs <= 0 || renewAfterMs > expiresAfterMs) renewAfterMs = expiresAfterMs;
+
+    return { renewAfterMs, expiresAfterMs };
   }
 }

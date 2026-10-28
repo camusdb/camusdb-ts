@@ -59,6 +59,23 @@ export const CamusRoutingMode = {
 
 export type CamusRoutingMode = (typeof CamusRoutingMode)[keyof typeof CamusRoutingMode];
 
+/** What the driver's spans record of the SQL text, as `db.query.text`. */
+export const CamusQueryTextMode = {
+  /** No SQL text. `traceQueryText: false` or `TraceQueryText=false`, and the default. */
+  Off: 'off',
+
+  /** The SQL text as it was sent, literal values included. `traceQueryText: true` or `TraceQueryText=true`. */
+  Raw: 'raw',
+
+  /**
+   * The SQL text with each literal value replaced by `?` and each comment removed.
+   * `traceQueryText: 'sanitized'` or `TraceQueryText=Sanitized`.
+   */
+  Sanitized: 'sanitized',
+} as const;
+
+export type CamusQueryTextMode = (typeof CamusQueryTextMode)[keyof typeof CamusQueryTextMode];
+
 /** Tuning for the gRPC batch streams. The REST transport ignores all of it. */
 export interface GrpcBatchOptions {
   /**
@@ -218,10 +235,12 @@ export interface CamusClientOptions {
   readonly int64?: Int64Mode;
 
   /**
-   * Whether the driver's spans carry the SQL text as `db.query.text`. Default false, because SQL
-   * text with literal values can contain sensitive data. Parameter values are never recorded.
+   * What the driver's spans record of the SQL text, as `db.query.text`. `false` (the default)
+   * records none, `true` (or `'raw'`) the text as sent, and `'sanitized'` the text with each literal
+   * value replaced by `?`. SQL text with literal values can contain sensitive data, so it is opt-in.
+   * Parameter values are never recorded.
    */
-  readonly traceQueryText?: boolean;
+  readonly traceQueryText?: boolean | CamusQueryTextMode;
 }
 
 /** The settings a client actually runs on, after both input forms are resolved. */
@@ -248,8 +267,8 @@ export interface ResolvedConfig {
   readonly defaultTransactionOptions: CamusTransactionOptions;
   readonly decode: DecodeOptions;
 
-  /** Whether the driver's spans carry the SQL text. */
-  readonly traceQueryText: boolean;
+  /** What the driver's spans record of the SQL text. */
+  readonly traceQueryText: CamusQueryTextMode;
 
   /** The connection string as written, when the client was built from one. */
   readonly connectionString: string | undefined;
@@ -310,7 +329,7 @@ export function resolveOptions(options: CamusClientOptions): ResolvedConfig {
     routingMaxHintAgeMs: atLeastOr(options.routingMaxHintAgeMs, 1, 5000),
     defaultTransactionOptions: options.defaultTransactionOptions ?? {},
     decode: { int64: options.int64 ?? 'auto' },
-    traceQueryText: options.traceQueryText === true,
+    traceQueryText: resolveQueryTextMode(options.traceQueryText),
     connectionString: undefined,
   };
 
@@ -383,7 +402,7 @@ export function resolveConnectionString(connectionString: string): ResolvedConfi
       locking: parseEnum(settings.get('Locking'), CamusLocking, undefined),
     },
     decode: { int64: parseInt64Mode(settings.get('Int64')) },
-    traceQueryText: parseBool(settings.get('TraceQueryText'), false),
+    traceQueryText: parseQueryTextMode(settings.get('TraceQueryText')),
     connectionString,
   };
 
@@ -623,6 +642,23 @@ function parseNonNegativeInt(raw: string | undefined, fallback: number): number 
 }
 
 /** Reads `true` or `false`, in any case. Anything else keeps the fallback. */
+function resolveQueryTextMode(value: boolean | CamusQueryTextMode | undefined): CamusQueryTextMode {
+  if (value === true) return CamusQueryTextMode.Raw;
+  if (value === CamusQueryTextMode.Raw || value === CamusQueryTextMode.Sanitized) return value;
+
+  return CamusQueryTextMode.Off;
+}
+
+/** `TraceQueryText=`: `true`, `false`, or `Sanitized`, in any case. An unrecognized value records none. */
+function parseQueryTextMode(raw: string | undefined): CamusQueryTextMode {
+  const text = raw?.trim().toLowerCase();
+
+  if (text === 'true') return CamusQueryTextMode.Raw;
+  if (text === 'sanitized') return CamusQueryTextMode.Sanitized;
+
+  return CamusQueryTextMode.Off;
+}
+
 function parseBool(raw: string | undefined, fallback: boolean): boolean {
   const text = raw?.trim().toLowerCase();
 

@@ -549,6 +549,39 @@ function suite(name: string, options: Partial<CamusClientOptions>): void {
       expect(row?.price).toBe(100);
     });
 
+    it('releases the locks of a transaction its block leaves without a commit', async () => {
+      const table = await createRobotsTable();
+      const id = await insertRobot(table, { name: 'locked', year: 2000 });
+
+      {
+        await using abandoned = await client.beginTransaction();
+
+        expect(
+          await client.execute(
+            `UPDATE ${table} SET year = 2001 WHERE id = @id`,
+            { id: camus.id(id) },
+            { transaction: abandoned },
+          ),
+        ).toMatchObject({ affectedRows: 1 });
+      }
+
+      // The dispose rolled the transaction back: its write is gone, and its locks do not block the
+      // next writer.
+      await client.transaction(async (next) => {
+        await client.execute(
+          `UPDATE ${table} SET year = 2002 WHERE id = @id`,
+          { id: camus.id(id) },
+          { transaction: next },
+        );
+      });
+
+      const row = await client.queryOne<Robot>(`SELECT year FROM ${table} WHERE id = @id`, {
+        id: camus.id(id),
+      });
+
+      expect(row?.year).toBe(2002);
+    });
+
     it('reads its own writes inside a transaction', async () => {
       const table = await createRobotsTable();
       const id = await insertRobot(table, { name: 'rww', price: 1 });

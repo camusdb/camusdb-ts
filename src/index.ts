@@ -51,7 +51,7 @@ export type {
 
 // ─── Configuration ──────────────────────────────────────────────────────────
 
-export { CamusProtocol, CamusRoutingMode, DEFAULT_BATCH_OPTIONS } from './config.js';
+export { CamusProtocol, CamusQueryTextMode, CamusRoutingMode, DEFAULT_BATCH_OPTIONS } from './config.js';
 export type { CamusClientOptions, CamusHttpVersion, GrpcBatchOptions, ResolvedConfig } from './config.js';
 
 export { parseConnectionString, redactConnectionString } from './connection-string.js';

@@ -7,9 +7,11 @@
 
 import { createRequire } from 'node:module';
 
+import { CamusQueryTextMode } from './config.js';
 import { CamusEndpointPool } from './endpoint-pool.js';
 import { CamusError } from './errors.js';
 import { CamusPreparedStatementPolicy } from './prepared/policy.js';
+import { querySummary, queryTables, sanitizeQueryText } from './query-text.js';
 
 /**
  * Traces and metrics through `@opentelemetry/api`.
@@ -49,6 +51,20 @@ export const CamusRetryKind = {
 
 export type CamusRetryKind = (typeof CamusRetryKind)[keyof typeof CamusRetryKind];
 
+/** The `camusdb.login.mode` values: how a login was started. */
+export const CamusLoginMode = {
+  /** A statement found no token it could send and waited for the login. */
+  Blocking: 'blocking',
+
+  /** A token reached its renewal point. Statements kept it, and the login ran beside them. */
+  Background: 'background',
+
+  /** The application called the login itself. */
+  Explicit: 'explicit',
+} as const;
+
+export type CamusLoginMode = (typeof CamusLoginMode)[keyof typeof CamusLoginMode];
+
 /** The `camusdb.prepared_statement.result` values. */
 export const PreparedResult = {
   Hit: 'hit',
@@ -68,6 +84,7 @@ type Attributes = Record<string, AttributeValue | undefined>;
 interface OtelSpan {
   isRecording(): boolean;
   setAttribute(key: string, value: AttributeValue): unknown;
+  updateName(name: string): unknown;
   setStatus(status: { code: number; message?: string }): unknown;
   recordException(exception: unknown): void;
   addEvent(name: string, attributes?: Attributes): unknown;
@@ -120,6 +137,7 @@ export interface OtelApi {
     getMeterProvider(): unknown;
     getMeter(name: string, version?: string): OtelMeter;
   };
+  readonly ROOT_CONTEXT: unknown;
   readonly SpanKind: { readonly CLIENT: number };
   readonly SpanStatusCode: { readonly ERROR: number };
 }
@@ -182,6 +200,7 @@ interface Instruments {
   readonly api: OtelApi;
   readonly provider: unknown;
   readonly duration: { record(value: number, attributes?: Attributes): void };
+  readonly logins: { add(value: number, attributes?: Attributes): void };
   readonly retries: { add(value: number, attributes?: Attributes): void };
   readonly quarantines: { add(value: number, attributes?: Attributes): void };
   readonly lookups: { add(value: number, attributes?: Attributes): void };
@@ -234,6 +253,10 @@ function instrumentsFor(otel: OtelApi): Instruments {
       description: 'Duration of database client operations.',
       advice: { explicitBucketBoundaries: [0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1, 5, 10] },
     }),
+    logins: meter.createCounter('camusdb.client.auth.logins', {
+      unit: '{login}',
+      description: 'Logins the driver sent to obtain a bearer token, by whether a statement waited for them.',
+    }),
     retries: meter.createCounter('camusdb.client.operation.retries', {
       unit: '{retry}',
       description: 'Operations the driver sent again after a failure it knows to be safe to retry.',
@@ -265,7 +288,7 @@ function instrumentsFor(otel: OtelApi): Instruments {
 /** What an operation reads from the client it runs for. `ClientRuntime` has this shape. */
 export interface TelemetryScope {
   readonly database: string;
-  readonly config: { readonly protocol: string; readonly traceQueryText: boolean };
+  readonly config: { readonly protocol: string; readonly traceQueryText: CamusQueryTextMode };
 }
 
 /** What one operation reports about itself. */
@@ -276,7 +299,10 @@ export interface OperationInit {
   /** The table, when the driver knows it without a parse of the SQL text. */
   readonly collection?: string | undefined;
 
-  /** The SQL text. It goes on the span only with `traceQueryText`. */
+  /**
+   * The SQL text. The driver reads the tables of a sampled span from it. The text goes on the span
+   * only with `traceQueryText`.
+   */
   readonly queryText?: string | undefined;
 
   /** The statement count of a pipeline exchange. */
@@ -390,7 +416,8 @@ export class CamusOperation {
  * Starts an operation, or reports `undefined` when `@opentelemetry/api` is not installed.
  *
  * The span is a child of the active span. Its name is `{operation} {target}`, where the target is
- * the table when it is known, and the database if not.
+ * the table when it is known, and the database if not. For a sampled span, `setTarget` replaces the
+ * name with the `db.query.summary` when the SQL text names a table.
  */
 export function startOperation(scope: TelemetryScope, init: OperationInit): CamusOperation | undefined {
   const otel = api();
@@ -408,17 +435,45 @@ export function startOperation(scope: TelemetryScope, init: OperationInit): Camu
     span.setAttribute('db.system.name', SYSTEM_NAME);
     span.setAttribute('db.namespace', database);
     if (init.operationName !== undefined) span.setAttribute('db.operation.name', init.operationName);
-    if (init.collection !== undefined) span.setAttribute('db.collection.name', init.collection);
+    setTarget(span, init);
     if (init.batchSize !== undefined && init.batchSize > 0) {
       span.setAttribute('db.operation.batch.size', init.batchSize);
     }
-    if (init.queryText !== undefined && scope.config.traceQueryText) {
-      span.setAttribute('db.query.text', init.queryText);
+    if (init.queryText !== undefined) {
+      if (scope.config.traceQueryText === CamusQueryTextMode.Raw) {
+        span.setAttribute('db.query.text', init.queryText);
+      } else if (scope.config.traceQueryText === CamusQueryTextMode.Sanitized) {
+        span.setAttribute('db.query.text', sanitizeQueryText(init.queryText));
+      }
     }
     span.setAttribute('camusdb.transport', scope.config.protocol);
   }
 
   return new CamusOperation(otel, span, performance.now(), database, init.operationName);
+}
+
+/**
+ * Sets the table attributes of a sampled span from the tables its SQL text names:
+ * `db.collection.name` when it names one, and `db.query.summary`, which also becomes the span name,
+ * when it names any. A typed insert passes its table as `collection`. The text is read only for a
+ * sampled span, so an unsampled one costs nothing.
+ */
+function setTarget(span: OtelSpan, init: OperationInit): void {
+  const tables =
+    init.collection !== undefined
+      ? [init.collection]
+      : init.queryText !== undefined
+        ? queryTables(init.queryText)
+        : [];
+
+  if (tables.length === 1) span.setAttribute('db.collection.name', tables[0]!);
+
+  const summary = querySummary(init.operationName, tables);
+
+  if (summary !== undefined) {
+    span.setAttribute('db.query.summary', summary);
+    span.updateName(summary);
+  }
 }
 
 /**
@@ -515,6 +570,39 @@ export function recordRetry(
       'db.operation.name': details.operationName,
     }),
   );
+}
+
+/**
+ * Counts one login. A blocking login also adds a `camusdb.login` event to the active span when it is
+ * one of the driver's, because that span carries the time of the login.
+ */
+export function recordLogin(mode: CamusLoginMode, error?: unknown): void {
+  const otel = api();
+  if (otel === undefined) return;
+
+  const errorType =
+    error === undefined ? undefined : CamusError.is(error) ? error.code : errorTypeName(error);
+
+  if (mode === CamusLoginMode.Blocking) {
+    const active = otel.trace.getActiveSpan();
+
+    if (active !== undefined && ownSpans.has(active)) {
+      active.addEvent('camusdb.login', defined({ 'camusdb.login.mode': mode, 'error.type': errorType }));
+    }
+  }
+
+  instrumentsFor(otel).logins.add(1, defined({ 'camusdb.login.mode': mode, 'error.type': errorType }));
+}
+
+/**
+ * Runs `fn` outside the active trace, for work that belongs to no operation: its spans do not show
+ * as part of the operation that started it. Without `@opentelemetry/api`, it only calls `fn`.
+ */
+export function runDetached<T>(fn: () => T): T {
+  const otel = api();
+  if (otel === undefined) return fn();
+
+  return otel.context.with(otel.ROOT_CONTEXT, fn);
 }
 
 /** Counts one endpoint set aside after a transport failure. */

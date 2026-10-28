@@ -116,7 +116,7 @@ const b = CamusClient.fromConnectionString('Endpoint=http://localhost:8082;Datab
 | `user` | `User` | No | The user to authenticate as. Key aliases: `UserId`, `Uid`, `Username`. |
 | `password` | `Password` | No | That user's password. Key alias: `Pwd`. |
 | `accessToken` | `AccessToken` | No | A bearer token obtained elsewhere, used as written. |
-| `tokenLifetimeSeconds` | `TokenLifetime` | No | Fallback seconds to reuse a token when the server reports no expiry. Default `600`. |
+| `tokenLifetimeSeconds` | `TokenLifetime` | No | Fallback seconds to reuse a token when the server reports no expiry. Default `600`. The driver renews in the background at 80% of it. |
 | `maxAutoPrepare` | `MaxAutoPrepare` | No | How many statements to keep prepared. Default `128`. Zero turns it off. |
 | `autoPrepareMinUsages` | `AutoPrepareMinUsages` | No | Executions of the same SQL before it is prepared. Default `2`. |
 | `channelPoolSize` | `ChannelPoolSize` | No | gRPC only: streams per endpoint. Default `2`. |
@@ -133,7 +133,7 @@ const b = CamusClient.fromConnectionString('Endpoint=http://localhost:8082;Datab
 | `routingMaxHintAgeMs` | `RoutingMaxHintAge` | No | The ceiling on how long a learned route is reused. Default `5000`. |
 | `defaultTransactionOptions` | `IsolationLevel`, `TransactionMode`, `Locking` | No | Concurrency defaults for every transaction and autocommit statement. |
 | `int64` | `Int64` | No | `auto` (the default), `number`, or `bigint`. See [Types](#types). |
-| `traceQueryText` | `TraceQueryText` | No | Put the SQL text on the driver's spans as `db.query.text`. Default `false`. See [OpenTelemetry](#opentelemetry). |
+| `traceQueryText` | `TraceQueryText` | No | Put the SQL text on the driver's spans as `db.query.text`: `false` (the default) puts none, `true` puts the text as sent, and `'sanitized'` (`TraceQueryText=Sanitized`) puts the text with each literal value replaced by `?`. See [OpenTelemetry](#opentelemetry). |
 
 **`HttpVersion`.** The .NET driver reads `HttpVersion=1.1|2|3` and can send REST calls over HTTP/2
 or HTTP/3. Node's `fetch` sends HTTP/1.1 only. So this driver accepts `1.1`, and it refuses `2` and
@@ -746,7 +746,10 @@ await client.execute('UPDATE robots SET year = @year WHERE id = @id',
 await txn.commit();
 ```
 
-With `await using`, a transaction left without a commit is rolled back as the block unwinds.
+With `await using`, a transaction left without a commit or a rollback is rolled back as the block
+unwinds, so the block never leaves a transaction (and its locks) open on the server. A rollback that
+fails there is ignored, and a second dispose sends nothing. A deferred transaction that ran no
+statement sends nothing when it is disposed.
 
 ### Concurrency options
 
@@ -935,8 +938,14 @@ replacement with — so a rejection reaches you rather than being retried.
   same deployment. Password verification is expensive on the server and is rate limited per
   account, so a login stampede is exactly what must be avoided.
 - **Concurrent callers share one login.** Callers that find no usable token await the same login.
-- **Renewal is proactive.** The server reports how long a token is good for, and the driver renews
-  at 80% of that. Against a server that reports none it falls back to `tokenLifetimeSeconds`.
+- **Renewal is proactive, and statements do not wait for it.** The server reports how long a token
+  is good for. At 80% of that lifetime the driver starts one login in the background and keeps
+  sending the current token, so a statement does not pay for the login. A statement waits for a
+  login only when there is no token yet, or when the token reached 95% of its lifetime and no
+  renewal succeeded. A failed background renewal is tried again after 5 seconds. Against a server
+  that reports no lifetime the driver falls back to `tokenLifetimeSeconds`: it renews at 80% of it,
+  and never sends a token past it. An application idle for longer than the lifetime still waits for
+  one login on its first statement.
 - **A rejection is the backstop.** A `CADB0516` from a real request discards the token and replays
   the statement once with a fresh one. That covers what a clock cannot predict: a rotated password,
   a dropped user, a logout from elsewhere, a server restart.
@@ -1322,8 +1331,10 @@ the SDK before the first database call.
 - A pipeline exchange, as one `BATCH` span with `db.operation.batch.size` and
   `camusdb.pipeline.commit`.
 
-The span name is `{operation} {target}`, for example `SELECT shop`. The target is the table for a
-typed insert, and the database for all other operations. The span has these attributes from the
+The span name is the `db.query.summary`: the operation and the tables that the SQL text names, for
+example `SELECT orders customers`. A statement that names no table, and `BEGIN`, `COMMIT`,
+`ROLLBACK` and `BATCH`, keep the name `{operation} {database}`, for example `SELECT shop`. The span
+has these attributes from the
 [OpenTelemetry database conventions](https://opentelemetry.io/docs/specs/semconv/database/):
 
 | Attribute | Value |
@@ -1331,9 +1342,10 @@ typed insert, and the database for all other operations. The span has these attr
 | `db.system.name` | `camusdb` |
 | `db.namespace` | The database of the client. |
 | `db.operation.name` | The first keyword of the SQL text, if it is a known verb (`SELECT`, `INSERT`, `UPDATE`, `DELETE`, `CREATE`, `ALTER`, `DROP`, `TRUNCATE`, and others), or `BEGIN`, `COMMIT`, `ROLLBACK`, `BATCH`. |
-| `db.collection.name` | The table of a typed insert. |
+| `db.collection.name` | The table, when the statement names exactly one. A typed insert always names its table. |
+| `db.query.summary` | The operation and the tables, each once and in the order of the SQL text, at most 255 characters. Only when the statement names a table. |
 | `server.address`, `server.port` | The endpoint that received the operation, after routing. |
-| `db.query.text` | The SQL text. Only with `traceQueryText: true`. |
+| `db.query.text` | The SQL text. With `traceQueryText: true`, as sent. With `traceQueryText: 'sanitized'`, with each string, number and bytes literal replaced by `?`, each comment removed, and each list of two or more `?` written as `?, ...`. |
 | `error.type`, `db.response.status_code` | The `CADBxxxx` code of a failed operation, or the error name when there is no code. |
 | `camusdb.transport` | `rest` or `grpc`. |
 
@@ -1350,6 +1362,7 @@ an attribute.
 
 | Metric | Type | Attributes | What it counts |
 | --- | --- | --- | --- |
+| `camusdb.client.auth.logins` | Counter | `camusdb.login.mode`, and `error.type` when the login failed | Each login the driver sends. The modes are `blocking` (a statement had no token it could send and waited), `background` (a token reached its renewal point; statements kept using it), and `explicit` (the application called `login`). When a driver span is active, a blocking login is also a `camusdb.login` event on it. A background login runs outside the trace of the statement that started it. |
 | `camusdb.client.operation.retries` | Counter | `camusdb.retry.kind`, `error.type`, and `db.namespace` and `db.operation.name` when known | Each time the driver sends an operation again. The kinds are `finalize` (a `COMMIT` or `ROLLBACK` after `CADB0509`), `autocommit` (`withRetry`), `transaction` (`client.transaction` from `BEGIN`), `token_renewal` (a call sent again with a new token after `CADB0516`), and `create_database`. When a driver span is active, the retry is also a `camusdb.retry` event on it. |
 | `camusdb.client.endpoint.quarantines` | Counter | `server.address`, `server.port` | Each time an endpoint fails at the transport level and the driver sets it aside for 30 seconds. |
 | `camusdb.client.endpoint.quarantined` | Gauge | `server.address`, `server.port` | `1` while the endpoint is set aside, `0` while it takes traffic. |
@@ -1362,8 +1375,12 @@ If `count` stays at `maxAutoPrepare` and `evictions` keeps growing, `maxAutoPrep
 for the workload.
 
 - **The SQL text is opt-in.** SQL text with literal values can contain sensitive data, so set
-  `traceQueryText: true` (or `TraceQueryText=true`) to record it. The driver never records
-  parameter values.
+  `traceQueryText: 'sanitized'` (or `TraceQueryText=Sanitized`) to record it without them, or
+  `traceQueryText: true` (or `TraceQueryText=true`) to record it as sent. The driver never records
+  parameter values: `@p0` stays `@p0`.
+- **Tables come from a scan, not a parse.** The driver takes a table from the name after `FROM`,
+  `JOIN`, `INTO`, `UPDATE` or `TABLE`. A comma join names only its first table, and a common table
+  expression is named as a table. The scan runs only for a sampled span.
 - **A stream ends its span at the last row.** For `queryStream`, the span ends when the iteration
   reaches the last row, when a read fails, or when the stream is closed.
 - **A provider registered later.** The metrics API has no proxy provider, so the driver makes its

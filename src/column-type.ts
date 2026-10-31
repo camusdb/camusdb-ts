@@ -31,6 +31,13 @@ export const ColumnType = {
    * decimal text in `strValue`, so no digit goes through a JavaScript number.
    */
   Numeric: 12,
+
+  /**
+   * One JSON document (SQL `JSONB`, alias `JSON`). It travels as its JSON text in `strValue`. A
+   * result cell holds the PostgreSQL text form on every transport: one space after each `:` and each
+   * `,`, keys in the stored order, and numbers with every digit and their scale.
+   */
+  Jsonb: 13,
 } as const;
 
 export type ColumnType = (typeof ColumnType)[keyof typeof ColumnType];
@@ -49,6 +56,7 @@ const NAMES: Record<number, string> = {
   10: 'Array',
   11: 'Uuid',
   12: 'Numeric',
+  13: 'Jsonb',
 };
 
 /** The declared type's name, for diagnostics and for `QueryResult.columns[i].typeName`. */

@@ -7,6 +7,32 @@ numbers follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.12.0] — 2026-10-31
+
+### Added
+
+- `JSONB` (alias `JSON`) support: `ColumnType.Jsonb` (13). A document travels as JSON text on REST
+  and on gRPC. The gRPC proto is again a copy of the server's (`json_value`, and the causal token
+  fields of `StartTxnRequest`, which the driver does not send yet).
+- A plain object parameter binds as `JSONB`. `camus.jsonb(value)` binds any other document: JSON
+  text in a `string`, an array, a scalar, or the JSON `null` document. An array of documents fails
+  before the request is sent, because the server has no `ARRAY(JSONB)`.
+- The `jsonb` decode mode, for the client (`jsonb`, or `Jsonb=` in a connection string), for one
+  statement, and for one pipelined query. `parse` (the default) gives the parsed JavaScript value,
+  with an unsafe integer as a `bigint`. `text` gives the PostgreSQL text form, with every digit, the
+  number scale, and the key order kept on both transports.
+- `formatJsonb(json)` gives the PostgreSQL text form of any JSON text. `JSONB_MAX_NESTING_DEPTH`
+  is 512.
+- `CamusErrorCode.InvalidJson` (`CADB0418`) and `CamusErrorCode.JsonNestingTooDeep` (`CADB0419`).
+- The live suite has JSONB cases on REST and gRPC, behind `CAMUS_LIVE_JSONB=true`.
+
+### Changed
+
+- The JSON reader and writer of the driver accept 528 levels of nesting, up from 200, so a
+  response can carry a document with 512 levels.
+- A REST result that has a `jsonb` column is parsed again with a reader that keeps the source text
+  of each document cell. A result without such a column is parsed as before.
+
 ## [0.11.0] — 2026-10-28
 
 ### Added

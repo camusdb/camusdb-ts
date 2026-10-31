@@ -35,6 +35,39 @@ export function parseLossless(text: string): unknown {
 const LONG_INTEGER = /\d{16,}/;
 
 /**
+ * The source text of one JSON value, kept as the server wrote it. `parseWithRawCells` gives one for
+ * each cell whose exact text matters: a JSONB document, whose numbers keep their scale (`2.50`) and
+ * whose keys keep their order only as text.
+ */
+export class RawJson {
+  readonly text: string;
+
+  constructor(text: string) {
+    this.text = text;
+  }
+}
+
+/** The cells of a result that `parseWithRawCells` keeps as `RawJson`. */
+export interface RawCellPlan {
+  /**
+   * The properties of the top-level object whose value is a list of rows. Leave it out when the
+   * text is one row, as an NDJSON row line is.
+   */
+  readonly rowsKeys?: readonly string[] | undefined;
+
+  /** The positions, inside a row, of the cells to keep as text. */
+  readonly columns: ReadonlySet<number>;
+}
+
+/**
+ * Parses JSON text as `parseLossless` does, but keeps each cell that `plan` names as a `RawJson`.
+ * It always uses the parser written in JavaScript, so use it only for a result that has such a cell.
+ */
+export function parseWithRawCells(text: string, plan: RawCellPlan): unknown {
+  return new LosslessParser(text, plan).parse();
+}
+
+/**
  * Serializes a value as JSON, writing a `bigint` as a JSON number and a negative zero as `-0`.
  *
  * `undefined`, a function, and a symbol are omitted from an object and become `null` in an array,
@@ -47,11 +80,17 @@ export function stringifyLossless(value: unknown): string {
   return out.join('');
 }
 
-const MAX_DEPTH = 200;
+/**
+ * The deepest JSON value this module reads or writes. A JSONB document can have 512 levels
+ * (`CADB0419` above that), and a response puts a few levels of its own around a document.
+ */
+export const MAX_JSON_DEPTH = 512 + 16;
+
+const MAX_DEPTH = MAX_JSON_DEPTH;
 
 function writeValue(value: unknown, out: string[], depth: number): void {
   if (depth > MAX_DEPTH) {
-    throw new TypeError('Cannot serialize a value nested more than 200 levels deep.');
+    throw new TypeError(`Cannot serialize a value nested more than ${String(MAX_DEPTH)} levels deep.`);
   }
 
   if (value === null) {
@@ -202,19 +241,33 @@ const JSON_NUMBER = /^-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?$/;
 const MIN_SAFE = BigInt(Number.MIN_SAFE_INTEGER);
 const MAX_SAFE = BigInt(Number.MAX_SAFE_INTEGER);
 
-/** A recursive-descent JSON reader. It is used only for text that holds a long integer run. */
+/**
+ * What a value is in a `RawCellPlan`: an ordinary value, the top-level object that holds the row
+ * lists, a list of rows, or one row.
+ */
+type Role = 'value' | 'body' | 'rows' | 'row';
+
+/**
+ * A recursive-descent JSON reader. It is used for text that holds a long integer run, and for a
+ * result whose cells a `RawCellPlan` keeps as text.
+ */
 class LosslessParser {
   private readonly text: string;
 
+  private readonly plan: RawCellPlan | undefined;
+
   private position = 0;
 
-  constructor(text: string) {
+  constructor(text: string, plan?: RawCellPlan) {
     this.text = text;
+    this.plan = plan;
   }
 
   parse(): unknown {
+    const role: Role = this.plan === undefined ? 'value' : this.plan.rowsKeys === undefined ? 'row' : 'body';
+
     this.skipWhitespace();
-    const value = this.readValue(0);
+    const value = this.readValue(0, role);
     this.skipWhitespace();
 
     if (this.position < this.text.length) {
@@ -224,18 +277,18 @@ class LosslessParser {
     return value;
   }
 
-  private readValue(depth: number): unknown {
+  private readValue(depth: number, role: Role = 'value'): unknown {
     if (depth > MAX_DEPTH) {
-      throw new SyntaxError('The JSON value is nested more than 200 levels deep.');
+      throw new SyntaxError(`The JSON value is nested more than ${String(MAX_DEPTH)} levels deep.`);
     }
 
     const character = this.text[this.position];
 
     switch (character) {
       case '{':
-        return this.readObject(depth);
+        return this.readObject(depth, role === 'body');
       case '[':
-        return this.readArray(depth);
+        return this.readArray(depth, role);
       case '"':
         return this.readString();
       case 't':
@@ -249,7 +302,7 @@ class LosslessParser {
     }
   }
 
-  private readObject(depth: number): Record<string, unknown> {
+  private readObject(depth: number, isBody: boolean): Record<string, unknown> {
     const object: Record<string, unknown> = {};
 
     this.position++; // past '{'
@@ -273,7 +326,8 @@ class LosslessParser {
       this.expect(':');
       this.skipWhitespace();
 
-      const value = this.readValue(depth + 1);
+      const role: Role = isBody && this.plan?.rowsKeys?.includes(key) === true ? 'rows' : 'value';
+      const value = this.readValue(depth + 1, role);
 
       // A prototype-polluting key is stored as an own property rather than assigned through the
       // prototype chain, so hostile JSON cannot reach Object.prototype.
@@ -291,7 +345,7 @@ class LosslessParser {
     }
   }
 
-  private readArray(depth: number): unknown[] {
+  private readArray(depth: number, role: Role): unknown[] {
     const array: unknown[] = [];
 
     this.position++; // past '['
@@ -302,9 +356,20 @@ class LosslessParser {
       return array;
     }
 
+    const itemRole: Role = role === 'rows' ? 'row' : 'value';
+    const rawColumns = role === 'row' ? this.plan?.columns : undefined;
+
     for (;;) {
       this.skipWhitespace();
-      array.push(this.readValue(depth + 1));
+
+      if (rawColumns?.has(array.length) === true) {
+        const start = this.position;
+        this.readValue(depth + 1);
+        array.push(new RawJson(this.text.slice(start, this.position)));
+      } else {
+        array.push(this.readValue(depth + 1, itemRole));
+      }
+
       this.skipWhitespace();
 
       if (this.text[this.position] === ',') {

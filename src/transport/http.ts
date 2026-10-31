@@ -103,8 +103,17 @@ export async function sendHttp(
   }
 }
 
-/** Sends a request and reads a JSON body. A non-2xx status becomes a `CamusError`. */
-export async function sendJson<T>(pool: CamusEndpointPool | undefined, init: HttpRequestInit): Promise<T> {
+/**
+ * Sends a request and reads a JSON body. A non-2xx status becomes a `CamusError`.
+ *
+ * `refine`, when given, gets the parsed body and its text, and gives the body to return. A caller
+ * uses it to parse again a body whose cells need their source text.
+ */
+export async function sendJson<T>(
+  pool: CamusEndpointPool | undefined,
+  init: HttpRequestInit,
+  refine?: (parsed: unknown, text: string) => unknown,
+): Promise<T> {
   const { response } = await sendHttp(pool, init);
 
   const text = await readBody(response);
@@ -116,7 +125,8 @@ export async function sendJson<T>(pool: CamusEndpointPool | undefined, init: Htt
   }
 
   try {
-    return parseLossless(text) as T;
+    const parsed = parseLossless(text);
+    return (refine === undefined ? parsed : refine(parsed, text)) as T;
   } catch (error) {
     // Distinct from the empty body above: something arrived, and it is not JSON. A caller that
     // sees this is looking at a proxy page or a truncated reply, not at a missing result.

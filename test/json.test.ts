@@ -186,7 +186,7 @@ describe('stringifyLossless', () => {
 
   it('refuses a value nested past the depth limit', () => {
     let deep: unknown = 1;
-    for (let i = 0; i < 300; i++) deep = [deep];
+    for (let i = 0; i < 600; i++) deep = [deep];
 
     expect(() => stringifyLossless(deep)).toThrow(TypeError);
   });

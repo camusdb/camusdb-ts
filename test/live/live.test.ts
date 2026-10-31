@@ -21,6 +21,8 @@
  *                             server refuses the clause as a parse error
  *   CAMUS_LIVE_NUMERIC        set to true to run the NUMERIC cases, which need a server with the
  *                             NUMERIC column type
+ *   CAMUS_LIVE_JSONB          set to true to run the JSONB cases, which need a server with the JSONB
+ *                             column type and GIN indexes
  *   CAMUS_LIVE_ARRAY_ELEMENT_TYPES
  *                             set to true to run the typed-array cases, which need a server that
  *                             reports an array column's element type in a REST result: without it,
@@ -65,6 +67,7 @@ const LARGE_VALUES = process.env.CAMUS_LIVE_LARGE_VALUES?.toLowerCase() === 'tru
 const SEQUENCES = process.env.CAMUS_LIVE_SEQUENCES?.toLowerCase() === 'true';
 const RETURNING = process.env.CAMUS_LIVE_RETURNING?.toLowerCase() === 'true';
 const NUMERIC = process.env.CAMUS_LIVE_NUMERIC?.toLowerCase() === 'true';
+const JSONB = process.env.CAMUS_LIVE_JSONB?.toLowerCase() === 'true';
 const ARRAY_ELEMENT_TYPES = process.env.CAMUS_LIVE_ARRAY_ELEMENT_TYPES?.toLowerCase() === 'true';
 const PIPELINE = process.env.CAMUS_LIVE_PIPELINE?.toLowerCase() === 'true';
 const NODE_STATS = process.env.CAMUS_LIVE_NODE_STATS?.toLowerCase() === 'true';
@@ -1584,6 +1587,158 @@ describe.runIf(NUMERIC)('NUMERIC', () => {
             p: camus.numeric('1e40'),
           }),
         ).rejects.toMatchObject({ code: CamusErrorCode.NumericValueOutOfRange });
+      });
+    });
+  }
+});
+
+describe.runIf(JSONB)('JSONB', () => {
+  for (const [name, options] of [
+    ['REST transport', { protocol: 'rest', endpoint: REST_ENDPOINT }],
+    ['gRPC transport', { protocol: 'grpc', endpoint: GRPC_ENDPOINT }],
+  ] as const) {
+    describe(name, () => {
+      let client: CamusClient;
+      const tables: string[] = [];
+
+      async function createTable(): Promise<string> {
+        const table = uniqueName('jsonb');
+
+        await client.executeDdl(
+          `CREATE TABLE ${table} (id OID PRIMARY KEY NOT NULL, name STRING NOT NULL, doc JSONB)`,
+        );
+
+        tables.push(table);
+        return table;
+      }
+
+      async function insert(table: string, docName: string, doc: unknown): Promise<void> {
+        await client.execute(`INSERT INTO ${table} (id, name, doc) VALUES (@id, @name, @doc)`, {
+          id: camus.id(CamusObjectId.generateAsString()),
+          name: docName,
+          doc,
+        });
+      }
+
+      async function names(sql: string, parameters?: Record<string, unknown>): Promise<string[]> {
+        const result = await client.query<{ name: string }>(sql, parameters);
+        return result.rows.map((row) => row.name).sort();
+      }
+
+      beforeAll(async () => {
+        client = new CamusClient({ database: DATABASE, timeoutSeconds: 30, ...CREDENTIALS, ...options });
+        await client.createDatabase(undefined, { ifNotExists: true });
+      });
+
+      afterAll(async () => {
+        for (const table of tables) {
+          await client.executeDdl(`DROP TABLE ${table}`).catch(() => undefined);
+        }
+
+        await client.close();
+      });
+
+      it('round-trips documents in the text form', async () => {
+        const table = await createTable();
+
+        await insert(table, 'text', camus.jsonb('{"b":1,   "a":[1,2.50], "n": 12345678901234567890.50}'));
+        await insert(table, 'object', { kind: 'login', tags: ['vip'] });
+        await insert(table, 'array', camus.jsonb(['x', { y: null }]));
+        await insert(table, 'string', '{"plain": "string"}');
+        await insert(table, 'json-null', camus.jsonb(null));
+        await insert(table, 'sql-null', null);
+
+        const result = await client.query<{ name: string; doc: string | null }>(
+          `SELECT name, doc FROM ${table}`,
+          undefined,
+          { jsonb: 'text' },
+        );
+
+        expect(result.columns[1]!.type).toBe(ColumnType.Jsonb);
+
+        const rows = new Map(result.rows.map((row) => [row.name, row.doc]));
+
+        expect(rows.get('text')).toBe('{"a": [1, 2.50], "b": 1, "n": 12345678901234567890.50}');
+        expect(rows.get('object')).toBe('{"kind": "login", "tags": ["vip"]}');
+        expect(rows.get('array')).toBe('["x", {"y": null}]');
+        expect(rows.get('string')).toBe('{"plain": "string"}');
+        expect(rows.get('sql-null')).toBeNull();
+
+        // gRPC tells the JSON null document from SQL NULL. A REST row writes both as the token null.
+        expect(rows.get('json-null')).toBe(options.protocol === 'grpc' ? 'null' : null);
+
+        const parsed = await client.queryOne<{ doc: unknown }>(
+          `SELECT doc FROM ${table} WHERE name = @name`,
+          { name: 'object' },
+        );
+
+        expect(parsed?.doc).toEqual({ kind: 'login', tags: ['vip'] });
+      });
+
+      it('filters with the operators and the jsonb functions', async () => {
+        const table = await createTable();
+
+        await insert(table, 'login', { kind: 'login', user: { id: 7 } });
+        await insert(table, 'logout', { kind: 'logout', user: { id: 7 } });
+        await insert(table, 'other', { kind: 'login', user: { id: 8 }, beta: true });
+
+        expect(
+          await names(`SELECT name FROM ${table} WHERE doc @> @filter`, { filter: { user: { id: 7 } } }),
+        ).toEqual(['login', 'logout']);
+
+        expect(
+          await names(`SELECT name FROM ${table} WHERE doc ->> 'kind' = @kind`, { kind: 'logout' }),
+        ).toEqual(['logout']);
+
+        expect(
+          await names(`SELECT name FROM ${table} WHERE jsonb_exists(doc, @key)`, { key: 'beta' }),
+        ).toEqual(['other']);
+      });
+
+      it('reads a GIN index for a containment query', async () => {
+        const table = await createTable();
+
+        await client.executeDdl(`CREATE INDEX ${table}_gin ON ${table} USING GIN (doc)`);
+        await insert(table, 'login', { kind: 'login' });
+        await insert(table, 'logout', { kind: 'logout' });
+
+        expect(
+          await names(`SELECT name FROM ${table} WHERE jsonb_contains(doc, @filter)`, {
+            filter: camus.jsonb('{"kind": "login"}'),
+          }),
+        ).toEqual(['login']);
+
+        const plan = await client.query(`EXPLAIN SELECT name FROM ${table} WHERE doc @> '{"kind": "login"}'`);
+
+        expect(JSON.stringify(plan.rows)).toContain('gin-scan');
+      });
+
+      it('streams a deep document', async () => {
+        const table = await createTable();
+        const deep = `${'['.repeat(300)}${']'.repeat(300)}`;
+
+        await insert(table, 'deep', camus.jsonb(deep));
+        await insert(table, 'flat', camus.jsonb('{"z": "é\\n"}'));
+
+        const stream = await client.queryStream<{ name: string; doc: string }>(
+          `SELECT name, doc FROM ${table}`,
+          undefined,
+          { jsonb: 'text' },
+        );
+
+        const rows = new Map<string, string>();
+        for await (const row of stream) rows.set(row.name, row.doc);
+
+        expect(rows.get('deep')).toBe(deep);
+        expect(rows.get('flat')).toBe('{"z": "é\\n"}');
+      });
+
+      it('refuses text that is not JSON', async () => {
+        const table = await createTable();
+
+        await expect(insert(table, 'bad', camus.jsonb('{"a": 1,}'))).rejects.toMatchObject({
+          code: CamusErrorCode.InvalidJson,
+        });
       });
     });
   }

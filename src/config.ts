@@ -20,7 +20,7 @@ import { CamusErrorCode } from './error-codes.js';
 import type { CamusTransactionOptions } from './options.js';
 import { CamusIsolationLevel, CamusLocking, CamusTransactionMode } from './options.js';
 import { isValidDatabaseName } from './sql-syntax.js';
-import type { DecodeOptions, Int64Mode } from './values/decode.js';
+import type { Int64Mode, JsonbMode } from './values/decode.js';
 
 /**
  * The highest HTTP version that the REST calls ask for, as the .NET driver's `HttpVersion=` names
@@ -235,6 +235,12 @@ export interface CamusClientOptions {
   readonly int64?: Int64Mode;
 
   /**
+   * How a `jsonb` column reaches a caller: `parse` (the default) gives the parsed JavaScript value,
+   * and `text` gives the document's JSON text with every digit kept.
+   */
+  readonly jsonb?: JsonbMode;
+
+  /**
    * What the driver's spans record of the SQL text, as `db.query.text`. `false` (the default)
    * records none, `true` (or `'raw'`) the text as sent, and `'sanitized'` the text with each literal
    * value replaced by `?`. SQL text with literal values can contain sensitive data, so it is opt-in.
@@ -265,7 +271,7 @@ export interface ResolvedConfig {
   readonly routingNodes: ReadonlyMap<string, string>;
   readonly routingMaxHintAgeMs: number;
   readonly defaultTransactionOptions: CamusTransactionOptions;
-  readonly decode: DecodeOptions;
+  readonly decode: { readonly int64: Int64Mode; readonly jsonb: JsonbMode };
 
   /** What the driver's spans record of the SQL text. */
   readonly traceQueryText: CamusQueryTextMode;
@@ -328,7 +334,7 @@ export function resolveOptions(options: CamusClientOptions): ResolvedConfig {
     routingNodes: resolveRoutingNodes(options.routingNodes, endpointList),
     routingMaxHintAgeMs: atLeastOr(options.routingMaxHintAgeMs, 1, 5000),
     defaultTransactionOptions: options.defaultTransactionOptions ?? {},
-    decode: { int64: options.int64 ?? 'auto' },
+    decode: { int64: options.int64 ?? 'auto', jsonb: options.jsonb ?? 'parse' },
     traceQueryText: resolveQueryTextMode(options.traceQueryText),
     connectionString: undefined,
   };
@@ -401,7 +407,10 @@ export function resolveConnectionString(connectionString: string): ResolvedConfi
       mode: parseEnum(settings.get('TransactionMode'), CamusTransactionMode, undefined),
       locking: parseEnum(settings.get('Locking'), CamusLocking, undefined),
     },
-    decode: { int64: parseInt64Mode(settings.get('Int64')) },
+    decode: {
+      int64: parseInt64Mode(settings.get('Int64')),
+      jsonb: parseJsonbMode(settings.get('Jsonb')),
+    },
     traceQueryText: parseQueryTextMode(settings.get('TraceQueryText')),
     connectionString,
   };
@@ -629,6 +638,10 @@ function parseInt64Mode(raw: string | undefined): Int64Mode {
     default:
       return 'auto';
   }
+}
+
+function parseJsonbMode(raw: string | undefined): JsonbMode {
+  return raw?.trim().toLowerCase() === 'text' ? 'text' : 'parse';
 }
 
 function parsePositiveInt(raw: string | undefined, fallback: number): number {

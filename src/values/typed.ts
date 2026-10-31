@@ -9,6 +9,7 @@ import { ColumnType } from '../column-type.js';
 import type { ColumnValue } from '../column-value.js';
 import { CamusError } from '../errors.js';
 import { CamusErrorCode } from '../error-codes.js';
+import { jsonbFromParameter } from './jsonb.js';
 import { dateToDayTicks, dateToTicks } from './ticks.js';
 import { isUuid, uuidToHalves } from './uuid.js';
 
@@ -47,7 +48,8 @@ function invalid(message: string): never {
  * The driver infers a column type from the JavaScript value, which is right for most parameters. A
  * helper here states the type instead, for the cases inference cannot reach: a `uuid` column (a
  * UUID is an ordinary string in JavaScript), an `id` column, a `float32` column, a `numeric`
- * column, a date-only column, and an empty array, whose element type nothing can be read from.
+ * column, a date-only column, a `jsonb` document that is not a plain object, and an empty array,
+ * whose element type nothing can be read from.
  */
 export const camus = {
   /** An `id` column value: an ObjectId as its 24-character string. */
@@ -101,6 +103,22 @@ export const camus = {
     return typed({ type: ColumnType.Float32, floatValue: value });
   },
 
+  /**
+   * A `jsonb` column value: one JSON document.
+   *
+   * A `string` is the document's JSON text, and it is sent as it is. The server refuses text that is
+   * not JSON with `CADB0418`. To store a JSON string, pass its JSON text: `camus.jsonb('"text"')`. A
+   * `Uint8Array` or an `ArrayBuffer` is UTF-8 JSON text. Any other value is serialized: an object,
+   * an array, a number, a boolean, or `null` (the JSON `null` document, which is not SQL `NULL`). A
+   * `bigint` keeps every digit.
+   *
+   * A plain object binds as `jsonb` without this helper. An array does not: it binds as an `ARRAY`
+   * column value, so wrap a JSON array document in `camus.jsonb`.
+   */
+  jsonb(value: unknown): TypedParameter {
+    return typed({ type: ColumnType.Jsonb, strValue: jsonbFromParameter(value) });
+  },
+
   /** A `bool` column value. */
   bool(value: boolean): TypedParameter {
     return typed({ type: ColumnType.Bool, boolValue: value });
@@ -148,6 +166,10 @@ export const camus = {
   array(items: readonly unknown[], elementType: ColumnType): TypedParameter {
     if (elementType === ColumnType.Numeric) {
       invalid('The server has no ARRAY(NUMERIC). Use ColumnType.Float64 or ColumnType.String elements.');
+    }
+
+    if (elementType === ColumnType.Jsonb) {
+      invalid('The server has no ARRAY(JSONB). Bind one JSON array document with camus.jsonb([...]).');
     }
 
     // Imported lazily to break the cycle with the encoder, which imports this module.

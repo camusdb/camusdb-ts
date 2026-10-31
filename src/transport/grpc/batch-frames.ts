@@ -137,6 +137,7 @@ function valueCost(value: GrpcValue): number {
 
   cost += textCost(value.stringValue);
   cost += textCost(value.numericValue);
+  cost += textCost(value.jsonValue);
   cost += bytesCost(value.bytesValue);
   cost += bytesCost(value.uuidValue);
 

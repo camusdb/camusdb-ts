@@ -309,7 +309,7 @@ describe('encodeParameter', () => {
 
   it('refuses a value it cannot map', () => {
     expect(() => encodeParameter(Symbol('x'))).toThrow(CamusError);
-    expect(() => encodeParameter({ a: 1 })).toThrow(CamusError);
+    expect(() => encodeParameter(new Map([['a', 1]]))).toThrow(CamusError);
   });
 });
 

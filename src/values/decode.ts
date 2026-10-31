@@ -7,6 +7,7 @@
 
 import { ColumnType } from '../column-type.js';
 import type { ColumnValue } from '../column-value.js';
+import { parseJsonb } from './jsonb.js';
 import { ticksToDate } from './ticks.js';
 import { halvesToUuid } from './uuid.js';
 
@@ -22,12 +23,26 @@ import { halvesToUuid } from './uuid.js';
  */
 export type Int64Mode = 'auto' | 'number' | 'bigint';
 
+/**
+ * How a `jsonb` column reaches a caller.
+ *
+ * - `parse` (the default) — the parsed JavaScript value: an object, an array, a string, a number, a
+ *   boolean, or `null`. An integer outside the safe range is a `bigint`. A number with a fraction is
+ *   a `number`, so it has about 15 significant digits and no scale (`2.50` is `2.5`).
+ * - `text` — the document's JSON text in the PostgreSQL text form, for example
+ *   `{"a": [1, 2.50]}`. Every digit and the key order are kept.
+ */
+export type JsonbMode = 'parse' | 'text';
+
 /** How a cell is turned into a JavaScript value. */
 export interface DecodeOptions {
   readonly int64: Int64Mode;
+
+  /** How a `jsonb` column reaches the caller. Default `parse`. */
+  readonly jsonb?: JsonbMode | undefined;
 }
 
-export const DEFAULT_DECODE_OPTIONS: DecodeOptions = Object.freeze({ int64: 'auto' });
+export const DEFAULT_DECODE_OPTIONS: DecodeOptions = Object.freeze({ int64: 'auto', jsonb: 'parse' });
 
 /**
  * The JavaScript value for one cell.
@@ -43,6 +58,8 @@ export const DEFAULT_DECODE_OPTIONS: DecodeOptions = Object.freeze({ int64: 'aut
  * - `Uuid` — the canonical lowercase hyphenated `string`.
  * - `Numeric` — the exact decimal `string`, for example `'12.5'`. JavaScript has no decimal type, and
  *   a `number` holds only about 15 significant digits.
+ * - `Jsonb` — the parsed document, or its text, per `options.jsonb`. A document that is JSON `null`
+ *   reads as `null` in `parse` mode.
  * - `Array` — an array of the values above.
  */
 export function decodeValue(value: ColumnValue, options: DecodeOptions = DEFAULT_DECODE_OPTIONS): unknown {
@@ -74,6 +91,9 @@ export function decodeValue(value: ColumnValue, options: DecodeOptions = DEFAULT
 
     case ColumnType.Uuid:
       return decodeUuid(value);
+
+    case ColumnType.Jsonb:
+      return options.jsonb === 'text' ? (value.strValue ?? 'null') : parseJsonb(value.strValue ?? 'null');
 
     case ColumnType.Array:
       return (value.arrayValues ?? []).map((item) => decodeValue(item, options));

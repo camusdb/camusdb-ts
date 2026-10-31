@@ -78,7 +78,8 @@ export type ValueKind =
   | 'datetimeValue'
   | 'arrayValue'
   | 'uuidValue'
-  | 'numericValue';
+  | 'numericValue'
+  | 'jsonValue';
 
 export interface GrpcValue {
   kind?: ValueKind | undefined;
@@ -95,6 +96,9 @@ export interface GrpcValue {
   arrayValue?: GrpcArrayValue;
   uuidValue?: Buffer;
   numericValue?: string;
+
+  /** JSONB: the document's JSON text. A result cell holds the PostgreSQL text form. */
+  jsonValue?: string;
 }
 
 export interface GrpcArrayValue {

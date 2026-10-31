@@ -24,7 +24,7 @@ import type {
   TransportPipelineStatement,
 } from './transport/transport.js';
 import { firstPipelineFailure } from './transport/transport.js';
-import type { Int64Mode } from './values/decode.js';
+import type { DecodeOptions, Int64Mode, JsonbMode } from './values/decode.js';
 import type { Parameters } from './values/encode.js';
 import { encodeParameters } from './values/encode.js';
 
@@ -32,6 +32,9 @@ import { encodeParameters } from './values/encode.js';
 export interface PipelineQueryOptions {
   /** How an `int64` column reaches the caller, for this statement alone. */
   readonly int64?: Int64Mode | undefined;
+
+  /** How a `jsonb` column reaches the caller, for this statement alone. */
+  readonly jsonb?: JsonbMode | undefined;
 }
 
 /**
@@ -133,7 +136,7 @@ export class CamusPipeline {
     parameters?: Parameters,
     options: PipelineQueryOptions = {},
   ): Promise<QueryResult<T>> {
-    const statement = this.add(sql, parameters, true, options.int64);
+    const statement = this.add(sql, parameters, true, options);
 
     return statement.promise as Promise<QueryResult<T>>;
   }
@@ -147,7 +150,7 @@ export class CamusPipeline {
    * `TRUNCATE`), and while a send is in progress.
    */
   execute(sql: string, parameters?: Parameters): Promise<ExecuteResult> {
-    const statement = this.add(sql, parameters, false, undefined);
+    const statement = this.add(sql, parameters, false, {});
 
     return statement.promise as Promise<ExecuteResult>;
   }
@@ -188,7 +191,7 @@ export class CamusPipeline {
     sql: string,
     parameters: Parameters | undefined,
     asReader: boolean,
-    int64: Int64Mode | undefined,
+    options: PipelineQueryOptions,
   ): QueuedStatement {
     if (this.sending) {
       throw new CamusError(
@@ -219,7 +222,10 @@ export class CamusPipeline {
       asReader,
       asReader && !dml ? 'query' : 'nonQuery',
       asReader && !dml ? CamusRouteOpKind.Query : CamusRouteOpKind.NonQuery,
-      int64 ?? this.runtime.config.decode.int64,
+      {
+        int64: options.int64 ?? this.runtime.config.decode.int64,
+        jsonb: options.jsonb ?? this.runtime.config.decode.jsonb,
+      },
     );
 
     this.queued.push(statement);
@@ -405,7 +411,7 @@ class QueuedStatement {
     readonly asReader: boolean,
     readonly kind: PipelineStatementKind,
     readonly routeKind: CamusRouteOpKind,
-    private readonly int64: Int64Mode,
+    private readonly decode: DecodeOptions,
   ) {
     this.promise = new Promise((resolve, reject) => {
       this.resolve = resolve;
@@ -481,7 +487,7 @@ class QueuedStatement {
   }
 
   private mapRows(resultSet: CamusResultSet): Pick<QueryResult<unknown>, 'rows' | 'columns' | 'rowCount'> {
-    const mapper = new RowMapper(resultSet.columnNames, { int64: this.int64 });
+    const mapper = new RowMapper(resultSet.columnNames, this.decode);
 
     return { rows: mapper.mapAll(resultSet), columns: resultSet.columns, rowCount: resultSet.rowCount };
   }

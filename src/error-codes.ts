@@ -41,6 +41,12 @@ export const CamusErrorCode = {
    */
   NumericValueOutOfRange: 'CADB0417',
 
+  /** A `jsonb` value is not valid JSON text. */
+  InvalidJson: 'CADB0418',
+
+  /** A `jsonb` document is nested deeper than 512 levels. */
+  JsonNestingTooDeep: 'CADB0419',
+
   /** The database already exists. Also raised when `IF NOT EXISTS` loses a registration race. */
   DatabaseAlreadyExists: 'CADB0012',
 

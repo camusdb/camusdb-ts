@@ -20,6 +20,8 @@ import { ColumnType } from './column-type.js';
  * - `String` and `Id` — `strValue`.
  * - `Numeric` — `strValue` as decimal text. The server sends the canonical form: no exponent, no
  *   trailing zeros, and at most 9 fraction digits.
+ * - `Jsonb` — `strValue` as JSON text. A result cell holds the PostgreSQL text form, for example
+ *   `{"a": [1, 2.50], "b": null}`.
  * - `Date` and `DateTime` — `longValue` as UTC .NET ticks. `Date` is truncated to midnight.
  * - `Bytes` — `bytesValue`. JSON carries it as base64.
  * - `Array` — `arrayValues` plus `arrayElementType`.
@@ -93,6 +95,7 @@ export function columnValueToJson(value: ColumnValue): ColumnValueJson {
     case ColumnType.Id:
     case ColumnType.String:
     case ColumnType.Numeric:
+    case ColumnType.Jsonb:
       json.strValue = value.strValue ?? '';
       return json;
 

@@ -133,6 +133,7 @@ const b = CamusClient.fromConnectionString('Endpoint=http://localhost:8082;Datab
 | `routingMaxHintAgeMs` | `RoutingMaxHintAge` | No | The ceiling on how long a learned route is reused. Default `5000`. |
 | `defaultTransactionOptions` | `IsolationLevel`, `TransactionMode`, `Locking` | No | Concurrency defaults for every transaction and autocommit statement. |
 | `int64` | `Int64` | No | `auto` (the default), `number`, or `bigint`. See [Types](#types). |
+| `jsonb` | `Jsonb` | No | `parse` (the default) or `text`. See [JSONB](#jsonb). |
 | `traceQueryText` | `TraceQueryText` | No | Put the SQL text on the driver's spans as `db.query.text`: `false` (the default) puts none, `true` puts the text as sent, and `'sanitized'` (`TraceQueryText=Sanitized`) puts the text with each literal value replaced by `?`. See [OpenTelemetry](#opentelemetry). |
 
 **`HttpVersion`.** The .NET driver reads `HttpVersion=1.1|2|3` and can send REST calls over HTTP/2
@@ -244,6 +245,7 @@ change what the statement means.
 | `Uint8Array`, `Buffer`, `ArrayBuffer` | `Bytes` |
 | `Float32Array` | `Bytes`, packed as a vector |
 | `CamusObjectId` | `Id` |
+| a plain object (`{ … }`) | `Jsonb`, as its JSON text |
 | an array | `Array`, with the element type read from the first element that is not null. When that element is a whole `number` and another `number` element is not whole or is `-0`, the element type is `Float64`. |
 
 A UUID-shaped string is **not** read as a `uuid`. A 36-character string that happens to look like
@@ -271,6 +273,7 @@ await client.query('SELECT * FROM robots WHERE key = @key AND made = @made AND t
 | `camus.float64(value)` | `Float64` |
 | `camus.float32(value)` | `Float32` |
 | `camus.numeric(value)` | `Numeric`, from a decimal `string`, a `bigint`, or a `number` |
+| `camus.jsonb(value)` | `Jsonb`, from JSON text in a `string`, or from any value as its JSON |
 | `camus.bool(value)` | `Bool` |
 | `camus.string(value)` | `String` |
 | `camus.bytes(value)` | `Bytes` |
@@ -308,6 +311,7 @@ against an `OID` column. `camus.array(uuids, ColumnType.Id)` therefore sends a `
 | `Date`, `DateTime` | `Date`, in UTC |
 | `Uuid` | `string`, canonical and lowercase |
 | `Numeric` | `string`, the exact decimal text — see [NUMERIC](#numeric) |
+| `Jsonb` | the parsed document, or its JSON text — see [JSONB](#jsonb) |
 | `Array` | an array of the values above |
 
 A `Float32` value is the single-precision number the server stored, on both transports. A negative
@@ -370,6 +374,70 @@ await client.execute('INSERT INTO orders (id, price, total) VALUES (GEN_ID(), @p
 
 const row = await client.queryOne<{ total: string }>('SELECT total FROM orders LIMIT 1');
 ```
+
+### JSONB
+
+`JSONB` (alias `JSON`) holds one JSON document: an object, an array, a string, a number, a boolean, or
+JSON `null`. The SQL follows PostgreSQL `jsonb`: the operators `->`, `->>`, `#>`, `#>>`, `@>`, `<@`,
+`?`, `?|`, `?&`, `||`, `-`, and `#-`, the `jsonb_*` functions, and GIN indexes. A document travels as
+JSON text on REST and on gRPC.
+
+- A plain object binds as `JSONB` with no helper. Its JSON text goes to the server, and a `bigint`
+  inside it keeps every digit.
+- `camus.jsonb(value)` binds any other document. A `string` is JSON text, and it is sent as it is.
+  An array, a number, a boolean, or `null` is serialized. `camus.jsonb(null)` is the JSON `null`
+  document, which is not SQL `NULL`. An array without `camus.jsonb` binds as an `ARRAY` column value,
+  and a plain `string` binds as a `STRING`. A `jsonb` column parses a `STRING` when it is written.
+- Text that is not valid JSON fails with `CADB0418` (`CamusErrorCode.InvalidJson`). A document
+  nested deeper than 512 levels fails with `CADB0419` (`CamusErrorCode.JsonNestingTooDeep`).
+- The server has no `ARRAY(JSONB)`. An array of documents is a document, so bind one JSON array with
+  `camus.jsonb([...])`. An array of plain objects fails before the request is sent.
+
+`jsonb` chooses how a document reaches you:
+
+- **`parse`** (the default) — the parsed JavaScript value. An integer outside the safe range is a
+  `bigint`, as in `int64: 'auto'`. A number with a fraction is a `number`, so `2.50` reads as `2.5`,
+  and a long fraction is rounded to about 15 significant digits.
+- **`text`** — the JSON text in the PostgreSQL form: a space after each `:` and each `,`, keys in the
+  stored order (shorter keys first), and no other white space. Numbers keep every digit and their
+  scale, on both transports. `formatJsonb(json)` gives the same form for any JSON text.
+
+Set it for the whole client (`jsonb: 'text'`, or `Jsonb=text` in a connection string), for one
+statement, or for one pipelined query.
+
+JSON `null` and SQL `NULL` are different values. In `text` mode, over gRPC, a JSON `null` document
+reads as the text `'null'`. A REST row writes both as the token `null`, so over REST a top-level JSON
+`null` document reads as `null`. In `parse` mode both read as `null`.
+
+```ts
+await client.executeDdl('CREATE TABLE events (id OID PRIMARY KEY NOT NULL, payload JSONB NOT NULL)');
+
+// A GIN index serves @>, <@, ?, ?|, ?& and the equality of one key in a WHERE.
+await client.executeDdl('CREATE INDEX events_payload_gin ON events USING GIN (payload)');
+
+await client.execute('INSERT INTO events (id, payload) VALUES (GEN_ID(), @payload)', {
+  payload: { kind: 'login', user: { id: 7 } },
+});
+
+const result = await client.query<{ payload: { kind: string; user: { id: number } }; userId: string }>(
+  "SELECT payload, payload -> 'user' ->> 'id' AS userId FROM events WHERE payload @> @filter",
+  { filter: { kind: 'login' } },
+);
+
+const exact = await client.scalar<string>('SELECT payload FROM events LIMIT 1', undefined, { jsonb: 'text' });
+// '{"kind": "login", "user": {"id": 7}}'
+```
+
+The GIN index gives a set of candidate rows, and the server checks each candidate against the full
+predicate. The index does not serve a conjunct under `OR` or `NOT`, a join, or `@>` with `{}`, `[]`,
+or a scalar. `EXPLAIN` shows `gin-scan(...)` when the index is used.
+
+The `?` operators do not conflict with CamusDB parameters, because CamusDB parameters are `@name`. A
+tool that rewrites `?` as its own placeholder can use `jsonb_exists`, `jsonb_exists_any`, and
+`jsonb_exists_all` instead.
+
+> A driver before 0.12.0 refuses a plain object as a parameter, and it reads every `jsonb` cell as
+> `null`, with no error, on both transports. Upgrade the driver before you read `jsonb` columns.
 
 ### Dates
 

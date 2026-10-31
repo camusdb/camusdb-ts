@@ -44,7 +44,7 @@ import type { CamusOperation } from './telemetry.js';
 import { CamusRetryKind, operationName, recordRetry, startOperation, traced } from './telemetry.js';
 import { CamusTransaction } from './transaction.js';
 import type { CamusBranchRow, NonQueryTransportResult, TransportSqlRequest } from './transport/transport.js';
-import type { Int64Mode } from './values/decode.js';
+import type { Int64Mode, JsonbMode } from './values/decode.js';
 import type { Parameters } from './values/encode.js';
 import { encodeParameters } from './values/encode.js';
 
@@ -61,6 +61,9 @@ export interface StatementOptions {
 
   /** How an `int64` column reaches the caller, for this statement alone. */
   readonly int64?: Int64Mode | undefined;
+
+  /** How a `jsonb` column reaches the caller, for this statement alone. */
+  readonly jsonb?: JsonbMode | undefined;
 }
 
 /** Options for a statement that begins its own short transaction. */
@@ -1240,8 +1243,11 @@ export class CamusClient implements AsyncDisposable {
     return withDefaults(requested ?? {}, this.runtime.config.defaultTransactionOptions);
   }
 
-  private decodeOptions(options: StatementOptions): { int64: Int64Mode } {
-    return { int64: options.int64 ?? this.runtime.config.decode.int64 };
+  private decodeOptions(options: StatementOptions): { int64: Int64Mode; jsonb: JsonbMode } {
+    return {
+      int64: options.int64 ?? this.runtime.config.decode.int64,
+      jsonb: options.jsonb ?? this.runtime.config.decode.jsonb,
+    };
   }
 
   private async withTransientRetry<T>(

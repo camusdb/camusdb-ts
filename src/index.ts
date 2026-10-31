@@ -80,8 +80,9 @@ export type { ColumnValue } from './column-value.js';
 export { camus } from './values/typed.js';
 export type { TypedParameter } from './values/typed.js';
 export type { Parameters, ParameterValue } from './values/encode.js';
-export type { DecodeOptions, Int64Mode } from './values/decode.js';
+export type { DecodeOptions, Int64Mode, JsonbMode } from './values/decode.js';
 export { decodeValue } from './values/decode.js';
+export { formatJsonb, JSONB_MAX_NESTING_DEPTH } from './values/jsonb.js';
 
 export {
   CamusColumnStorage,

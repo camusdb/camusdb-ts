@@ -74,6 +74,9 @@ export function encodeValue(value: ColumnValue): GrpcValue {
     case ColumnType.Numeric:
       return { numericValue: value.strValue ?? '' };
 
+    case ColumnType.Jsonb:
+      return { jsonValue: value.strValue ?? '' };
+
     case ColumnType.Array:
       return { arrayValue: encodeArray(value) };
 
@@ -129,6 +132,10 @@ export function decodeValue(value: GrpcValue): ColumnValue {
     case 'numericValue':
       return { type: ColumnType.Numeric, strValue: value.numericValue ?? '' };
 
+    // The server sends the PostgreSQL text form, the form the REST decoder also gives.
+    case 'jsonValue':
+      return { type: ColumnType.Jsonb, strValue: value.jsonValue ?? '' };
+
     case 'arrayValue':
       return decodeArray(value.arrayValue);
 
@@ -159,6 +166,7 @@ const VALUE_KINDS: readonly ValueKind[] = [
   'arrayValue',
   'uuidValue',
   'numericValue',
+  'jsonValue',
   'nullValue',
 ];
 

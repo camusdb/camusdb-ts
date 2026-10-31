@@ -32,7 +32,7 @@ import {
 } from './branch-statements.js';
 import { readBody, sendHttp, sendJson, translateErrorBody } from './http.js';
 import { NDJSON_CONTENT_TYPE, NdjsonRowSource } from './ndjson-row-source.js';
-import { resultSetFromWire } from './rest-decode.js';
+import { keepJsonbText, resultSetFromWire } from './rest-decode.js';
 import type { RestPreparedStatement } from './rest-prepared-cache.js';
 import { RestPreparedStatementCache } from './rest-prepared-cache.js';
 import type {
@@ -192,7 +192,7 @@ export class RestTransport implements CamusTransport {
     let body: unknown;
 
     try {
-      body = parseLossless(text);
+      body = keepJsonbText(text, parseLossless(text), 'rows');
     } catch (error) {
       throw new CamusError(CamusErrorCode.Generic, 'The server returned a body that is not valid JSON.', {
         cause: error,
@@ -262,6 +262,7 @@ export class RestTransport implements CamusTransport {
       buildNonQueryBody(request, binding),
       request.timeoutSeconds,
       request.signal,
+      (parsed, text) => keepJsonbText(text, parsed, 'returningRows'),
     );
 
     // `columns` is present only for a write with RETURNING whose rows were not discarded. The rows
@@ -618,16 +619,21 @@ export class RestTransport implements CamusTransport {
     body: unknown,
     timeoutSeconds: number,
     signal: AbortSignal | undefined,
+    refine?: (parsed: unknown, text: string) => unknown,
   ): Promise<T> {
-    return sendJson<T>(this.pool, {
-      endpoint,
-      path,
-      method: 'POST',
-      body,
-      token: await this.token(signal),
-      timeoutSeconds,
-      signal,
-    });
+    return sendJson<T>(
+      this.pool,
+      {
+        endpoint,
+        path,
+        method: 'POST',
+        body,
+        token: await this.token(signal),
+        timeoutSeconds,
+        signal,
+      },
+      refine,
+    );
   }
 
   /**

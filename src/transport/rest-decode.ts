@@ -8,8 +8,9 @@
 import { ColumnType, isColumnType } from '../column-type.js';
 import type { ColumnValue } from '../column-value.js';
 import { NULL_VALUE } from '../column-value.js';
-import { asBigInt, asNumber } from '../json.js';
+import { asBigInt, asNumber, parseWithRawCells, RawJson } from '../json.js';
 import { CamusResultSet } from '../result-set.js';
+import { formatJsonb, formatJsonbValue } from '../values/jsonb.js';
 
 /**
  * Decodes the compact-raw wire form of a query result.
@@ -44,6 +45,34 @@ export function resultSetFromWire(columns: unknown, rows: unknown): CamusResultS
   }
 
   return new CamusResultSet(names, types, cells, rowCount);
+}
+
+/** The positions of the `jsonb` columns among `types`. */
+export function jsonbColumns(types: readonly ColumnType[]): Set<number> {
+  const positions = new Set<number>();
+
+  for (let i = 0; i < types.length; i++) {
+    if (types[i] === ColumnType.Jsonb) positions.add(i);
+  }
+
+  return positions;
+}
+
+/**
+ * A response body with each `jsonb` cell kept as its source text.
+ *
+ * `parseLossless` reads a document cell into JavaScript values, and a JavaScript number does not
+ * keep the scale of its text (`2.50`) or every digit of a long fraction. So when the body's
+ * `columns` has a `jsonb` column, the body is parsed again with `parseWithRawCells`, which keeps
+ * each cell of that column in the rows under `rowsKey` as a `RawJson`. A body without such a column
+ * is given back as it is, with no second parse.
+ */
+export function keepJsonbText(text: string, body: unknown, rowsKey: string): unknown {
+  if (typeof body !== 'object' || body === null || Array.isArray(body)) return body;
+
+  const columns = jsonbColumns(readSchema((body as { columns?: unknown }).columns).types);
+
+  return columns.size === 0 ? body : parseWithRawCells(text, { rowsKeys: [rowsKey], columns });
 }
 
 /** The output columns of a response's `columns` element. */
@@ -97,6 +126,10 @@ export function readSchema(columns: unknown): WireSchema {
  *
  * `elementType` is the schema's element type for an `Array` column, and `Null` when the server did
  * not report one.
+ *
+ * A `jsonb` cell is the document as native JSON. It is kept in the PostgreSQL text form, which is
+ * the form a gRPC cell carries. A REST row writes a JSON `null` document and SQL `NULL` as the same
+ * token, so over REST a document that is JSON `null` reads as SQL `NULL`.
  */
 export function decodeCell(
   cell: unknown,
@@ -104,6 +137,8 @@ export function decodeCell(
   elementType: ColumnType = ColumnType.Null,
 ): ColumnValue {
   if (cell === null || cell === undefined) return NULL_VALUE;
+
+  if (cell instanceof RawJson) return decodeJsonbText(cell.text);
 
   switch (declared) {
     case ColumnType.Id:
@@ -124,6 +159,9 @@ export function decodeCell(
     case ColumnType.Numeric:
       return decodeNumericCell(cell, declared);
 
+    case ColumnType.Jsonb:
+      return { type: ColumnType.Jsonb, strValue: formatJsonbValue(cell) };
+
     case ColumnType.Array:
       return decodeArrayCell(cell, elementType);
 
@@ -137,6 +175,13 @@ export function decodeCell(
 
       return decodeScalarByToken(cell, declared);
   }
+}
+
+/** A `jsonb` cell from its source text. The token `null` is SQL `NULL`, as for every other type. */
+function decodeJsonbText(text: string): ColumnValue {
+  const formatted = formatJsonb(text);
+
+  return formatted === 'null' ? NULL_VALUE : { type: ColumnType.Jsonb, strValue: formatted };
 }
 
 /** A `uuid` is wired as `[high, low]`, two big-endian 64-bit halves. A string is accepted too. */

@@ -10,10 +10,10 @@ import type { ColumnValue } from '../column-value.js';
 import { NULL_VALUE } from '../column-value.js';
 import { CamusError } from '../errors.js';
 import { CamusErrorCode } from '../error-codes.js';
-import { parseLossless } from '../json.js';
+import { parseLossless, parseWithRawCells } from '../json.js';
 import type { CamusRowSource } from '../row-source.js';
 import { sanitizeErrorText } from './error-text.js';
-import { decodeCell, readSchema } from './rest-decode.js';
+import { decodeCell, jsonbColumns, readSchema } from './rest-decode.js';
 
 /** The content type the streaming query endpoint serves and expects in `Accept`. */
 export const NDJSON_CONTENT_TYPE = 'application/x-ndjson';
@@ -40,6 +40,12 @@ export class NdjsonRowSource implements CamusRowSource {
   /** The element type of each `Array` column, or `Null` when the header did not report one. */
   private readonly elementTypes: readonly ColumnType[];
 
+  /**
+   * The positions of the `jsonb` columns. A row line with one is parsed with `parseWithRawCells`,
+   * so each document keeps its source text.
+   */
+  private readonly jsonbColumns: ReadonlySet<number>;
+
   private readonly lines: LineReader;
 
   private finished = false;
@@ -56,6 +62,7 @@ export class NdjsonRowSource implements CamusRowSource {
     this.columnNames = names;
     this.columnTypes = types;
     this.elementTypes = elementTypes;
+    this.jsonbColumns = jsonbColumns(types);
   }
 
   /** Reads the header line and reports a source positioned before the first row. */
@@ -127,7 +134,10 @@ export class NdjsonRowSource implements CamusRowSource {
     let parsed: unknown;
 
     try {
-      parsed = parseLossless(line);
+      parsed =
+        this.jsonbColumns.size === 0
+          ? parseLossless(line)
+          : parseWithRawCells(line, { columns: this.jsonbColumns });
     } catch (error) {
       // The header's parse is wrapped the same way. A row that escaped unwrapped would break the
       // `CamusError` contract the caller reads the stream under.

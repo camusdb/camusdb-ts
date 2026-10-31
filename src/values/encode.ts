@@ -10,6 +10,7 @@ import type { ColumnValue } from '../column-value.js';
 import { CamusError } from '../errors.js';
 import { CamusErrorCode } from '../error-codes.js';
 import { CamusObjectId } from '../object-id.js';
+import { isPlainObject, jsonbFromParameter } from './jsonb.js';
 import { dateToDayTicks, dateToTicks } from './ticks.js';
 import { isUuid, uuidToHalves } from './uuid.js';
 import { isTypedParameter, registerArrayEncoder } from './typed.js';
@@ -39,6 +40,8 @@ export type Parameters = Readonly<Record<string, ParameterValue>>;
  * - `Float32Array` — `Bytes`, packed as a vector. It is the natural JavaScript form of an
  *   embedding, and a packed float32 buffer has no other meaning in CamusDB.
  * - `CamusObjectId` — `Id`.
+ * - a plain object (`{ … }`) — `Jsonb`, as its JSON text. Use `camus.jsonb` for any other document:
+ *   a JSON array, a scalar, or JSON text in a string.
  * - an array — `Array`, with the element type inferred from the first element that is not null.
  *   When that element is a whole `number` and another element is a `number` that is not, the
  *   element type is `Float64`.
@@ -130,6 +133,9 @@ export function encodeAs(value: unknown, declared: ColumnType): ColumnValue {
     case ColumnType.Array:
       return encodeArray(value, ColumnType.Null);
 
+    case ColumnType.Jsonb:
+      return { type: ColumnType.Jsonb, strValue: jsonbFromParameter(value) };
+
     default:
       return invalid(`Cannot encode a value as ${columnTypeName(declared)}.`);
   }
@@ -194,6 +200,10 @@ function encodeInferred(value: unknown): ColumnValue {
     return encodeArray(value, ColumnType.Null);
   }
 
+  if (isPlainObject(value)) {
+    return { type: ColumnType.Jsonb, strValue: jsonbFromParameter(value) };
+  }
+
   return invalid(`Cannot bind a value of type ${describe(value)}.`);
 }
 
@@ -223,6 +233,11 @@ function encodeArray(value: unknown, declaredElementType: ColumnType): ColumnVal
       return invalid(
         'The server has no ARRAY(NUMERIC). Bind the elements as numbers, or as camus.float64 values.',
       );
+    }
+
+    // An array of documents is itself one document, and the server has no ARRAY(JSONB).
+    if (elementType === ColumnType.Jsonb) {
+      return invalid('The server has no ARRAY(JSONB). Bind one JSON array document with camus.jsonb([...]).');
     }
 
     if (elementType === ColumnType.Null && value.length > 0) {

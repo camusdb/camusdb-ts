@@ -62,7 +62,7 @@ export class NdjsonRowSource implements CamusRowSource {
     this.columnNames = names;
     this.columnTypes = types;
     this.elementTypes = elementTypes;
-    this.jsonbColumns = jsonbColumns(types);
+    this.jsonbColumns = jsonbColumns(types, elementTypes);
   }
 
   /** Reads the header line and reports a source positioned before the first row. */

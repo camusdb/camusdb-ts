@@ -7,6 +7,18 @@ numbers follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- Over REST, a `jsonb` document that is JSON `null` read as SQL `NULL`, because the default REST
+  row writes both as the token `null`. The driver now sends `jsonbAsText: true` on the query, the
+  streamed query, and the non-query routes. A server that supports the option writes each `jsonb`
+  cell as a JSON string that holds the document text, and marks the column with
+  `jsonbAsText: true`. The driver reads a cell as text only in a marked column, so a server older
+  than the option, which ignores it, is still read correctly. In `text` mode a JSON `null`
+  document now reads as `'null'` on both transports.
+- The text form also avoids a server defect: in the default REST form, a document nested 31 or
+  more levels deep failed the whole response with HTTP 500.
+
 ## [0.12.0] — 2026-10-31
 
 ### Added

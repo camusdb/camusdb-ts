@@ -1664,8 +1664,9 @@ describe.runIf(JSONB)('JSONB', () => {
         expect(rows.get('string')).toBe('{"plain": "string"}');
         expect(rows.get('sql-null')).toBeNull();
 
-        // gRPC tells the JSON null document from SQL NULL. A REST row writes both as the token null.
-        expect(rows.get('json-null')).toBe(options.protocol === 'grpc' ? 'null' : null);
+        // Both transports tell the JSON null document from SQL NULL. Over REST the driver asks for
+        // the text form (jsonbAsText), because the default REST row writes both as the token null.
+        expect(rows.get('json-null')).toBe('null');
 
         const parsed = await client.queryOne<{ doc: unknown }>(
           `SELECT doc FROM ${table} WHERE name = @name`,

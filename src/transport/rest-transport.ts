@@ -675,6 +675,12 @@ function buildQueryBody(
 
   if (request.routingAcceptVersion > 0) body.routingAcceptVersion = request.routingAcceptVersion;
 
+  // Each jsonb cell as a JSON string that holds the document text. In the default form a document
+  // that is JSON null and SQL NULL are the same token. The server marks each column it writes in
+  // this form, and only a marked column is read as text (see readSchema), so a server older than
+  // the field, which ignores it, is still read correctly.
+  body.jsonbAsText = true;
+
   return body;
 }
 

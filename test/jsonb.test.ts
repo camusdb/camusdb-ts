@@ -210,6 +210,32 @@ describe('a jsonb column on REST', () => {
       strValue: '{"a": [1, 2]}',
     });
   });
+
+  it('reads a column marked jsonbAsText as document text, and keeps JSON null apart from SQL NULL', () => {
+    const text =
+      '{"status":"ok","columns":[{"name":"id","type":2},{"name":"doc","type":13,"jsonbAsText":true}],' +
+      '"rows":[[1,"{\\"a\\": 2.50}"],[2,"null"],[3,"\\"abc\\""],[4,null]]}';
+
+    const parsed = parseLossless(text);
+
+    // Every jsonb column is in the text form, so the body needs no second parse.
+    expect(keepJsonbText(text, parsed, 'rows')).toBe(parsed);
+
+    const body = parsed as { columns: unknown; rows: unknown };
+    const result = resultSetFromWire(body.columns, body.rows);
+
+    expect(result.cell(0, 1)).toEqual({ type: ColumnType.Jsonb, strValue: '{"a": 2.50}' });
+    expect(result.cell(1, 1)).toEqual({ type: ColumnType.Jsonb, strValue: 'null' });
+    expect(result.cell(2, 1)).toEqual({ type: ColumnType.Jsonb, strValue: '"abc"' });
+    expect(decodeValue(result.cell(3, 1))).toBeNull();
+  });
+
+  it('reads an unmarked string cell as a string document, as a server older than jsonbAsText sends it', () => {
+    expect(decodeCell('{"a": 1}', ColumnType.Jsonb)).toEqual({
+      type: ColumnType.Jsonb,
+      strValue: '"{\\"a\\": 1}"',
+    });
+  });
 });
 
 describe('a jsonb value on gRPC', () => {
@@ -364,6 +390,55 @@ describe('jsonb over REST, end to end', () => {
 
     const sent = server.requestsTo('execute-sql-non-query').at(-1)!.body as { parameters?: unknown };
     expect(JSON.stringify(sent)).toContain('"type":13');
+  });
+
+  it('asks for the text form, and reads JSON null apart from SQL NULL when the server gives it', async () => {
+    server.json(
+      'execute-sql-query',
+      '{"status":"ok","columns":[{"name":"id","type":2},{"name":"payload","type":13,"jsonbAsText":true}],' +
+        '"rows":[[1,"{\\"price\\": 2.50}"],[2,"null"],[3,null]]}',
+    );
+
+    const result = await client().query('SELECT id, payload FROM events', undefined, { jsonb: 'text' });
+
+    expect(result.rows).toEqual([
+      { id: 1, payload: '{"price": 2.50}' },
+      { id: 2, payload: 'null' },
+      { id: 3, payload: null },
+    ]);
+
+    const sent = server.requestsTo('execute-sql-query').at(-1)!.body as { jsonbAsText?: unknown };
+    expect(sent.jsonbAsText).toBe(true);
+  });
+
+  it('reads RETURNING rows and streamed rows in the text form', async () => {
+    server.json(
+      'execute-sql-non-query',
+      '{"status":"ok","rows":1,"columns":[{"name":"payload","type":13,"jsonbAsText":true}],"returningRows":[["null"]]}',
+    );
+
+    await expect(
+      client().scalar('INSERT INTO events (payload) VALUES (@p) RETURNING payload', { p: camus.jsonb(null) }, { jsonb: 'text' }),
+    ).resolves.toBe('null');
+
+    expect((server.requestsTo('execute-sql-non-query').at(-1)!.body as { jsonbAsText?: unknown }).jsonbAsText).toBe(true);
+
+    server.on('execute-sql-query-stream', (_request, response) => {
+      respondNdjson(response, [
+        { columns: [{ name: 'payload', type: ColumnType.Jsonb, jsonbAsText: true }] },
+        '["null"]',
+        '[null]',
+        '["{\\"a\\": [1.0]}"]',
+        { status: 'ok' },
+      ]);
+    });
+
+    const rows: unknown[] = [];
+    const stream = await client().queryStream('SELECT payload FROM events', undefined, { jsonb: 'text' });
+    for await (const row of stream) rows.push(row);
+
+    expect(rows).toEqual([{ payload: 'null' }, { payload: null }, { payload: '{"a": [1.0]}' }]);
+    expect((server.requestsTo('execute-sql-query-stream').at(-1)!.body as { jsonbAsText?: unknown }).jsonbAsText).toBe(true);
   });
 
   it('keeps the text of a document in a streamed row', async () => {

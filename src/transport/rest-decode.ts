@@ -47,12 +47,26 @@ export function resultSetFromWire(columns: unknown, rows: unknown): CamusResultS
   return new CamusResultSet(names, types, cells, rowCount);
 }
 
-/** The positions of the `jsonb` columns among `types`. */
-export function jsonbColumns(types: readonly ColumnType[]): Set<number> {
+/**
+ * The value a `jsonb` column holds in the schema's element-type slot when the server marked it
+ * `jsonbAsText`: each cell is then a JSON string that holds the document text, not the document as
+ * native JSON. A `jsonb` column has no elements, so the slot is free for this mark.
+ *
+ * The mark comes only from the server. A server older than `jsonbAsText` ignores the request field
+ * and sends native JSON with no mark, and a string document such as `"abc"` is valid in both forms,
+ * so the form is never guessed from the token.
+ */
+export const JSONB_TEXT_FORM = ColumnType.String;
+
+/**
+ * The positions of the `jsonb` columns among `types` whose cells are native JSON. A column the
+ * server marked `jsonbAsText` is left out: its cells are plain strings and need no source text.
+ */
+export function jsonbColumns(types: readonly ColumnType[], elementTypes: readonly ColumnType[] = []): Set<number> {
   const positions = new Set<number>();
 
   for (let i = 0; i < types.length; i++) {
-    if (types[i] === ColumnType.Jsonb) positions.add(i);
+    if (types[i] === ColumnType.Jsonb && elementTypes[i] !== JSONB_TEXT_FORM) positions.add(i);
   }
 
   return positions;
@@ -70,7 +84,8 @@ export function jsonbColumns(types: readonly ColumnType[]): Set<number> {
 export function keepJsonbText(text: string, body: unknown, rowsKey: string): unknown {
   if (typeof body !== 'object' || body === null || Array.isArray(body)) return body;
 
-  const columns = jsonbColumns(readSchema((body as { columns?: unknown }).columns).types);
+  const { types, elementTypes } = readSchema((body as { columns?: unknown }).columns);
+  const columns = jsonbColumns(types, elementTypes);
 
   return columns.size === 0 ? body : parseWithRawCells(text, { rowsKeys: [rowsKey], columns });
 }
@@ -82,7 +97,8 @@ export interface WireSchema {
 
   /**
    * The element type of each `Array` column, and `Null` for every other column. A server that
-   * predates the `elementType` field reports none, so every entry is `Null` from one.
+   * predates the `elementType` field reports none, so every entry is `Null` from one. A `jsonb`
+   * column the server marked `jsonbAsText` holds {@link JSONB_TEXT_FORM}.
    */
   elementTypes: ColumnType[];
 }
@@ -96,7 +112,7 @@ export function readSchema(columns: unknown): WireSchema {
   const elementTypes: ColumnType[] = new Array<ColumnType>(columns.length);
 
   for (let i = 0; i < columns.length; i++) {
-    const column = columns[i] as { name?: unknown; type?: unknown; elementType?: unknown } | null;
+    const column = columns[i] as { name?: unknown; type?: unknown; elementType?: unknown; jsonbAsText?: unknown } | null;
 
     names[i] = typeof column?.name === 'string' ? column.name : '';
 
@@ -109,7 +125,9 @@ export function readSchema(columns: unknown): WireSchema {
     elementTypes[i] =
       types[i] === ColumnType.Array && isColumnType(elementType) && elementType !== ColumnType.Array
         ? elementType
-        : ColumnType.Null;
+        : types[i] === ColumnType.Jsonb && column?.jsonbAsText === true
+          ? JSONB_TEXT_FORM
+          : ColumnType.Null;
   }
 
   return { names, types, elementTypes };
@@ -127,9 +145,11 @@ export function readSchema(columns: unknown): WireSchema {
  * `elementType` is the schema's element type for an `Array` column, and `Null` when the server did
  * not report one.
  *
- * A `jsonb` cell is the document as native JSON. It is kept in the PostgreSQL text form, which is
- * the form a gRPC cell carries. A REST row writes a JSON `null` document and SQL `NULL` as the same
- * token, so over REST a document that is JSON `null` reads as SQL `NULL`.
+ * A `jsonb` cell has two forms. In a column the server marked `jsonbAsText` ({@link JSONB_TEXT_FORM}),
+ * it is a JSON string that holds the PostgreSQL text form, the form a gRPC cell carries, and a
+ * document that is JSON `null` is the string `"null"`. Otherwise it is the document as native JSON,
+ * kept in the text form; the token `null` is then SQL `NULL`, so a document that is JSON `null` reads
+ * as SQL `NULL`. That happens only with a server older than `jsonbAsText`.
  */
 export function decodeCell(
   cell: unknown,
@@ -160,6 +180,7 @@ export function decodeCell(
       return decodeNumericCell(cell, declared);
 
     case ColumnType.Jsonb:
+      if (elementType === JSONB_TEXT_FORM && typeof cell === 'string') return { type: ColumnType.Jsonb, strValue: cell };
       return { type: ColumnType.Jsonb, strValue: formatJsonbValue(cell) };
 
     case ColumnType.Array:

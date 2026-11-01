@@ -8,7 +8,8 @@
 import { CamusError } from '../errors.js';
 import { CamusErrorCode } from '../error-codes.js';
 import { asNumber, parseLossless } from '../json.js';
-import { readBody, sendHttp, translateErrorBody } from '../transport/http.js';
+import { envelopeError } from '../transport/error-text.js';
+import { sendHttpText, translateErrorBody } from '../transport/http.js';
 import type { CamusLoginClient, CamusLoginResult } from './login-client.js';
 
 interface LoginResponseBody {
@@ -33,7 +34,7 @@ export class RestLoginClient implements CamusLoginClient {
     timeoutSeconds: number,
     signal?: AbortSignal,
   ): Promise<CamusLoginResult> {
-    const { response } = await sendHttp(undefined, {
+    const { response, text } = await sendHttpText(undefined, {
       endpoint,
       path: ['login'],
       method: 'POST',
@@ -41,8 +42,6 @@ export class RestLoginClient implements CamusLoginClient {
       timeoutSeconds,
       signal,
     });
-
-    const text = await readBody(response);
 
     if (!response.ok) throw translateErrorBody(response.status, text);
 
@@ -68,17 +67,16 @@ export class RestLoginClient implements CamusLoginClient {
     }
 
     if (body === null || body.status !== 'ok' || body.token === undefined || body.token.length === 0) {
-      throw new CamusError(
-        body?.code ?? CamusErrorCode.AuthenticationFailed,
-        body?.message ?? 'Authentication failed',
-      );
+      throw envelopeError(body, CamusErrorCode.AuthenticationFailed, 'Authentication failed');
     }
 
     return { token: body.token, expiresInMs: readExpiryMs(body) };
   }
 
   async logout(endpoint: string, token: string, timeoutSeconds: number, signal?: AbortSignal): Promise<void> {
-    const { response } = await sendHttp(undefined, {
+    // The body carries nothing this driver reads on success, but it is read in full so the
+    // connection returns to the pool instead of staying half-read.
+    const { response, text } = await sendHttpText(undefined, {
       endpoint,
       path: ['logout'],
       method: 'POST',
@@ -87,11 +85,7 @@ export class RestLoginClient implements CamusLoginClient {
       signal,
     });
 
-    if (!response.ok) throw translateErrorBody(response.status, await readBody(response));
-
-    // The body carries nothing this driver reads, but it must be drained so the connection returns
-    // to the pool instead of staying half-read.
-    await readBody(response);
+    if (!response.ok) throw translateErrorBody(response.status, text);
   }
 }
 

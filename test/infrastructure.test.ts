@@ -128,6 +128,12 @@ describe('SharedRegistry', () => {
 describe('CamusStatementRouteCache', () => {
   const key = routeKey('test', 'SELECT 1', CamusRouteOpKind.Query);
 
+  it('keeps a space in a database name apart from the statement that follows it', () => {
+    expect(routeKey('a b', 'SELECT 1', CamusRouteOpKind.Query)).not.toBe(
+      routeKey('a', 'b SELECT 1', CamusRouteOpKind.Query),
+    );
+  });
+
   it('reports a miss for an unknown statement', () => {
     const cache = new CamusStatementRouteCache(10, 1024);
 

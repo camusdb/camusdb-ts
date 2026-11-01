@@ -288,3 +288,49 @@ describe('HttpVersion', () => {
     ).toThrow(CamusError);
   });
 });
+
+// Each of these names joins a cache key that a newline separates, so every entry point refuses a
+// control character in one.
+describe('control characters in a database name or an endpoint', () => {
+  it('refuses a database name with a newline in a connection string', () => {
+    expect(() => resolveConnectionString('Endpoint=http://localhost:8082;Database=a\nSELECT 1')).toThrow(
+      /control character/,
+    );
+  });
+
+  it('refuses an empty database name in a connection string', () => {
+    expect(() => resolveConnectionString('Endpoint=http://localhost:8082;Database=')).toThrow(
+      /Database is required/,
+    );
+  });
+
+  it('refuses a database name with a newline in an options object', () => {
+    expect(() => resolveOptions({ endpoint: 'http://localhost:8082', database: 'a\nb' })).toThrow(
+      /control character/,
+    );
+  });
+
+  it.each(['http://local\nhost:8082', 'http://localhost:8082/\tx', 'http://a:1,http://b\r:2'])(
+    'refuses the endpoint %j',
+    (endpoint) => {
+      expect(() => resolveOptions({ endpoint, database: 'test' })).toThrow(
+        /Endpoint holds a control character/,
+      );
+      expect(() => resolveConnectionString(`Endpoint=${endpoint};Database=test`)).toThrow(
+        /Endpoint holds a control character/,
+      );
+    },
+  );
+
+  it('refuses a backup endpoint with a control character', () => {
+    expect(() =>
+      resolveOptions({ endpoint: 'http://localhost:8082', database: 'test', backupEndpoint: 'http://b\n:1' }),
+    ).toThrow(/BackupEndpoint holds a control character/);
+  });
+
+  it('accepts the whitespace a connection string puts around an endpoint', () => {
+    expect(resolveOptions({ endpoint: ' http://a:1 , http://b:2 ', database: 'test' }).endpointList).toBe(
+      ' http://a:1 , http://b:2 ',
+    );
+  });
+});

@@ -5,10 +5,10 @@
  * file that was distributed with this source code.
  */
 
-import { CamusError } from './errors.js';
 import { CamusErrorCode } from './error-codes.js';
 import { asNumber } from './json.js';
 import type { ClientRuntime } from './runtime.js';
+import { envelopeError } from './transport/error-text.js';
 import { sendJson } from './transport/http.js';
 
 /** One backup in the node's catalog. */
@@ -167,7 +167,7 @@ export class CamusBackupClient {
     const reply = await this.send(path, 'POST', body, undefined, signal);
 
     if (reply.status !== 'ok' || reply.backup === undefined || reply.backup === null) {
-      throw new CamusError(reply.code ?? CamusErrorCode.Generic, reply.message ?? failureMessage);
+      throw envelopeError(reply, CamusErrorCode.Generic, failureMessage);
     }
 
     return readBackupInfo(reply.backup);
@@ -181,7 +181,7 @@ export class CamusBackupClient {
     const reply = await this.send(path, 'GET', undefined, undefined, signal);
 
     if (reply.status !== 'ok') {
-      throw new CamusError(reply.code ?? CamusErrorCode.Generic, reply.message ?? failureMessage);
+      throw envelopeError(reply, CamusErrorCode.Generic, failureMessage);
     }
 
     return (reply.backups ?? []).map(readBackupInfo);
@@ -197,10 +197,7 @@ export class CamusBackupClient {
     );
 
     if (reply.status !== 'ok') {
-      throw new CamusError(
-        reply.code ?? CamusErrorCode.Generic,
-        reply.message ?? 'Backup garbage collection failed',
-      );
+      throw envelopeError(reply, CamusErrorCode.Generic, 'Backup garbage collection failed');
     }
 
     return {

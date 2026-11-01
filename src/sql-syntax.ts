@@ -24,12 +24,14 @@ export function sqlLiteral(value: string, target: string): string {
 }
 
 /**
- * Refuses a value that cannot be written as a literal.
+ * Refuses a value that cannot be written as a literal on every server this driver supports.
  *
- * CamusDB's lexer reads a backslash and the character after it as one unit. A doubled quote
- * therefore stops escaping the quote when a backslash precedes it, and a trailing backslash
- * consumes the literal's closing quote. Neither case has a spelling, so both are refused here
- * rather than sent as a statement that would parse as something else.
+ * A CamusDB server from 0.9.9 on reads a backslash in a plain `'...'` string as an ordinary
+ * character, and only an `E'...'` string treats it as an escape. An older server reads a backslash
+ * and the character after it as one unit in every string. On such a server, a doubled quote stops
+ * escaping the quote when a backslash precedes it, and a trailing backslash consumes the literal's
+ * closing quote. Neither case has a spelling that both lexers read the same way, so both are
+ * refused here rather than sent as a statement that could parse as something else.
  */
 export function validateSqlLiteral(value: string, target: string): void {
   let index = value.indexOf('\\');
@@ -37,15 +39,15 @@ export function validateSqlLiteral(value: string, target: string): void {
   while (index >= 0) {
     if (index === value.length - 1) {
       throw new TypeError(
-        `The value for ${target} ends with a backslash. CamusDB's lexer reads a backslash and the ` +
-          "character after it as one unit, so a trailing backslash would consume the literal's closing quote.",
+        `The value for ${target} ends with a backslash. A CamusDB server before 0.9.9 reads a backslash ` +
+          "and the character after it as one unit, so a trailing backslash would consume the literal's closing quote.",
       );
     }
 
     if (value[index + 1] === "'") {
       throw new TypeError(
         `The value for ${target} has a backslash immediately before a quote at position ${String(index)}. ` +
-          'CamusDB’s lexer reads that pair as one unit, so the quote cannot be escaped.',
+          'A CamusDB server before 0.9.9 reads that pair as one unit, so the quote cannot be escaped.',
       );
     }
 
@@ -152,9 +154,9 @@ const RETURNING = 'RETURNING';
  * delimited identifier, or a comment, and not as part of a longer name or an `@placeholder`.
  *
  * `RETURNING` is a reserved word on the server, so a token match is the clause itself. A column or
- * a table called `returning` must be written with backticks, which this skips. The scan follows the
- * lexer rules that `validateSqlLiteral` describes: a backslash and the character after it are one
- * unit, and a doubled quote stays inside the literal.
+ * a table called `returning` must be written with backticks, which this skips. Literals are skipped
+ * with `skipQuoted`, the scan `sanitizeQueryText` uses too, so both read a string the way the
+ * server does.
  */
 export function hasReturningKeyword(sql: string): boolean {
   let i = 0;
@@ -163,7 +165,13 @@ export function hasReturningKeyword(sql: string): boolean {
     const c = sql[i]!;
 
     if (c === "'" || c === '"' || c === '`') {
-      i = skipDelimited(sql, i, c);
+      i = skipQuoted(sql, i, c, false);
+      continue;
+    }
+
+    // An `E'...'` string is the one kind in which a backslash escapes the next character.
+    if ((c === 'e' || c === 'E') && (sql[i + 1] === "'" || sql[i + 1] === '"')) {
+      i = skipQuoted(sql, i + 1, sql[i + 1]!, true);
       continue;
     }
 
@@ -200,28 +208,35 @@ function isWordCharacter(character: string): boolean {
   return /[\p{L}\p{Nd}_@$.]/u.test(character);
 }
 
-/** The index just past the closing delimiter, or the end of the text when the literal never closes. */
-function skipDelimited(sql: string, open: number, quote: string): number {
-  let j = open + 1;
+/**
+ * The index after the quoted run that opens at `index`, or the end of the text when the run never
+ * closes. A doubled quote is part of the run. A backslash escapes the next character only when
+ * `backslashEscapes` is set, which is for an `E'...'` string: the server reads a backslash in any
+ * other string as an ordinary character.
+ *
+ * @internal
+ */
+export function skipQuoted(sql: string, index: number, quote: string, backslashEscapes: boolean): number {
+  index++;
 
-  while (j < sql.length) {
-    const character = sql[j];
+  while (index < sql.length) {
+    const current = sql[index];
 
-    if (character === '\\' && quote !== '`') {
-      j += 2;
+    if (current === '\\' && backslashEscapes) {
+      index += 2;
       continue;
     }
 
-    if (character === quote) {
-      if (sql[j + 1] === quote) {
-        j += 2;
+    if (current === quote) {
+      if (sql[index + 1] === quote) {
+        index += 2;
         continue;
       }
 
-      return j + 1;
+      return index + 1;
     }
 
-    j++;
+    index++;
   }
 
   return sql.length;

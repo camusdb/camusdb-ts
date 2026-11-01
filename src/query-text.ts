@@ -5,6 +5,8 @@
  * file that was distributed with this source code.
  */
 
+import { skipQuoted } from './sql-syntax.js';
+
 /**
  * Reads a SQL text for the driver's spans: the tables it names, for `db.collection.name` and
  * `db.query.summary`, and a copy with its literal values removed, for `db.query.text` under
@@ -21,6 +23,12 @@
 
 /** The longest summary the driver writes. Longer summaries end at the last whole table. */
 export const MAX_SUMMARY_LENGTH = 255;
+
+/**
+ * The longest `db.query.text` the driver writes, in UTF-16 code units. A generated statement can
+ * run to megabytes, and a span attribute goes to every exporter on every execution.
+ */
+export const MAX_QUERY_TEXT_LENGTH = 4096;
 
 /** The text a sanitized SQL text has in place of each literal value. */
 const PLACEHOLDER = '?';
@@ -158,6 +166,21 @@ export function querySummary(
 }
 
 /**
+ * `text` cut to `MAX_QUERY_TEXT_LENGTH` code units, with `…` after a cut. A cut never splits a
+ * surrogate pair.
+ */
+export function truncateQueryText(text: string): string {
+  if (text.length <= MAX_QUERY_TEXT_LENGTH) return text;
+
+  let end = MAX_QUERY_TEXT_LENGTH - 1;
+  const last = text.charCodeAt(end - 1);
+
+  if (last >= 0xd800 && last <= 0xdbff) end--;
+
+  return `${text.slice(0, end)}…`;
+}
+
+/**
  * `sql` with each string, number and bytes literal replaced by `?`, each comment removed, and each
  * list of two or more `?` written as `?, ...`. Identifiers, keywords and `@` parameters are kept as
  * they are.
@@ -247,37 +270,6 @@ function tokenize(sql: string): Token[] {
   }
 
   return tokens;
-}
-
-/**
- * The index after the quoted run that opens at `index`. A doubled quote is part of the run. A
- * backslash escapes the next character only in an `E'...'` string: in any other string it is an
- * ordinary character, as the server reads it.
- */
-function skipQuoted(sql: string, index: number, quote: string, backslashEscapes: boolean): number {
-  index++;
-
-  while (index < sql.length) {
-    const current = sql[index];
-
-    if (current === '\\' && backslashEscapes) {
-      index += 2;
-      continue;
-    }
-
-    if (current === quote) {
-      if (index + 1 < sql.length && sql[index + 1] === quote) {
-        index += 2;
-        continue;
-      }
-
-      return index + 1;
-    }
-
-    index++;
-  }
-
-  return sql.length;
 }
 
 function skipNumber(sql: string, index: number): number {

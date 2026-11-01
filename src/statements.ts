@@ -101,6 +101,9 @@ const PREPARABLE_PREFIXES = ['SELECT', '(', 'INSERT', 'UPSERT', 'UPDATE', 'DELET
  */
 const OWN_TRANSACTION_PREFIXES = ['TRUNCATE'];
 
+/** A placeholder as the server's lexer reads one: `@`, then ASCII letters, digits, or `_`. */
+const PLACEHOLDER = /^@[A-Za-z0-9_]+$/;
+
 /** True when the statement goes to the DDL route. */
 export function isDdlStatement(sql: string): boolean {
   return startsWithAny(sql, DDL_PREFIXES);
@@ -131,9 +134,11 @@ export function isWriteReturning(sql: string): boolean {
  * The arguments follow the order of the parameter object's keys, because a procedure takes its
  * arguments by position. A key that is a whole number, such as `'0'`, comes first in JavaScript
  * whatever its place in the object literal, so use names. The server reads the procedure name only
- * as a plain identifier, so any other name is refused here, before a request.
+ * as a plain identifier, so any other name is refused here, before a request. The parameter names
+ * become SQL text too, so each one must be a placeholder the server reads as one token.
  *
  * @throws {TypeError} when the procedure name is not a plain identifier.
+ * @throws {CamusError} `InvalidParameter` when a parameter name is empty or is not a placeholder.
  */
 export function callStatement(procedure: string, parameters?: Parameters): string {
   const name = procedure.trim();
@@ -150,7 +155,19 @@ export function callStatement(procedure: string, parameters?: Parameters): strin
       throw new CamusError(CamusErrorCode.InvalidParameter, 'A parameter name cannot be empty.');
     }
 
-    return key.startsWith('@') ? key : `@${key}`;
+    const placeholder = key.startsWith('@') ? key : `@${key}`;
+
+    // The key becomes SQL text, not a bound value, so it must be a placeholder the server lexes as
+    // one token. Anything else could close the argument list and append a statement.
+    if (!PLACEHOLDER.test(placeholder)) {
+      throw new CamusError(
+        CamusErrorCode.InvalidParameter,
+        `'${key}' is not a parameter name for CALL. A parameter name must be ASCII letters, digits, ` +
+          "or '_', with an optional leading '@'.",
+      );
+    }
+
+    return placeholder;
   });
 
   return `CALL ${name}(${placeholders.join(', ')})`;

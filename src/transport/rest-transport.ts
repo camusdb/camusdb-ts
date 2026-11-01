@@ -30,7 +30,8 @@ import {
   showAncestorsSql,
   showBranchesSql,
 } from './branch-statements.js';
-import { readBody, sendHttp, sendJson, translateErrorBody } from './http.js';
+import { envelopeError } from './error-text.js';
+import { openHttp, readBody, sendHttpText, sendJson, translateErrorBody } from './http.js';
 import { NDJSON_CONTENT_TYPE, NdjsonRowSource } from './ndjson-row-source.js';
 import { keepJsonbText, resultSetFromWire } from './rest-decode.js';
 import type { RestPreparedStatement } from './rest-prepared-cache.js';
@@ -127,7 +128,7 @@ export class RestTransport implements CamusTransport {
     );
 
     if (body.status !== 'ok') {
-      throw new CamusError(body.code ?? CamusErrorCode.Generic, body.message ?? 'Empty result returned');
+      throw envelopeError(body, CamusErrorCode.Generic, 'Empty result returned');
     }
 
     return {
@@ -158,10 +159,7 @@ export class RestTransport implements CamusTransport {
     );
 
     if (body.status !== 'ok') {
-      throw new CamusError(
-        body.code ?? CamusErrorCode.Generic,
-        body.message ?? (commit ? 'Commit failed' : 'Rollback failed'),
-      );
+      throw envelopeError(body, CamusErrorCode.Generic, commit ? 'Commit failed' : 'Rollback failed');
     }
   }
 
@@ -175,7 +173,7 @@ export class RestTransport implements CamusTransport {
     request: TransportSqlRequest,
     binding: PreparedBinding | undefined,
   ): Promise<QueryTransportResult> {
-    const { response } = await sendHttp(this.pool, {
+    const { response, text } = await sendHttpText(this.pool, {
       endpoint: request.endpoint,
       path: ['execute-sql-query'],
       method: 'POST',
@@ -184,8 +182,6 @@ export class RestTransport implements CamusTransport {
       timeoutSeconds: request.timeoutSeconds,
       signal: request.signal,
     });
-
-    const text = await readBody(response);
 
     if (!response.ok) throw translateErrorBody(response.status, text);
 
@@ -220,7 +216,7 @@ export class RestTransport implements CamusTransport {
     request: TransportSqlRequest,
     binding: PreparedBinding | undefined,
   ): Promise<CamusRowSource> {
-    const { response } = await sendHttp(this.pool, {
+    const { response, signal, release } = await openHttp(this.pool, {
       endpoint: request.endpoint,
       path: ['execute-sql-query-stream'],
       method: 'POST',
@@ -231,10 +227,18 @@ export class RestTransport implements CamusTransport {
       signal: request.signal,
     });
 
-    // A failure to set the statement up — bad SQL, an unknown database — arrives as a non-2xx
-    // before the first line. A conflict that surfaces after rows start flowing is reported by the
-    // NDJSON trailer instead, and raised from the read that reaches it.
-    if (!response.ok) throw translateErrorBody(response.status, await readBody(response));
+    // The deadline covers the request and an error body, but not the rows: a stream that the
+    // caller reads for longer than the timeout is not a failure.
+    try {
+      // A failure to set the statement up — bad SQL, an unknown database — arrives as a non-2xx
+      // before the first line. A conflict that surfaces after rows start flowing is reported by the
+      // NDJSON trailer instead, and raised from the read that reaches it.
+      if (!response.ok) {
+        throw translateErrorBody(response.status, await readBody(response, undefined, signal));
+      }
+    } finally {
+      release();
+    }
 
     if (response.body === null) {
       throw new CamusError(CamusErrorCode.Generic, 'The streaming query response carried no body.');
@@ -355,7 +359,7 @@ export class RestTransport implements CamusTransport {
     });
 
     if (body.status !== 'ok') {
-      throw new CamusError(body.code ?? CamusErrorCode.Generic, body.message ?? 'Node stats failed');
+      throw envelopeError(body, CamusErrorCode.Generic, 'Node stats failed');
     }
 
     return nodeStatsFromWire(endpoint, body);
@@ -379,7 +383,7 @@ export class RestTransport implements CamusTransport {
     );
 
     if (body.status !== 'ok') {
-      throw new CamusError(body.code ?? CamusErrorCode.Generic, body.message ?? 'Create database failed');
+      throw envelopeError(body, CamusErrorCode.Generic, 'Create database failed');
     }
   }
 
@@ -420,7 +424,7 @@ export class RestTransport implements CamusTransport {
     );
 
     if (body.status !== 'ok') {
-      throw new CamusError(body.code ?? CamusErrorCode.Generic, body.message ?? 'Drop database failed');
+      throw envelopeError(body, CamusErrorCode.Generic, 'Drop database failed');
     }
   }
 
@@ -522,7 +526,7 @@ export class RestTransport implements CamusTransport {
     );
 
     if (body.status !== 'ok' || body.statementId === undefined || body.statementId.length === 0) {
-      throw new CamusError(body.code ?? CamusErrorCode.Generic, body.message ?? 'Prepare statement failed');
+      throw envelopeError(body, CamusErrorCode.Generic, 'Prepare statement failed');
     }
 
     return { statementId: body.statementId, parameterNames: body.parameterNames ?? [] };

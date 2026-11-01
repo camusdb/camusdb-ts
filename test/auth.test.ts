@@ -3,7 +3,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { credentialsFromPassword, credentialsFromToken, NO_CREDENTIALS } from '../src/auth/credentials.js';
 import type { CamusLoginClient, CamusLoginResult } from '../src/auth/login-client.js';
 import { RestLoginClient } from '../src/auth/rest-login-client.js';
-import { CamusTokenProvider } from '../src/auth/token-provider.js';
+import { CamusTokenProvider, MAX_REPORTED_TOKEN_LIFETIME_MS } from '../src/auth/token-provider.js';
 import { CamusError } from '../src/errors.js';
 import { AuthenticatingTransport } from '../src/transport/authenticating-transport.js';
 import type { CamusTransport, TransportSqlRequest } from '../src/transport/transport.js';
@@ -106,6 +106,25 @@ describe('CamusTokenProvider', () => {
 
     expect(tokens).toEqual(['token-1', 'token-1', 'token-1']);
     expect(client.logins).toBe(1);
+  });
+
+  it('caps a lifetime the server reported at one day', async () => {
+    const tenYears = 10 * 365 * MAX_REPORTED_TOKEN_LIFETIME_MS;
+    const client = new ScriptedLoginClient(tenYears);
+    const auth = provider(client);
+
+    let now = 0;
+    auth.clock = () => now;
+
+    expect(await auth.getToken()).toBe('token-1');
+
+    now = MAX_REPORTED_TOKEN_LIFETIME_MS * 0.8 + 1;
+    expect(await auth.getToken()).toBe('token-1');
+    expect(auth.loginInFlight).toBe(true);
+
+    await settled(auth);
+
+    expect(await auth.getToken()).toBe('token-2');
   });
 
   it('renews in the background at 80% of the lifetime the server reported', async () => {

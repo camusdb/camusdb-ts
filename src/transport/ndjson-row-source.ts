@@ -66,8 +66,11 @@ export class NdjsonRowSource implements CamusRowSource {
   }
 
   /** Reads the header line and reports a source positioned before the first row. */
-  static async create(body: ReadableStream<Uint8Array>): Promise<NdjsonRowSource> {
-    const lines = new LineReader(body);
+  static async create(
+    body: ReadableStream<Uint8Array>,
+    maxLineLength = MAX_LINE_LENGTH,
+  ): Promise<NdjsonRowSource> {
+    const lines = new LineReader(body, maxLineLength);
 
     let header: string | undefined;
 
@@ -215,6 +218,12 @@ function throwIfFailed(meta: Record<string, unknown>): void {
 }
 
 /**
+ * The longest line, in UTF-16 code units, that the reader holds. It matches the gRPC transport's
+ * per-message limit, so the largest row is about the same on both transports.
+ */
+const MAX_LINE_LENGTH = 64 * 1024 * 1024;
+
+/**
  * Splits a byte stream into newline-terminated strings.
  *
  * A JSON line can be split across any number of network reads, so the tail of an incomplete line
@@ -235,8 +244,11 @@ class LineReader {
 
   private closed = false;
 
-  constructor(stream: ReadableStream<Uint8Array>) {
+  private readonly maxLineLength: number;
+
+  constructor(stream: ReadableStream<Uint8Array>, maxLineLength: number) {
     this.reader = stream.getReader();
+    this.maxLineLength = maxLineLength;
   }
 
   /** The next line without its terminator, or `undefined` at the end of the stream. */
@@ -255,6 +267,17 @@ class LineReader {
 
       // Everything held has now been examined; the next search resumes at what the next read adds.
       this.searched = this.buffer.length;
+
+      // One line is one row, so a line with no end in sight is a server that never ends the row.
+      // Holding it all would defeat the streaming this source exists for.
+      if (this.buffer.length > this.maxLineLength) {
+        await this.close();
+        throw new CamusError(
+          CamusErrorCode.Generic,
+          `The streaming query response holds a line longer than ${String(this.maxLineLength)} characters, ` +
+            'which this client does not read into memory.',
+        );
+      }
 
       if (this.eof) return this.takeRemainder();
 

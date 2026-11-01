@@ -154,7 +154,14 @@ export class CamusStatementRouteCache {
   }
 }
 
-/** The cache key for one statement. The separator cannot appear in a kind or a database name. */
+/**
+ * The cache key for one statement.
+ *
+ * A newline separates the parts, as in the other statement caches. A kind never holds one, and the
+ * configuration refuses every control character in a database name, so only the last part, the
+ * SQL text, can hold a newline and the key stays unambiguous. A space would not do: it is legal in
+ * a database name and is in almost every statement.
+ */
 export function routeKey(database: string, sql: string, kind: CamusRouteOpKind): string {
-  return `${String(kind)} ${database} ${sql}`;
+  return `${String(kind)}\n${database}\n${sql}`;
 }

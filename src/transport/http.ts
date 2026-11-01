@@ -41,16 +41,33 @@ export interface HttpRequestInit {
 }
 
 /**
- * An HTTP response whose body has not been read yet. The streaming query endpoint needs the raw
- * body, and every other route reads it as JSON.
+ * An HTTP response whose body has not been read yet, and the deadline of its request.
+ *
+ * The deadline stays in force until `release` is called, so a body read before then is held to the
+ * same timeout as the request. A caller must call `release` once, after the body is read or once it
+ * hands the body to a stream reader that has no deadline.
  */
-export interface HttpResponse {
+export interface HttpExchange {
   readonly status: number;
   readonly response: Response;
+
+  /** The signal that ends the request, or `undefined` when it has no deadline and no caller signal. */
+  readonly signal: AbortSignal | undefined;
+
+  /** Clears the deadline and releases the caller's signal. Safe to call more than once. */
+  readonly release: () => void;
+}
+
+/** A response with its body read as text. */
+export interface HttpTextResponse {
+  readonly status: number;
+  readonly response: Response;
+  readonly text: string;
 }
 
 /**
- * Sends one request and reports the response, whatever its status.
+ * Sends one request and reports the response, whatever its status, with the deadline still in
+ * force.
  *
  * A failure to reach the node at all — a refused connection, a DNS failure, a deadline — is turned
  * into a `CamusError` here, and the endpoint is set aside in the pool. A non-2xx status is left to
@@ -59,10 +76,10 @@ export interface HttpResponse {
  * A cancellation the caller asked for is re-thrown as it is. It is not a database failure, the
  * node is not unreachable, and turning it into a `CamusError` would hide the caller's own intent.
  */
-export async function sendHttp(
+export async function openHttp(
   pool: CamusEndpointPool | undefined,
   init: HttpRequestInit,
-): Promise<HttpResponse> {
+): Promise<HttpExchange> {
   const url = buildUrl(init.endpoint, init.path, init.query);
 
   const headers: Record<string, string> = { Accept: init.accept ?? 'application/json' };
@@ -90,16 +107,45 @@ export async function sendHttp(
       redirect: 'error',
     });
 
-    return { status: response.status, response };
+    return { status: response.status, response, signal, release: dispose };
   } catch (error) {
+    dispose();
+
     // The caller ended the request. That is not a transport failure and the node is fine.
     if (init.signal?.aborted === true) throw error;
 
     pool?.markUnreachable(init.endpoint);
 
     throw new CamusError(CamusErrorCode.Generic, describeTransportFailure(url, error), { cause: error });
+  }
+}
+
+/**
+ * Sends one request and reads its whole body as text, whatever the status.
+ *
+ * The request's deadline covers the body as well as the headers. Without that, a server that
+ * sends its headers and then sends the body slowly, or never ends it, would hold the call open
+ * with no limit. A body that misses the deadline sets the endpoint aside, as a request that
+ * misses it does.
+ */
+export async function sendHttpText(
+  pool: CamusEndpointPool | undefined,
+  init: HttpRequestInit,
+): Promise<HttpTextResponse> {
+  const exchange = await openHttp(pool, init);
+
+  try {
+    const text = await readBody(exchange.response, MAX_RESPONSE_BODY_BYTES, exchange.signal);
+
+    return { status: exchange.status, response: exchange.response, text };
+  } catch (error) {
+    if (exchange.signal?.aborted === true && init.signal?.aborted !== true) {
+      pool?.markUnreachable(init.endpoint);
+    }
+
+    throw error;
   } finally {
-    dispose();
+    exchange.release();
   }
 }
 
@@ -114,9 +160,7 @@ export async function sendJson<T>(
   init: HttpRequestInit,
   refine?: (parsed: unknown, text: string) => unknown,
 ): Promise<T> {
-  const { response } = await sendHttp(pool, init);
-
-  const text = await readBody(response);
+  const { response, text } = await sendHttpText(pool, init);
 
   if (!response.ok) throw translateErrorBody(response.status, text);
 
@@ -170,13 +214,94 @@ export function translateErrorBody(status: number, text: string): CamusError {
   return new CamusError(CamusErrorCode.Generic, `The server answered HTTP ${String(status)} with no body.`);
 }
 
-/** Reads a body as text, reporting an empty string when it cannot be read. */
-export async function readBody(response: Response): Promise<string> {
-  try {
-    return await response.text();
-  } catch {
-    return '';
+/**
+ * The largest response body read into memory. Every byte of a server's body is the far end's
+ * choice, so without a limit a hostile or broken server could make the client allocate until the
+ * process fails. A result larger than this belongs on the streaming query route.
+ */
+export const MAX_RESPONSE_BODY_BYTES = 256 * 1024 * 1024;
+
+/**
+ * Reads a body as text, reporting an empty string when it cannot be read.
+ *
+ * `signal` is the signal of the request. When it ended the read, its reason is thrown rather than
+ * an empty body: the timeout's `CamusError`, or the caller's own cancellation as it is.
+ *
+ * @throws {CamusError} when the body is larger than `limit` bytes. The read stops at the limit and
+ * the rest of the body is discarded.
+ */
+export async function readBody(
+  response: Response,
+  limit = MAX_RESPONSE_BODY_BYTES,
+  signal?: AbortSignal,
+): Promise<string> {
+  const declared = Number(response.headers.get('content-length') ?? Number.NaN);
+
+  if (Number.isFinite(declared) && declared > limit) {
+    await discard(response.body as ReadableStream<Uint8Array> | null);
+    throw bodyTooLarge(limit);
   }
+
+  if (response.body === null) return '';
+
+  const reader = (response.body as ReadableStream<Uint8Array>).getReader();
+  const chunks: Uint8Array[] = [];
+  let received = 0;
+
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+
+      if (done) break;
+
+      received += value.byteLength;
+
+      if (received > limit) break;
+
+      chunks.push(value);
+    }
+  } catch (error) {
+    if (signal?.aborted === true) throw signal.reason ?? error;
+    return '';
+  } finally {
+    if (received > limit) await reader.cancel().catch(() => undefined);
+    reader.releaseLock();
+  }
+
+  if (received > limit) throw bodyTooLarge(limit);
+
+  return decodeUtf8(chunks, received);
+}
+
+function bodyTooLarge(limit: number): CamusError {
+  return new CamusError(
+    CamusErrorCode.Generic,
+    `The server returned a body larger than ${String(limit)} bytes, which this client does not read ` +
+      'into memory. Read a large result with the streaming query API.',
+  );
+}
+
+async function discard(body: ReadableStream<Uint8Array> | null): Promise<void> {
+  try {
+    await body?.cancel();
+  } catch {
+    // The stream is already gone. Nothing is left to release.
+  }
+}
+
+/** Decodes the chunks as one UTF-8 text, as `Response.text()` does. */
+function decodeUtf8(chunks: readonly Uint8Array[], length: number): string {
+  if (chunks.length === 1) return new TextDecoder('utf-8').decode(chunks[0]);
+
+  const bytes = new Uint8Array(length);
+  let offset = 0;
+
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+
+  return new TextDecoder('utf-8').decode(bytes);
 }
 
 function buildUrl(

@@ -18,6 +18,8 @@
  * expressions.
  */
 
+import { CamusError } from '../errors.js';
+
 /** The longest message kept. A server error body is a sentence; anything longer is echoed content. */
 export const MAX_ERROR_MESSAGE_LENGTH = 2048;
 
@@ -60,6 +62,24 @@ export function sanitizeErrorText(text: string | undefined | null): string {
   }
 
   return index < text.length ? clean + ELIDED : clean;
+}
+
+/**
+ * The error a failed `{status, code, message}` envelope reports.
+ *
+ * A server can report a failure in the body of an HTTP 2xx reply. That message is the far end's
+ * text exactly as much as a non-2xx body is, so it goes through `sanitizeErrorText` too. A field of
+ * the wrong type, or an empty one, falls back to the driver's own code or message.
+ */
+export function envelopeError(
+  envelope: { readonly code?: unknown; readonly message?: unknown } | null | undefined,
+  fallbackCode: string,
+  fallbackMessage: string,
+): CamusError {
+  const code = typeof envelope?.code === 'string' && envelope.code.length > 0 ? envelope.code : fallbackCode;
+  const message = typeof envelope?.message === 'string' ? sanitizeErrorText(envelope.message) : '';
+
+  return new CamusError(code, message.length > 0 ? message : fallbackMessage);
 }
 
 function matchSecretPrefix(lowercase: string, index: number): number | undefined {

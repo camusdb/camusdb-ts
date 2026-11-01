@@ -747,6 +747,9 @@ await client.call('transfer', { from: 'alice', to: 'bob', amount: 30 });
 
 - The procedure name must be a plain identifier: a letter or `_`, then letters, digits, or `_`. Any
   other text throws `TypeError` before the driver sends the call.
+- Each parameter name becomes SQL text, so it must be ASCII letters, digits, or `_`, with an
+  optional leading `@`. Any other name throws a `CamusError` with the code `CADB0400` before the
+  driver sends the call.
 - JavaScript puts a key that is a whole number, such as `'0'`, before the other keys. So give the
   parameters names.
 - Only input parameters are supported. A procedure has no output parameters and no return value.
@@ -1548,6 +1551,14 @@ await CamusTransportPool.closeAll();
 - **The driver never follows a redirect.** A redirected statement would leave the configured
   endpoint and take its bearer token with it.
 - **Error text is sanitized.** See [Errors](#errors).
+- **A response cannot fill the client's memory.** The driver reads at most 256 MiB of one REST
+  response body, and at most 64 MiB of one line of a streamed result. A larger response throws a
+  `CamusError`. Use `queryStream` for a large result.
+- **A token lifetime has a ceiling.** The driver uses the lifetime that the server reports for a
+  token, up to 24 hours. A longer reported lifetime is read as 24 hours, so the driver still
+  renews the token.
+- **A control character is refused in a database name or an endpoint.** This applies to an options
+  object, a connection string, and `changeDatabase`.
 - **A token key is hashed and salted.** The map key that shares a token holds no plaintext
   password, and cannot be tested against a guessed one outside the process.
 

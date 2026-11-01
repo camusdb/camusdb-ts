@@ -27,6 +27,13 @@ export const DEFAULT_TOKEN_LIFETIME_MS = 600_000;
 const USABLE_SHARE_OF_REPORTED_LIFETIME = 0.95;
 
 /**
+ * The longest server-reported lifetime the provider accepts. The server is the authority on how
+ * short a token lives, not on how long the client keeps one: a reply that reported a decade would
+ * keep one bearer token in use for a decade and retire the client's rotation.
+ */
+export const MAX_REPORTED_TOKEN_LIFETIME_MS = 24 * 60 * 60 * 1000;
+
+/**
  * How long the provider waits before it starts another background renewal after one failed. The
  * token is still valid, so the wait costs nothing. Without the wait, every statement after a failed
  * renewal would start a new login, against a server that is down or rate-limits this account.
@@ -404,10 +411,13 @@ export class CamusTokenProvider {
    *
    * The server's reported lifetime is authoritative — its own setting is configurable and may be
    * shorter than any value the driver defaults to — so the provider renews at 80% of it, and sends
-   * the token until 95% of it. Without a reported value, the configured lifetime is the lifetime
-   * the driver assumes: it renews at 80% of it, and does not send the token past it.
+   * the token until 95% of it. A reported lifetime longer than `MAX_REPORTED_TOKEN_LIFETIME_MS` is
+   * read as that maximum. Without a reported value, the configured lifetime is the lifetime the
+   * driver assumes: it renews at 80% of it, and does not send the token past it.
    */
   private deadlines(reported: number | undefined): { renewAfterMs: number; expiresAfterMs: number } {
+    if (reported !== undefined) reported = Math.min(reported, MAX_REPORTED_TOKEN_LIFETIME_MS);
+
     let expiresAfterMs =
       reported === undefined ? this.lifetimeMs : reported * USABLE_SHARE_OF_REPORTED_LIFETIME;
     let renewAfterMs = (reported ?? this.lifetimeMs) * 0.8;

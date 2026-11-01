@@ -290,17 +290,11 @@ export function resolveOptions(options: CamusClientOptions): ResolvedConfig {
     throw new CamusError(CamusErrorCode.Generic, 'Endpoint is required.');
   }
 
-  if (typeof options.database !== 'string' || options.database.trim().length === 0) {
+  if (typeof options.database !== 'string') {
     throw new CamusError(CamusErrorCode.Generic, 'Database is required.');
   }
 
-  if (!isValidDatabaseName(options.database)) {
-    throw new CamusError(
-      CamusErrorCode.Generic,
-      'Database holds a control character. A database name is part of a cache key that a newline ' +
-        'separates, so a control character cannot appear in one.',
-    );
-  }
+  ensureValidDatabase(options.database);
 
   const config: ResolvedConfig = {
     endpointList,
@@ -339,6 +333,7 @@ export function resolveOptions(options: CamusClientOptions): ResolvedConfig {
     connectionString: undefined,
   };
 
+  ensureEndpointsHoldNoControlCharacters(config);
   ensureCredentialsAreNotSentInClear(config);
 
   return config;
@@ -359,6 +354,8 @@ export function resolveConnectionString(connectionString: string): ResolvedConfi
   if (database === undefined) {
     throw new CamusError(CamusErrorCode.Generic, 'Database is required.');
   }
+
+  ensureValidDatabase(database);
 
   const config: ResolvedConfig = {
     endpointList,
@@ -415,9 +412,60 @@ export function resolveConnectionString(connectionString: string): ResolvedConfi
     connectionString,
   };
 
+  ensureEndpointsHoldNoControlCharacters(config);
   ensureCredentialsAreNotSentInClear(config);
 
   return config;
+}
+
+/**
+ * Refuses a database name that is empty or that holds a control character.
+ *
+ * Every way a database name enters the client goes through this test: an options object, a
+ * connection string, and `changeDatabase`. The prepared-statement policy, the gRPC batcher, and
+ * the REST prepared-statement cache each join a database name and a statement with a newline, and
+ * the keys are unambiguous only while no database name holds one.
+ */
+function ensureValidDatabase(database: string): void {
+  if (database.trim().length === 0) {
+    throw new CamusError(CamusErrorCode.Generic, 'Database is required.');
+  }
+
+  if (!isValidDatabaseName(database)) {
+    throw new CamusError(
+      CamusErrorCode.Generic,
+      'Database holds a control character. A database name is part of a cache key that a newline ' +
+        'separates, so a control character cannot appear in one.',
+    );
+  }
+}
+
+/**
+ * Refuses an endpoint that holds a control character.
+ *
+ * The REST prepared-statement cache joins an endpoint, a database name, and a statement with
+ * newlines, so a newline in an endpoint would make two distinct keys collide. A URL parser also
+ * removes a tab or a newline from inside a URL without an error, so the address that is called
+ * would not be the text that was written. No endpoint needs a control character.
+ */
+function ensureEndpointsHoldNoControlCharacters(config: ResolvedConfig): void {
+  const endpoints: Array<[key: string, endpoint: string]> = config.endpointList
+    .split(',')
+    .map((endpoint) => ['Endpoint', endpoint]);
+
+  if (config.backupEndpoint !== undefined) {
+    endpoints.push(['BackupEndpoint', config.backupEndpoint]);
+  }
+
+  for (const [key, endpoint] of endpoints) {
+    // eslint-disable-next-line no-control-regex -- the point of the test is to find these characters.
+    if (/[\u0000-\u001f\u007f]/.test(endpoint.trim())) {
+      throw new CamusError(
+        CamusErrorCode.Generic,
+        `The ${key} holds a control character, which no URL needs.`,
+      );
+    }
+  }
 }
 
 /**

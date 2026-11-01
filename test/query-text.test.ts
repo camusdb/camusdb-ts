@@ -1,6 +1,14 @@
 import { describe, expect, it } from 'vitest';
 
-import { MAX_SUMMARY_LENGTH, querySummary, queryTables, sanitizeQueryText } from '../src/query-text.js';
+import {
+  MAX_QUERY_TEXT_LENGTH,
+  MAX_SUMMARY_LENGTH,
+  querySummary,
+  queryTables,
+  sanitizeQueryText,
+  truncateQueryText,
+} from '../src/query-text.js';
+import { hasReturningKeyword } from '../src/sql-syntax.js';
 
 // The tables and the sanitized text the driver's spans take from a SQL text. The cases are those of
 // the .NET driver, so both drivers name a span the same way.
@@ -101,5 +109,41 @@ describe('sanitizeQueryText', () => {
     ["SELECT * FROM t WHERE s = 'unterminated", 'SELECT * FROM t WHERE s = ?'],
   ])('replaces each literal value of %j', (sql, expected) => {
     expect(sanitizeQueryText(sql)).toBe(expected);
+  });
+});
+
+describe('truncateQueryText', () => {
+  it('keeps a text at the limit as it is', () => {
+    const text = 'x'.repeat(MAX_QUERY_TEXT_LENGTH);
+
+    expect(truncateQueryText(text)).toBe(text);
+  });
+
+  it('cuts a longer text and marks the cut', () => {
+    const cut = truncateQueryText('x'.repeat(MAX_QUERY_TEXT_LENGTH * 10));
+
+    expect(cut).toHaveLength(MAX_QUERY_TEXT_LENGTH);
+    expect(cut.endsWith('…')).toBe(true);
+  });
+
+  it('never splits a surrogate pair', () => {
+    // The pair takes the last code unit before the marker and the first one after it.
+    const cut = truncateQueryText('x'.repeat(MAX_QUERY_TEXT_LENGTH - 2) + '😀'.repeat(10));
+
+    expect(cut).toHaveLength(MAX_QUERY_TEXT_LENGTH - 1);
+    expect(cut.endsWith('x…')).toBe(true);
+  });
+});
+
+// The sanitizer and the RETURNING scan read a string the same way the server does: a backslash is
+// an escape only in an E'...' string.
+describe('one string grammar', () => {
+  it.each([
+    ["INSERT INTO t (a) VALUES ('a\\') RETURNING a", 'INSERT INTO t (a) VALUES (?) RETURNING a', true],
+    ["INSERT INTO t (a) VALUES (E'a\\'') RETURNING a", 'INSERT INTO t (a) VALUES (?) RETURNING a', true],
+    ["INSERT INTO t (a) VALUES ('a\\'' RETURNING a')", 'INSERT INTO t (a) VALUES (?)', false],
+  ])('reads %j', (sql, sanitized, returning) => {
+    expect(sanitizeQueryText(sql)).toBe(sanitized);
+    expect(hasReturningKeyword(sql)).toBe(returning);
   });
 });

@@ -75,6 +75,19 @@ describe('callStatement', () => {
     expect(() => callStatement('transfer', { '': 1 })).toThrow(expect.objectContaining({ code: 'CADB0400' }));
   });
 
+  it.each(['x); TRUNCATE audit_log; --', 'a b', '@', '@@a', 'a-b', 'café', 'a,@b', 'a\n'])(
+    'refuses the parameter name %j, which would reach the SQL text as more than a placeholder',
+    (key) => {
+      expect(() => callStatement('report', { [key]: 1 })).toThrow(
+        expect.objectContaining({ code: 'CADB0400' }),
+      );
+    },
+  );
+
+  it('accepts the parameter names the server lexes as placeholders', () => {
+    expect(callStatement('p', { _a: 1, '@B9': 2, '0': 3 })).toBe('CALL p(@0, @_a, @B9)');
+  });
+
   it('reads a plain identifier as ASCII letters, digits, and _', () => {
     expect(isPlainIdentifier('_x9')).toBe(true);
     expect(isPlainIdentifier('Transfer_2')).toBe(true);

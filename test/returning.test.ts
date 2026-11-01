@@ -23,7 +23,11 @@ describe('the RETURNING keyword scan', () => {
     'INSERT INTO t (a) VALUES (1)\nRETURNING\ta',
     "INSERT INTO t (a) VALUES ('x') RETURNING a",
     "INSERT INTO t (a) VALUES ('it''s') RETURNING a",
-    "INSERT INTO t (a) VALUES ('a\\'b') RETURNING a",
+    "INSERT INTO t (a) VALUES (E'a\\'b') RETURNING a",
+    'INSERT INTO t (a) VALUES (e"a\\"b") RETURNING a',
+    // A backslash is an ordinary character in a plain string, so the string ends at the next quote.
+    "INSERT INTO t (a) VALUES ('C:\\') RETURNING a",
+    'INSERT INTO t (a) VALUES ("C:\\") RETURNING a',
     'INSERT INTO t SELECT * FROM s /* comment */ RETURNING id',
     'INSERT INTO t (a) VALUES (1) -- note\nRETURNING a',
     'UPDATE t SET a = 1 WHERE b = 2 RETURNING a, b',
@@ -44,6 +48,7 @@ describe('the RETURNING keyword scan', () => {
     'INSERT INTO t (a) SELECT s.returning FROM s',
     'INSERT INTO t (a) VALUES ("RETURNING")',
     "INSERT INTO t (a) VALUES ('unterminated RETURNING",
+    "INSERT INTO t (a) VALUES (E'it\\' RETURNING')",
     "UPDATE t SET note = 'RETURNING' WHERE a = 1",
     'DELETE FROM `returning` WHERE a = 1',
   ])('does not find the keyword in %j', (sql) => {

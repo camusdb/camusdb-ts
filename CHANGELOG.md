@@ -5,6 +5,40 @@ Every notable change to this package is written here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the version
 numbers follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Security
+
+- `call` put each parameter name into the `CALL` text without a check. A name such as
+  `x); TRUNCATE t; --` could add a statement. Each name must now be ASCII letters, digits, or `_`,
+  with an optional leading `@`. Any other name throws `CADB0400` before the driver sends the call.
+- A connection string did not check its `Database` value for control characters, and no entry point
+  checked an endpoint. A newline in either could make two prepared-statement cache keys collide. Both
+  are now refused on every entry point.
+- A failure that a server reported in the body of an HTTP 2xx reply went into the `CamusError`
+  message without sanitization. This applied to transactions, node stats, database creation and
+  removal, statement preparation, backups, and login. The message now goes through the same
+  sanitizer as every other server error text.
+- A server could make the client hold any amount of data. A REST response body is now limited to
+  256 MiB, and one line of a streamed result to 64 MiB. A larger response throws a `CamusError`.
+- A server-reported token lifetime is now limited to 24 hours, so the driver always renews a token.
+- The request timeout stopped when the response headers arrived, so a server that sent its headers
+  and then stopped in the middle of the body held the call open with no limit. The timeout now
+  covers the whole body on every REST route and on login and logout. A body that misses the timeout
+  sets the endpoint aside, as a request that misses it does. The rows of `queryStream` are still not
+  held to the timeout, but an error body on that route is.
+
+### Fixed
+
+- The `RETURNING` scan read a backslash in a plain `'...'` string as an escape. A CamusDB server
+  from 0.9.9 on reads it as an ordinary character. A statement such as
+  `INSERT ... VALUES ('C:\') RETURNING id` went to the route for a write without rows. The scan now
+  uses the same string rules as the query-text sanitizer: a backslash escapes only in `E'...'`.
+- `db.query.text` is now cut at 4096 characters, with `…` at the end of a cut text.
+- The learned-route cache separated a database name and a statement with a space, which can occur
+  in both. Two different statements could share one learned route. The parts are now separated by a
+  newline.
+
 ## [0.12.1] — 2026-10-31
 
 ### Fixed

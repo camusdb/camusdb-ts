@@ -11,7 +11,7 @@ import { CamusQueryTextMode } from './config.js';
 import { CamusEndpointPool } from './endpoint-pool.js';
 import { CamusError } from './errors.js';
 import { CamusPreparedStatementPolicy } from './prepared/policy.js';
-import { querySummary, queryTables, sanitizeQueryText } from './query-text.js';
+import { querySummary, queryTables, sanitizeQueryText, truncateQueryText } from './query-text.js';
 
 /**
  * Traces and metrics through `@opentelemetry/api`.
@@ -441,9 +441,9 @@ export function startOperation(scope: TelemetryScope, init: OperationInit): Camu
     }
     if (init.queryText !== undefined) {
       if (scope.config.traceQueryText === CamusQueryTextMode.Raw) {
-        span.setAttribute('db.query.text', init.queryText);
+        span.setAttribute('db.query.text', truncateQueryText(init.queryText));
       } else if (scope.config.traceQueryText === CamusQueryTextMode.Sanitized) {
-        span.setAttribute('db.query.text', sanitizeQueryText(init.queryText));
+        span.setAttribute('db.query.text', truncateQueryText(sanitizeQueryText(init.queryText)));
       }
     }
     span.setAttribute('camusdb.transport', scope.config.protocol);

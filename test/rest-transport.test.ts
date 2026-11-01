@@ -6,6 +6,9 @@ import { ColumnType } from '../src/column-type.js';
 import { CamusEndpointPool } from '../src/endpoint-pool.js';
 import { CamusError } from '../src/errors.js';
 import { CamusIsolationLevel, CamusLocking, CamusTransactionMode } from '../src/options.js';
+import { MAX_RESPONSE_BODY_BYTES, readBody } from '../src/transport/http.js';
+import { RestLoginClient } from '../src/auth/rest-login-client.js';
+import { NdjsonRowSource } from '../src/transport/ndjson-row-source.js';
 import { RestTransport } from '../src/transport/rest-transport.js';
 import type { TransportSqlRequest } from '../src/transport/transport.js';
 import { stringifyLossless } from '../src/json.js';
@@ -403,6 +406,34 @@ describe('transactions', () => {
 
     expect(server.callCount('commit-transaction')).toBe(1);
     expect(server.callCount('rollback-transaction')).toBe(1);
+  });
+
+  it('sanitizes the message of a failure reported in a 2xx envelope', async () => {
+    server.json('start-transaction', {
+      status: 'failed',
+      code: 'CADB0505',
+      message: 'MustRetry\nFAKE LOG ENTRY \u001b[31m Authorization: Bearer abc.def',
+    });
+
+    const { transport } = unauthenticated();
+    const error = await transport.startTransaction(server.endpoint, 'test', {}, 5).catch((e: unknown) => e);
+
+    expect(error).toBeInstanceOf(CamusError);
+    expect((error as CamusError).code).toBe('CADB0505');
+    expect((error as CamusError).message).not.toContain('\n');
+    expect((error as CamusError).message).not.toContain('\u001b');
+    expect((error as CamusError).message).not.toContain('abc.def');
+    expect((error as CamusError).message).toContain('Bearer ***');
+  });
+
+  it('falls back to its own code and message for an envelope whose fields are not text', async () => {
+    server.json('commit-transaction', { status: 'failed', code: 42, message: { nested: true } });
+
+    const { transport } = unauthenticated();
+
+    await expect(
+      transport.finalizeTransaction(true, server.endpoint, 'test', 1n, 2, undefined, 5),
+    ).rejects.toMatchObject({ code: 'CADB0000', message: 'Commit failed' });
   });
 
   it('reports a failed begin', async () => {
@@ -856,5 +887,146 @@ describe('authentication', () => {
     await transport.executeQuery(sqlRequest());
 
     expect(server.requestsTo('execute-sql-query')[0]!.headers.authorization).toBeUndefined();
+  });
+});
+
+// A server chooses every byte it sends, so the client caps what it holds in memory.
+describe('response size limits', () => {
+  function chunked(...chunks: Uint8Array[]): ReadableStream<Uint8Array> {
+    return new ReadableStream({
+      start(controller) {
+        for (const chunk of chunks) controller.enqueue(chunk);
+        controller.close();
+      },
+    });
+  }
+
+  it('reads a body within the limit, with a character split across chunks', async () => {
+    const bytes = new TextEncoder().encode('{"a":"é"}');
+    const body = chunked(bytes.slice(0, 7), bytes.slice(7));
+
+    expect(await readBody(new Response(body), 64)).toBe('{"a":"é"}');
+  });
+
+  it('refuses a body that grows past the limit', async () => {
+    const body = chunked(new Uint8Array(40), new Uint8Array(40));
+
+    await expect(readBody(new Response(body), 64)).rejects.toThrow(/larger than 64 bytes/);
+  });
+
+  it('refuses a body whose declared length is past the limit before it reads it', async () => {
+    const response = new Response('x'.repeat(10), { headers: { 'content-length': '1000' } });
+
+    await expect(readBody(response, 64)).rejects.toThrow(CamusError);
+  });
+
+  it('has a default limit far above any ordinary result', () => {
+    expect(MAX_RESPONSE_BODY_BYTES).toBe(256 * 1024 * 1024);
+  });
+
+  it('refuses a streaming line that grows past the limit', async () => {
+    const encoder = new TextEncoder();
+    const header = encoder.encode(`${stringifyLossless({ status: 'ok', columns: [] })}\n`);
+    const endless = chunked(header, encoder.encode('['), encoder.encode('1,'.repeat(200)));
+
+    const source = await NdjsonRowSource.create(endless, 100);
+
+    await expect(source.next()).rejects.toThrow(/line longer than 100 characters/);
+  });
+
+  it('refuses a streaming header that grows past the limit', async () => {
+    const body = chunked(new TextEncoder().encode('{"status":"ok","columns":[' + ' '.repeat(200)));
+
+    await expect(NdjsonRowSource.create(body, 100)).rejects.toThrow(CamusError);
+  });
+});
+
+// The request deadline covers the body too. A server that sends its headers and then stops in the
+// middle of the body must not hold a call open with no limit.
+describe('the deadline on a response body', () => {
+  /** Sends the headers and the first bytes of a body, and then never ends it. */
+  function stall(path: string): void {
+    server.on(path, (_request, response) => {
+      response.writeHead(200, { 'Content-Type': 'application/json' });
+      response.write('{"status":');
+    });
+  }
+
+  it('ends a JSON route whose body stops', async () => {
+    stall('create-db');
+
+    const { transport, pool } = unauthenticated();
+    const started = performance.now();
+
+    await expect(transport.createDatabase(server.endpoint, 'test', false, 0.2)).rejects.toThrow(
+      /timed out after 0.2s/,
+    );
+    expect(performance.now() - started).toBeLessThan(2000);
+    expect(pool.isQuarantined(server.endpoint)).toBe(true);
+  });
+
+  it('ends a query whose body stops', async () => {
+    stall('execute-sql-query');
+
+    const { transport } = unauthenticated();
+
+    await expect(transport.executeQuery(sqlRequest({ timeoutSeconds: 0.2 }))).rejects.toThrow(/timed out/);
+  });
+
+  it('ends a login whose body stops', async () => {
+    stall('login');
+
+    await expect(new RestLoginClient().login(server.endpoint, 'app', 'secret', 0.2)).rejects.toThrow(
+      /timed out/,
+    );
+  });
+
+  it('reports a cancellation by the caller as it is, and keeps the endpoint', async () => {
+    stall('create-db');
+
+    const { transport, pool } = unauthenticated();
+    const controller = new AbortController();
+    const reason = new Error('caller gave up');
+
+    setTimeout(() => controller.abort(reason), 50);
+
+    await expect(transport.createDatabase(server.endpoint, 'test', false, 5, controller.signal)).rejects.toBe(
+      reason,
+    );
+    expect(pool.isQuarantined(server.endpoint)).toBe(false);
+  });
+
+  it('ends a streaming error body that stops', async () => {
+    server.on('execute-sql-query-stream', (_request, response) => {
+      response.writeHead(400, { 'Content-Type': 'application/json' });
+      response.write('{"status":');
+    });
+
+    const { transport } = unauthenticated();
+
+    await expect(transport.executeQueryStream(sqlRequest({ timeoutSeconds: 0.2 }))).rejects.toThrow(
+      /timed out/,
+    );
+  });
+
+  it('does not end a stream whose rows arrive after the deadline', async () => {
+    server.on('execute-sql-query-stream', (_request, response) => {
+      response.writeHead(200, { 'Content-Type': 'application/x-ndjson' });
+      response.write(
+        `${stringifyLossless({ status: 'ok', columns: [{ name: 'n', type: ColumnType.Integer64 }] })}\n`,
+      );
+
+      setTimeout(() => {
+        response.end(`[1]\n${stringifyLossless({ status: 'ok', total: 1 })}\n`);
+      }, 400);
+    });
+
+    const { transport } = unauthenticated();
+    const source = await transport.executeQueryStream(sqlRequest({ timeoutSeconds: 0.2 }));
+
+    expect((await source.next())?.[0]?.longValue).toBe(1n);
+    expect(await source.next()).toBeUndefined();
+
+    await source.close();
   });
 });

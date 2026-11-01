@@ -418,10 +418,16 @@ describe('jsonb over REST, end to end', () => {
     );
 
     await expect(
-      client().scalar('INSERT INTO events (payload) VALUES (@p) RETURNING payload', { p: camus.jsonb(null) }, { jsonb: 'text' }),
+      client().scalar(
+        'INSERT INTO events (payload) VALUES (@p) RETURNING payload',
+        { p: camus.jsonb(null) },
+        { jsonb: 'text' },
+      ),
     ).resolves.toBe('null');
 
-    expect((server.requestsTo('execute-sql-non-query').at(-1)!.body as { jsonbAsText?: unknown }).jsonbAsText).toBe(true);
+    expect(
+      (server.requestsTo('execute-sql-non-query').at(-1)!.body as { jsonbAsText?: unknown }).jsonbAsText,
+    ).toBe(true);
 
     server.on('execute-sql-query-stream', (_request, response) => {
       respondNdjson(response, [
@@ -438,7 +444,9 @@ describe('jsonb over REST, end to end', () => {
     for await (const row of stream) rows.push(row);
 
     expect(rows).toEqual([{ payload: 'null' }, { payload: null }, { payload: '{"a": [1.0]}' }]);
-    expect((server.requestsTo('execute-sql-query-stream').at(-1)!.body as { jsonbAsText?: unknown }).jsonbAsText).toBe(true);
+    expect(
+      (server.requestsTo('execute-sql-query-stream').at(-1)!.body as { jsonbAsText?: unknown }).jsonbAsText,
+    ).toBe(true);
   });
 
   it('keeps the text of a document in a streamed row', async () => {

@@ -62,7 +62,10 @@ export const JSONB_TEXT_FORM = ColumnType.String;
  * The positions of the `jsonb` columns among `types` whose cells are native JSON. A column the
  * server marked `jsonbAsText` is left out: its cells are plain strings and need no source text.
  */
-export function jsonbColumns(types: readonly ColumnType[], elementTypes: readonly ColumnType[] = []): Set<number> {
+export function jsonbColumns(
+  types: readonly ColumnType[],
+  elementTypes: readonly ColumnType[] = [],
+): Set<number> {
   const positions = new Set<number>();
 
   for (let i = 0; i < types.length; i++) {
@@ -112,7 +115,12 @@ export function readSchema(columns: unknown): WireSchema {
   const elementTypes: ColumnType[] = new Array<ColumnType>(columns.length);
 
   for (let i = 0; i < columns.length; i++) {
-    const column = columns[i] as { name?: unknown; type?: unknown; elementType?: unknown; jsonbAsText?: unknown } | null;
+    const column = columns[i] as {
+      name?: unknown;
+      type?: unknown;
+      elementType?: unknown;
+      jsonbAsText?: unknown;
+    } | null;
 
     names[i] = typeof column?.name === 'string' ? column.name : '';
 
@@ -180,7 +188,8 @@ export function decodeCell(
       return decodeNumericCell(cell, declared);
 
     case ColumnType.Jsonb:
-      if (elementType === JSONB_TEXT_FORM && typeof cell === 'string') return { type: ColumnType.Jsonb, strValue: cell };
+      if (elementType === JSONB_TEXT_FORM && typeof cell === 'string')
+        return { type: ColumnType.Jsonb, strValue: cell };
       return { type: ColumnType.Jsonb, strValue: formatJsonbValue(cell) };
 
     case ColumnType.Array:

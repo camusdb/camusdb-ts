@@ -747,8 +747,8 @@ await client.call('transfer', { from: 'alice', to: 'bob', amount: 30 });
 
 - The procedure name must be a plain identifier: a letter or `_`, then letters, digits, or `_`. Any
   other text throws `TypeError` before the driver sends the call.
-- Each parameter name becomes SQL text, so it must be ASCII letters, digits, or `_`, with an
-  optional leading `@`. Any other name throws a `CamusError` with the code `CADB0400` before the
+- Each parameter name becomes SQL text. From 0.13.0, it must be ASCII letters, digits, or `_`, with
+  an optional leading `@`. Any other name throws a `CamusError` with the code `CADB0400` before the
   driver sends the call.
 - JavaScript puts a key that is a whole number, such as `'0'`, before the other keys. So give the
   parameters names.

@@ -406,10 +406,10 @@ Set it for the whole client (`jsonb: 'text'`, or `Jsonb=text` in a connection st
 statement, or for one pipelined query.
 
 JSON `null` and SQL `NULL` are different values. In `text` mode, a JSON `null` document reads as the
-text `'null'`, and SQL `NULL` reads as `null`. Over REST the driver asks the server to send each
-document as text (`jsonbAsText`), because the default REST row writes both values as the token
-`null`. A server older than that option ignores it, and over REST it gives a top-level JSON `null`
-document as `null`. In `parse` mode both read as `null`.
+text `'null'`, and SQL `NULL` reads as `null`. From 0.12.1, over REST the driver asks the server to
+send each document as text (`jsonbAsText`), because the default REST row writes both values as the
+token `null`. A server older than that option ignores it, and over REST it gives a top-level JSON
+`null` document as `null`. In `parse` mode both read as `null`.
 
 ```ts
 await client.executeDdl('CREATE TABLE events (id OID PRIMARY KEY NOT NULL, payload JSONB NOT NULL)');

@@ -45,6 +45,15 @@ describe('queryTables', () => {
     ["SELECT 'FROM fake' FROM robots", 'robots'],
     ['SELECT 1', ''],
     ['BEGIN', ''],
+    [
+      'CREATE FUNCTION f(s STRING) RETURNS STRING LANGUAGE csharp AS $$\n    // read from cache\n    return string.Join(",", s);\n$$',
+      '',
+    ],
+    [
+      'CREATE FUNCTION f(c STRING) RETURNS BOOL LANGUAGE csharp AS $$ return c == "\'"; $$; SELECT * FROM robots',
+      'robots',
+    ],
+    ['SELECT f(name) FROM robots WHERE g($x$ from fake $$ $x$)', 'robots'],
   ])('names each table of %j once, in order', (sql, expected) => {
     expect(queryTables(sql)).toEqual(expected.length === 0 ? [] : expected.split(','));
   });
@@ -72,7 +81,7 @@ describe('the scan', () => {
   it('reads any text without an exception', () => {
     // The scan runs inside every sampled operation, so it must accept any text, finished or not.
     const alphabet =
-      'SELECT FROM JOIN INTO UPDATE TABLE IF NOT EXISTS TRUNCATE EXTRACT(`\'"\\-/*@.,;()0123456789xXeE \n';
+      'SELECT FROM JOIN INTO UPDATE TABLE IF NOT EXISTS TRUNCATE EXTRACT(`\'"\\-/*@.,;()$0123456789xXeE \n';
 
     // A fixed linear congruential sequence, so a failure repeats.
     let seed = 20261026;
@@ -107,6 +116,16 @@ describe('sanitizeQueryText', () => {
     ['SELECT /* user 7 */ id FROM t', 'SELECT   id FROM t'],
     ['SELECT * FROM t WHERE b = TRUE AND c IS NULL', 'SELECT * FROM t WHERE b = TRUE AND c IS NULL'],
     ["SELECT * FROM t WHERE s = 'unterminated", 'SELECT * FROM t WHERE s = ?'],
+    [
+      "CREATE FUNCTION f(s STRING) RETURNS STRING LANGUAGE csharp AS $$\n    return s.Replace('\\'', '-') + \"secret\";\n$$",
+      'CREATE FUNCTION f(s STRING) RETURNS STRING LANGUAGE csharp AS ?',
+    ],
+    [
+      'CREATE FUNCTION f() RETURNS STRING LANGUAGE csharp AS$fn$ return "$$"; $fn$',
+      'CREATE FUNCTION f() RETURNS STRING LANGUAGE csharp AS?',
+    ],
+    ["SELECT $$ unterminated 'x", 'SELECT ?'],
+    ['SELECT price$ FROM t WHERE a = $1', 'SELECT price$ FROM t WHERE a = $?'],
   ])('replaces each literal value of %j', (sql, expected) => {
     expect(sanitizeQueryText(sql)).toBe(expected);
   });

@@ -156,7 +156,7 @@ const RETURNING = 'RETURNING';
  * `RETURNING` is a reserved word on the server, so a token match is the clause itself. A column or
  * a table called `returning` must be written with backticks, which this skips. Literals are skipped
  * with `skipQuoted`, the scan `sanitizeQueryText` uses too, so both read a string the way the
- * server does.
+ * server does. Dollar-quoted text is skipped whole.
  */
 export function hasReturningKeyword(sql: string): boolean {
   let i = 0;
@@ -175,6 +175,11 @@ export function hasReturningKeyword(sql: string): boolean {
       continue;
     }
 
+    if (c === '$' && dollarQuoteLength(sql, i) > 0) {
+      i = skipDollarQuoted(sql, i);
+      continue;
+    }
+
     if (c === '-' && sql[i + 1] === '-') {
       const end = sql.indexOf('\n', i);
       i = end < 0 ? sql.length : end + 1;
@@ -190,7 +195,13 @@ export function hasReturningKeyword(sql: string): boolean {
     if (isWordCharacter(c)) {
       const start = i;
 
-      while (i < sql.length && isWordCharacter(sql[i]!)) i++;
+      while (
+        i < sql.length &&
+        isWordCharacter(sql[i]!) &&
+        !(sql[i] === '$' && dollarQuoteLength(sql, i) > 0)
+      ) {
+        i++;
+      }
 
       if (i - start === RETURNING.length && sql.slice(start, i).toUpperCase() === RETURNING) return true;
 
@@ -206,6 +217,53 @@ export function hasReturningKeyword(sql: string): boolean {
 /** `@`, `$`, and `.` join the word, so `@returning` and `t.returning` are not the keyword. */
 function isWordCharacter(character: string): boolean {
   return /[\p{L}\p{Nd}_@$.]/u.test(character);
+}
+
+/**
+ * The length of the dollar quote that opens at `start`: `$$`, or `$`, a tag, and `$`, as in `$fn$`.
+ * Zero when the character there opens no quote.
+ *
+ * The rule is the server lexer's: a tag is a letter or `_`, then letters, digits, or `_`, all ASCII.
+ * A dollar quote holds the body of `CREATE FUNCTION … LANGUAGE csharp`.
+ *
+ * @internal
+ */
+export function dollarQuoteLength(sql: string, start: number): number {
+  if (sql[start] !== '$') return 0;
+
+  let i = start + 1;
+
+  if (i < sql.length && isAsciiTagStart(sql[i]!)) {
+    while (i < sql.length && isAsciiTagPart(sql[i]!)) i++;
+  }
+
+  return sql[i] === '$' ? i + 1 - start : 0;
+}
+
+/**
+ * The index after the dollar-quoted text that opens at `start`. The text between two equal quotes
+ * is raw: quotes, semicolons, and comments in it are text, with no escape. With no closing quote,
+ * the rest of the text is in it, as the server's script splitter reads it. The caller must first
+ * make sure that a quote opens there (`dollarQuoteLength`).
+ *
+ * @internal
+ */
+export function skipDollarQuoted(sql: string, start: number): number {
+  const length = dollarQuoteLength(sql, start);
+  const quote = sql.slice(start, start + length);
+  const close = sql.indexOf(quote, start + length);
+
+  return close < 0 ? sql.length : close + length;
+}
+
+function isAsciiTagStart(character: string): boolean {
+  return (
+    character === '_' || (character >= 'A' && character <= 'Z') || (character >= 'a' && character <= 'z')
+  );
+}
+
+function isAsciiTagPart(character: string): boolean {
+  return isAsciiTagStart(character) || (character >= '0' && character <= '9');
 }
 
 /**

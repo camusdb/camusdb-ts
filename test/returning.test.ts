@@ -32,6 +32,8 @@ describe('the RETURNING keyword scan', () => {
     'INSERT INTO t (a) VALUES (1) -- note\nRETURNING a',
     'UPDATE t SET a = 1 WHERE b = 2 RETURNING a, b',
     'DELETE FROM t WHERE a > 2000 LIMIT 10 RETURNING *',
+    "INSERT INTO t (a) VALUES ($$ it's $$) RETURNING a",
+    'INSERT INTO t (a) VALUES ($a$ $$ $a$) RETURNING a',
   ])('finds the keyword in %j', (sql) => {
     expect(hasReturningKeyword(sql)).toBe(true);
   });
@@ -51,6 +53,9 @@ describe('the RETURNING keyword scan', () => {
     "INSERT INTO t (a) VALUES (E'it\\' RETURNING')",
     "UPDATE t SET note = 'RETURNING' WHERE a = 1",
     'DELETE FROM `returning` WHERE a = 1',
+    'INSERT INTO t (a) VALUES ($$ RETURNING $$)',
+    "INSERT INTO t (a) VALUES ($q$ it's $$ RETURNING $q$)",
+    'INSERT INTO t (a) VALUES ($$ unterminated RETURNING',
   ])('does not find the keyword in %j', (sql) => {
     expect(hasReturningKeyword(sql)).toBe(false);
   });

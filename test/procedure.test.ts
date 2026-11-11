@@ -50,6 +50,26 @@ describe('CALL classification', () => {
     expect(isDdlStatement('DROP TRIGGER audit ON robots')).toBe(true);
     expect(isDdlStatement('  drop  trigger audit ON robots')).toBe(true);
   });
+
+  it.each([
+    "CREATE EXTENSION geo VERSION '1.2.0'",
+    'ALTER EXTENSION geo UPDATE',
+    'DROP EXTENSION geo',
+    "CREATE FUNCTION slugify(s STRING) RETURNS STRING LANGUAGE csharp AS $$\n    return s.Trim().Replace(' ', '-');\n$$",
+    'CREATE OR REPLACE FUNCTION twice(n INT64) RETURNS INT64 LANGUAGE csharp AS $fn$ return n * 2; $fn$',
+    'DROP FUNCTION IF EXISTS slugify',
+    'ALTER FUNCTION slugify OWNER TO alice',
+    '  create  or replace\nfunction f() RETURNS INT64 LANGUAGE csharp AS $$ return 1; $$',
+  ])('routes extension and inline function DDL %j to the DDL route', (sql) => {
+    expect(isDdlStatement(sql)).toBe(true);
+    expect(isPreparableStatement(sql)).toBe(false);
+  });
+
+  it('does not route a call of a function to the DDL route', () => {
+    expect(isDdlStatement('SELECT slugify(title) FROM posts')).toBe(false);
+    expect(isDdlStatement('SHOW FUNCTIONS')).toBe(false);
+    expect(isDdlStatement('SHOW CREATE FUNCTION slugify')).toBe(false);
+  });
 });
 
 describe('callStatement', () => {
@@ -218,6 +238,22 @@ describe('CALL over REST', () => {
 
     expect(server.callCount('execute-sql-ddl')).toBe(2);
     expect(server.callCount('execute-sql-non-query')).toBe(0);
+  });
+
+  it('sends inline function and extension DDL from execute to the DDL route', async () => {
+    const camus = client();
+    const create =
+      "CREATE OR REPLACE FUNCTION slugify(s STRING) RETURNS STRING LANGUAGE csharp AS $$\n    return s.Trim().Replace(' ', '-');\n$$";
+
+    await expect(camus.execute(create)).resolves.toEqual({ affectedRows: 0 });
+    await camus.execute('DROP FUNCTION slugify');
+    await camus.execute('CREATE EXTENSION geo');
+
+    expect(server.callCount('execute-sql-ddl')).toBe(3);
+    expect(server.callCount('execute-sql-non-query')).toBe(0);
+
+    // The driver sends the body as written.
+    expect((server.requestsTo('execute-sql-ddl')[0]!.body as Record<string, unknown>).sql).toBe(create);
   });
 
   it('does not retry an extension error', async () => {

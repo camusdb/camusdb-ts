@@ -22,7 +22,7 @@ import { querySummary, queryTables, sanitizeQueryText, truncateQueryText } from 
  * OpenTelemetry SDK and register it as usual to collect the data. The driver needs no plugin.
  *
  * The span and metric names and attributes are those of the .NET driver, and they follow the
- * OpenTelemetry database conventions. See the README for the list.
+ * OpenTelemetry database conventions. See docs/opentelemetry.md for the list.
  */
 
 /** The instrumentation scope that the driver's tracer and meter report under. */

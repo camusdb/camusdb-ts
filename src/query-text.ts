@@ -5,17 +5,17 @@
  * file that was distributed with this source code.
  */
 
-import { skipQuoted } from './sql-syntax.js';
+import { dollarQuoteLength, skipDollarQuoted, skipQuoted } from './sql-syntax.js';
 
 /**
  * Reads a SQL text for the driver's spans: the tables it names, for `db.collection.name` and
  * `db.query.summary`, and a copy with its literal values removed, for `db.query.text` under
  * `traceQueryText: 'sanitized'`.
  *
- * This is a scan of tokens, not a parse. It knows string, number and bytes literals, backtick
- * identifiers, `@` parameters and comments, and it takes a table from the name that follows `FROM`,
- * `JOIN`, `INTO`, `UPDATE` or `TABLE`. A comma join names only its first table, and a common table
- * expression is named as a table. Literal values never reach a summary, because a table name is
+ * This is a scan of tokens, not a parse. It knows string, number and bytes literals, dollar-quoted
+ * text (`$$ … $$`, a literal), backtick identifiers, `@` parameters and comments, and it takes a
+ * table from the name that follows `FROM`, `JOIN`, `INTO`, `UPDATE` or `TABLE`. A comma join names
+ * only its first table, and a common table expression is named as a table. Literal values never reach a summary, because a table name is
  * never a literal. The .NET driver has the same scan, so both drivers name a span the same way.
  *
  * @internal
@@ -250,6 +250,10 @@ function tokenize(sql: string): Token[] {
     } else if ((current === 'x' || current === 'X') && next === "'") {
       index = skipQuoted(sql, index + 1, "'", false);
       tokens.push({ kind: TokenKind.Literal, start, length: index - start, text: '' });
+    } else if (current === '$' && dollarQuoteLength(sql, index) > 0) {
+      // The C# body of CREATE FUNCTION: one literal, so its words name no table.
+      index = skipDollarQuoted(sql, index);
+      tokens.push({ kind: TokenKind.Literal, start, length: index - start, text: '' });
     } else if (current === '`') {
       index = skipQuoted(sql, index, '`', false);
       const text = sql.slice(start + 1, start + 1 + Math.max(0, index - start - 2)).replaceAll('``', '`');
@@ -259,7 +263,14 @@ function tokenize(sql: string): Token[] {
       tokens.push({ kind: TokenKind.Literal, start, length: index - start, text: '' });
     } else if (isWordStart(current) || (current === '@' && isWordStart(next))) {
       index++;
-      while (index < sql.length && isWordPart(sql[index]!)) index++;
+      // A word stops where a dollar quote opens, as in `AS$fn$`.
+      while (
+        index < sql.length &&
+        isWordPart(sql[index]!) &&
+        !(sql[index] === '$' && dollarQuoteLength(sql, index) > 0)
+      ) {
+        index++;
+      }
 
       const kind = current === '@' ? TokenKind.Parameter : TokenKind.Word;
       tokens.push({ kind, start, length: index - start, text: sql.slice(start, index) });

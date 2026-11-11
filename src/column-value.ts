@@ -70,7 +70,8 @@ export interface ColumnValueJson {
   type: number;
   strValue?: string | null;
   longValue?: bigint;
-  floatValue?: number;
+  /** A finite number, or `"Infinity"`, `"-Infinity"`, or `"NaN"`, for which JSON has no number. */
+  floatValue?: number | NonFiniteFloatName;
   boolValue?: boolean;
   bytesValue?: string | null;
   arrayValues?: ColumnValueJson[] | null;
@@ -78,6 +79,9 @@ export interface ColumnValueJson {
   uuidHigh?: bigint;
   uuidValue?: string | null;
 }
+
+/** The name a REST body gives a float that JSON has no number for. */
+export type NonFiniteFloatName = 'Infinity' | '-Infinity' | 'NaN';
 
 /**
  * Renders a value for a REST request body.
@@ -105,7 +109,7 @@ export function columnValueToJson(value: ColumnValue): ColumnValueJson {
 
     case ColumnType.Float64:
     case ColumnType.Float32:
-      json.floatValue = value.floatValue ?? 0;
+      json.floatValue = floatToJson(value.floatValue ?? 0);
       return json;
 
     case ColumnType.Bool:
@@ -138,4 +142,17 @@ export function columnValueToJson(value: ColumnValue): ColumnValueJson {
     default:
       return json;
   }
+}
+
+/**
+ * A float parameter as a REST body carries it. A finite number is the number. JSON has no number
+ * for an infinity or `NaN`, and `JSON.stringify` writes `null` for one, so such a value is written
+ * by name: `"Infinity"`, `"-Infinity"`, or `"NaN"`, the form the server reads in a float parameter.
+ * A server older than the PostgreSQL float rule refuses it.
+ */
+function floatToJson(value: number): number | NonFiniteFloatName {
+  if (Number.isFinite(value)) return value;
+  if (Number.isNaN(value)) return 'NaN';
+
+  return value > 0 ? 'Infinity' : '-Infinity';
 }

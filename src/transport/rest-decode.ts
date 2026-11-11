@@ -298,6 +298,11 @@ function isFloatToken(item: unknown): boolean {
 function decodeScalarByToken(cell: unknown, declared: ColumnType): ColumnValue {
   switch (typeof cell) {
     case 'string':
+      if (declared === ColumnType.Float64 || declared === ColumnType.Float32) {
+        const nonFinite = nonFiniteFloat(cell);
+        if (nonFinite !== undefined) return { type: declared, floatValue: nonFinite };
+      }
+
       return { type: ColumnType.String, strValue: cell };
 
     case 'boolean':
@@ -321,6 +326,28 @@ function decodeScalarByToken(cell: unknown, declared: ColumnType): ColumnValue {
 
     default:
       return NULL_VALUE;
+  }
+}
+
+/**
+ * The value of the string the server writes for a non-finite float in a `FLOAT64` or `FLOAT32` cell
+ * or array element: `"Infinity"`, `"-Infinity"`, or `"NaN"`. `undefined` for any other string.
+ *
+ * JSON has no number for these values, so a server with the PostgreSQL float rule sends them as
+ * strings, and the column's type still says float. Without this, the cell decoded as a `String`
+ * that held the name, so a value read over REST differed from the same value read over gRPC, which
+ * carries the IEEE double. Any other string in a float column stays a `String`.
+ */
+function nonFiniteFloat(text: string): number | undefined {
+  switch (text) {
+    case 'Infinity':
+      return Number.POSITIVE_INFINITY;
+    case '-Infinity':
+      return Number.NEGATIVE_INFINITY;
+    case 'NaN':
+      return Number.NaN;
+    default:
+      return undefined;
   }
 }
 

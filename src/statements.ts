@@ -62,6 +62,16 @@ const DDL_PREFIXES = [
   // statement starts with these two words.
   'CREATE TRIGGER',
   'DROP TRIGGER',
+  // Extension assemblies installed in a database: CREATE EXTENSION, ALTER EXTENSION … UPDATE, and
+  // DROP EXTENSION.
+  'CREATE EXTENSION',
+  'ALTER EXTENSION',
+  'DROP EXTENSION',
+  // Inline functions, whose C# body is dollar-quoted text. ALTER FUNCTION is the OWNER TO form.
+  'CREATE FUNCTION',
+  'CREATE OR REPLACE FUNCTION',
+  'DROP FUNCTION',
+  'ALTER FUNCTION',
 ];
 
 /**

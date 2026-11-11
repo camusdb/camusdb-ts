@@ -5,6 +5,42 @@ Every notable change to this package is written here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the version
 numbers follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.14.0] — 2026-11-10
+
+### Added
+
+- Inline functions. A server can create a scalar function from C# source in the statement:
+  `CREATE [OR REPLACE] FUNCTION ... LANGUAGE csharp AS $$ body $$`. `CREATE FUNCTION`,
+  `CREATE OR REPLACE FUNCTION`, `DROP FUNCTION`, and `ALTER FUNCTION` now go to the DDL route.
+  Before, they took the data route and its forward. A pipeline refuses them, as it refuses all DDL.
+- `CREATE EXTENSION`, `ALTER EXTENSION`, and `DROP EXTENSION` now go to the DDL route too.
+- `docs/csharp-extensions.md` describes inline functions and their error codes, `CADB0838` to
+  `CADB0845` and `CADB0809`.
+
+### Changed
+
+- The README is short now. Each topic is a page under `docs/`, and the README links to the pages.
+  A new glossary page defines the terms that the pages use.
+
+### Fixed
+
+- The driver read dollar-quoted text (`$$ ... $$` or `$tag$ ... $tag$`) as SQL. So the telemetry
+  scan kept most of a function body in a sanitized `db.query.text`, and a C# character literal such
+  as `'\''` put the scan out of step. Words in the body, such as `from` or `into`, also became table
+  names in `db.collection.name`. The telemetry scan and the `RETURNING` scan now read dollar-quoted
+  text as one literal, by the server lexer's rule: `$$`, or `$` and an ASCII tag and `$`. A word stops
+  where a dollar quote opens, so `AS$fn$` is the word `AS` and a quote. Text with no closing quote
+  runs to the end, as the server's script splitter reads it.
+- A server with the PostgreSQL float rule stores `Infinity`, `-Infinity`, and `NaN` in `float64` and
+  `float32` columns. JSON has no number for them, so its REST responses write them as the strings
+  `"Infinity"`, `"-Infinity"`, and `"NaN"`. The REST decoders, buffered and streamed, now read those
+  three strings in a `Float64` or `Float32` cell or array element as the float value, the value gRPC
+  gives. Before, the cell read as a `string` that held the name. Any other string stays a `string`.
+- A non-finite float parameter went over REST as `null`, because JSON has no number for it. It now
+  goes as `"Infinity"`, `"-Infinity"`, or `"NaN"`, the form the server reads in a float parameter.
+  This applies to an inline parameter, a prepared parameter, and an array element. A server older
+  than the PostgreSQL float rule refuses it. gRPC is unchanged, because it carries the IEEE double.
+
 ## [0.13.0] — 2026-11-01
 
 ### Security

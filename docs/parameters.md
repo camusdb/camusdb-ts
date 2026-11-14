@@ -26,6 +26,7 @@ Always bind values. Do not put values into the SQL text with string operations. 
 | `Uint8Array`, `Buffer`, `ArrayBuffer` | `Bytes` |
 | `Float32Array` | `Bytes`, as a vector |
 | `CamusObjectId` | `Id` |
+| `CamusInterval` | `String`, as its ISO-8601 text. See [INTERVAL](data-types.md#interval). |
 | plain object (`{ … }`) | `Jsonb` |
 | array | `Array`. The element type comes from the first element that is not null. If one `number` has a fraction or is `-0`, all `number` elements are `Float64`. |
 
@@ -54,6 +55,7 @@ await client.query('SELECT * FROM robots WHERE key = @key AND made = @made AND t
 | `camus.float32(value)` | `Float32` |
 | `camus.numeric(value)` | `Numeric`, from a decimal `string`, a `bigint`, or a `number` |
 | `camus.jsonb(value)` | `Jsonb`, from JSON text, or from any value |
+| `camus.interval(value)` | `String`, from a `CamusInterval` or from ISO-8601 interval text |
 | `camus.bool(value)` | `Bool` |
 | `camus.string(value)` | `String` |
 | `camus.bytes(value)` | `Bytes` |
@@ -68,4 +70,4 @@ await client.query('SELECT * FROM robots WHERE key = @key AND made = @made AND t
 - Each helper checks its value, so a bad value fails where you call the helper.
 - A UUID string is always a `Uuid`, also in `camus.array(items, ColumnType.Id)`.
 
-See [Data types](data-types.md) for `NUMERIC`, `JSONB`, dates, and vectors.
+See [Data types](data-types.md) for `NUMERIC`, `INTERVAL`, `JSONB`, dates, and vectors.

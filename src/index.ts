@@ -99,6 +99,7 @@ export {
 } from './sequence.js';
 export type { CamusSequenceOptions } from './sequence.js';
 
+export { CamusInterval } from './interval.js';
 export { CamusObjectId } from './object-id.js';
 export { CamusVector } from './vector.js';
 

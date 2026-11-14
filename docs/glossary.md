@@ -12,6 +12,8 @@ The terms that the other pages use.
 | gRPC | A binary protocol over HTTP/2. The driver keeps long-lived streams open and sends many statements on them. |
 | Route | The server URL path that a request goes to, such as the query route or the DDL route. The driver picks the route from the first words of the SQL. |
 | DDL | Data definition language: statements that change the schema, such as `CREATE TABLE`. |
+| Interval | A span of time in months, days, and microseconds. The result of an expression such as `finished - started`. |
+| ISO-8601 interval text | The text form of an interval, such as `P1DT2H` (1 day and 2 hours) or `PT0S` (zero). |
 | Write | `INSERT`, `UPSERT`, `UPDATE`, `DELETE`, or `CALL`. |
 | Autocommit statement | A statement that runs outside an explicit transaction. The server runs it in its own short transaction. |
 | Serializable conflict | Two transactions changed the same data. The server aborts one of them with a retryable code. |

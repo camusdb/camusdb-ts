@@ -9,6 +9,7 @@ import { ColumnType, columnTypeName } from '../column-type.js';
 import type { ColumnValue } from '../column-value.js';
 import { CamusError } from '../errors.js';
 import { CamusErrorCode } from '../error-codes.js';
+import { CamusInterval } from '../interval.js';
 import { CamusObjectId } from '../object-id.js';
 import { isPlainObject, jsonbFromParameter } from './jsonb.js';
 import { dateToDayTicks, dateToTicks } from './ticks.js';
@@ -40,11 +41,13 @@ export type Parameters = Readonly<Record<string, ParameterValue>>;
  * - `Float32Array` — `Bytes`, packed as a vector. It is the natural JavaScript form of an
  *   embedding, and a packed float32 buffer has no other meaning in CamusDB.
  * - `CamusObjectId` — `Id`.
+ * - `CamusInterval` — `String`, as its ISO-8601 text. The SQL casts it: `CAST(@p AS interval)`.
  * - a plain object (`{ … }`) — `Jsonb`, as its JSON text. Use `camus.jsonb` for any other document:
  *   a JSON array, a scalar, or JSON text in a string.
  * - an array — `Array`, with the element type inferred from the first element that is not null.
  *   When that element is a whole `number` and another element is a `number` that is not, the
- *   element type is `Float64`.
+ *   element type is `Float64`. An array of `CamusInterval` infers no element type, because the
+ *   server has no interval elements: state `ColumnType.String` with `camus.array`.
  */
 export function encodeParameter(value: ParameterValue): ColumnValue {
   if (isTypedParameter(value)) return value.value;
@@ -177,6 +180,12 @@ function encodeInferred(value: unknown): ColumnValue {
     return { type: ColumnType.Id, strValue: value.toString() };
   }
 
+  // An interval has no wire type: it travels as its ISO-8601 text, and the SQL casts it with
+  // CAST(@p AS interval).
+  if (value instanceof CamusInterval) {
+    return { type: ColumnType.String, strValue: value.toString() };
+  }
+
   if (value instanceof Float32Array) {
     return { type: ColumnType.Bytes, bytesValue: packVector(value) };
   }
@@ -217,6 +226,16 @@ function encodeArray(value: unknown, declaredElementType: ColumnType): ColumnVal
   if (elementType === ColumnType.Null) {
     for (const item of value) {
       if (item === null || item === undefined) continue;
+
+      // An interval cannot be an array element on the server, so no element type is inferred. A
+      // stated element type of String binds the text of each element.
+      if (item instanceof CamusInterval) {
+        return invalid(
+          'The server has no interval array elements, so the driver infers no element type for an array of ' +
+            'CamusInterval. To bind the text of each element, state it: camus.array(items, ColumnType.String).',
+        );
+      }
+
       elementType = inferElementType(item);
 
       // JavaScript has one number type, so `[2, 1.5]` is a float array whose first value happens
@@ -303,6 +322,7 @@ function packVector(vector: Float32Array): Uint8Array {
 
 function asString(value: unknown): string {
   if (typeof value === 'string') return value;
+  if (value instanceof CamusInterval) return value.toString();
   if (typeof value === 'number' || typeof value === 'bigint' || typeof value === 'boolean') {
     return String(value);
   }

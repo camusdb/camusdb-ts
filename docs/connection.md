@@ -29,7 +29,7 @@ A client opens no socket of its own, so it is cheap to make. See [What a client 
 | `tokenLifetimeSeconds` | `TokenLifetime` | `600` | How long to use a token when the server does not say. |
 | `maxAutoPrepare` | `MaxAutoPrepare` | `128` | How many statements to keep prepared. `0` turns it off. See [Prepared statements](prepared-statements.md). |
 | `autoPrepareMinUsages` | `AutoPrepareMinUsages` | `2` | How many runs of the same SQL before the driver prepares it. |
-| `channelPoolSize` | `ChannelPoolSize` | `2` | gRPC only: streams for each endpoint. |
+| `channelPoolSize` | `ChannelPoolSize` | `8` | gRPC only: streams for each endpoint. The stream count, not the number of clients, limits the statements that run at the same time. See [Transport](transport.md#how-grpc-works). |
 | `coalescingThreshold` | `CoalescingThreshold` | `10` | gRPC only. `1` turns coalescing off. |
 | `coalescingDelayMs` | `CoalescingDelay` | `0` | gRPC only: the coalescing wait in milliseconds. `0` is off. |
 | `requestFrames` | `RequestFrames` | `true` | gRPC only: send statements that wait together as one message. |

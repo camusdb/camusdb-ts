@@ -7,7 +7,7 @@ The JavaScript value of each column type, and the rules for the types that JavaS
 | Column type | JavaScript value |
 | --- | --- |
 | `Null` | `null` |
-| `Id`, `String` | `string` |
+| `Id`, `String` | `string`. An interval result is a `String`. See [INTERVAL](#interval). |
 | `Integer64` | `number` or `bigint`. See [64-bit integers](#64-bit-integers). |
 | `Float64`, `Float32` | `number` |
 | `Bool` | `boolean` |
@@ -65,6 +65,29 @@ await client.query('SELECT n FROM counters', undefined, { int64: 'number' });
 await client.execute('INSERT INTO orders (id, price) VALUES (GEN_ID(), @price)', {
   price: camus.numeric('19.99'),
 });
+```
+
+## INTERVAL
+
+An interval is a span of months, days, and microseconds, as in PostgreSQL. It needs a server from 2026-11-13 or later. An interval is the value of an expression only: no column, array element, or stored value can be an interval. Use it for date arithmetic: `created > now() - INTERVAL '7 days'`, `finished - started`, `ts + INTERVAL 1 MONTH`.
+
+- **Read.** A result interval arrives as ISO-8601 text (`P1DT2H`, `P-7D`, `PT0S`) in a `String` column, on REST and on gRPC. So you get a `string`. Use `CamusInterval.parse(text)` to get its parts.
+- **The parts.** A `CamusInterval` holds `months`, `days`, and `microseconds` (a `bigint`). `toString()` gives the ISO-8601 text. `equals` compares the three parts, so `P1M` and `P30D` are not equal, but the server compares them as equal.
+- **Milliseconds.** `CamusInterval.fromMilliseconds(ms)` makes an interval from a duration. `toMilliseconds()` gives the duration back. It throws a `RangeError` for an interval with months (for example from `age(a, b)`), because a number of milliseconds has no months.
+- **Bind.** A `CamusInterval` parameter binds as its ISO-8601 text. `camus.interval(text)` binds ISO-8601 text that you have. The server does not read text as an interval by itself, so cast it: `CAST(@p AS interval)`. The server rounds the seconds to a microsecond.
+- **Arrays.** The driver infers no element type for an array of `CamusInterval`. Use `camus.array(items, ColumnType.String)` to bind the text of each element.
+
+```ts
+import { CamusInterval } from 'camusdb';
+
+const result = await client.query<{ name: string; length: string }>(
+  'SELECT name, finished - started AS length FROM jobs WHERE finished - started > CAST(@limit AS interval)',
+  { limit: CamusInterval.fromMilliseconds(60 * 60_000) },
+);
+
+for (const row of result.rows) {
+  const ms = CamusInterval.parse(row.length).toMilliseconds(); // 'P1DT3H' → 97200000
+}
 ```
 
 ## JSONB

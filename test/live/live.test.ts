@@ -23,6 +23,8 @@
  *                             NUMERIC column type
  *   CAMUS_LIVE_JSONB          set to true to run the JSONB cases, which need a server with the JSONB
  *                             column type and GIN indexes
+ *   CAMUS_LIVE_INTERVAL       set to true to run the INTERVAL cases, which need a server with the
+ *                             interval type (server commit 3449de61)
  *   CAMUS_LIVE_ARRAY_ELEMENT_TYPES
  *                             set to true to run the typed-array cases, which need a server that
  *                             reports an array column's element type in a REST result: without it,
@@ -49,6 +51,7 @@ import {
   CamusColumnStorage,
   CamusError,
   CamusErrorCode,
+  CamusInterval,
   CamusObjectId,
   CamusVector,
   camus,
@@ -68,6 +71,7 @@ const SEQUENCES = process.env.CAMUS_LIVE_SEQUENCES?.toLowerCase() === 'true';
 const RETURNING = process.env.CAMUS_LIVE_RETURNING?.toLowerCase() === 'true';
 const NUMERIC = process.env.CAMUS_LIVE_NUMERIC?.toLowerCase() === 'true';
 const JSONB = process.env.CAMUS_LIVE_JSONB?.toLowerCase() === 'true';
+const INTERVAL = process.env.CAMUS_LIVE_INTERVAL?.toLowerCase() === 'true';
 const ARRAY_ELEMENT_TYPES = process.env.CAMUS_LIVE_ARRAY_ELEMENT_TYPES?.toLowerCase() === 'true';
 const PIPELINE = process.env.CAMUS_LIVE_PIPELINE?.toLowerCase() === 'true';
 const NODE_STATS = process.env.CAMUS_LIVE_NODE_STATS?.toLowerCase() === 'true';
@@ -2088,6 +2092,108 @@ describe.runIf(EXTENSIONS)('C# extensions', () => {
         );
 
         expect(result.rows).toEqual([{ tag: '[Hello World]' }]);
+      });
+    });
+  }
+});
+
+describe.runIf(INTERVAL)('INTERVAL', () => {
+  const started = new Date('2024-01-31T10:00:00.000Z');
+  const finished = new Date('2024-02-01T13:30:15.250Z');
+
+  for (const [name, options] of [
+    ['REST transport', { protocol: 'rest', endpoint: REST_ENDPOINT }],
+    ['gRPC transport', { protocol: 'grpc', endpoint: GRPC_ENDPOINT }],
+  ] as const) {
+    describe(name, () => {
+      let client: CamusClient;
+      const tables: string[] = [];
+
+      beforeAll(async () => {
+        client = new CamusClient({ database: DATABASE, timeoutSeconds: 30, ...CREDENTIALS, ...options });
+        await client.createDatabase(undefined, { ifNotExists: true });
+      });
+
+      afterAll(async () => {
+        for (const table of tables) {
+          await client.executeDdl(`DROP TABLE ${table}`).catch(() => undefined);
+        }
+
+        await client.close();
+      });
+
+      it('reads interval results as ISO-8601 text', async () => {
+        const row = await client.queryOne<Record<string, string | Date>>(
+          'SELECT CAST(@span AS interval) AS span, ' +
+            'CAST(@finished AS datetime) - CAST(@started AS datetime) AS elapsed, ' +
+            "age(CAST('2001-04-10' AS date), CAST('1957-06-13' AS date)) AS age, " +
+            'CAST(@started AS datetime) + CAST(@span AS interval) AS moved, ' +
+            'CAST(@interval AS interval) AS months',
+          {
+            span: camus.interval('P1DT2H3M4.1234567S'),
+            started,
+            finished,
+            interval: new CamusInterval(14, -3, 5_000_000n),
+          },
+        );
+
+        // The server rounds the seventh digit of the seconds to a microsecond.
+        expect(row!.span).toBe('P1DT2H3M4.123457S');
+        expect(CamusInterval.parse(row!.elapsed as string).toMilliseconds()).toBe(
+          finished.getTime() - started.getTime(),
+        );
+        expect(CamusInterval.parse(row!.age as string)).toEqual(new CamusInterval(525, 27, 0n));
+        expect(() => CamusInterval.parse(row!.age as string).toMilliseconds()).toThrow(RangeError);
+        expect((row!.moved as Date).getTime()).toBe(started.getTime() + 93_784_123);
+        expect(CamusInterval.parse(row!.months as string)).toEqual(new CamusInterval(14, -3, 5_000_000n));
+      });
+
+      it('streams interval results', async () => {
+        await using stream = await client.queryStream<{ scaled: string; negated: string }>(
+          'SELECT CAST(@a AS interval) * 1.5 AS scaled, -CAST(@a AS interval) AS negated',
+          { a: CamusInterval.fromMilliseconds(26 * 3_600_000) },
+        );
+
+        const rows: { scaled: string; negated: string }[] = [];
+        for await (const row of stream) rows.push(row);
+
+        expect(rows).toHaveLength(1);
+        expect(CamusInterval.parse(rows[0]!.scaled).toMilliseconds()).toBe(39 * 3_600_000);
+        expect(CamusInterval.parse(rows[0]!.negated).toMilliseconds()).toBe(-26 * 3_600_000);
+      });
+
+      it('filters rows with an interval parameter', async () => {
+        const table = uniqueName('interval_rows');
+
+        await client.executeDdl(
+          `CREATE TABLE ${table} (id OID PRIMARY KEY NOT NULL, name STRING NOT NULL, ` +
+            'started DATETIME NOT NULL, finished DATETIME NOT NULL)',
+        );
+        tables.push(table);
+
+        for (const [rowName, length] of [
+          ['short', 5 * 60_000],
+          ['long', 3 * 3_600_000],
+        ] as const) {
+          await client.execute(
+            `INSERT INTO ${table} (id, name, started, finished) VALUES (@id, @name, @started, @finished)`,
+            {
+              id: camus.id(CamusObjectId.generateAsString()),
+              name: rowName,
+              started,
+              finished: new Date(started.getTime() + length),
+            },
+          );
+        }
+
+        const result = await client.query<{ name: string; length: string }>(
+          `SELECT name, finished - started AS length FROM ${table} WHERE finished - started > CAST(@limit AS interval)`,
+          { limit: CamusInterval.fromMilliseconds(3_600_000) },
+        );
+
+        expect(result.rows).toHaveLength(1);
+        expect(result.rows[0]!.name).toBe('long');
+        expect(CamusInterval.parse(result.rows[0]!.length).toMilliseconds()).toBe(3 * 3_600_000);
       });
     });
   }

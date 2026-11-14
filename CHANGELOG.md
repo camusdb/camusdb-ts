@@ -5,6 +5,33 @@ Every notable change to this package is written here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the version
 numbers follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.15.0] — 2026-11-14
+
+### Added
+
+- INTERVAL support. A server from 2026-11-13 on (server commit 3449de61) has an interval type. An
+  interval is the value of an expression only: no column, array element, or stored value can be an
+  interval. A result interval is ISO-8601 text in a `String` column, and a parameter is text that the
+  SQL casts with `CAST(@p AS interval)`.
+- `CamusInterval` holds the months, the days, and the microseconds of an interval. `parse` and
+  `tryParse` read the server's ISO-8601 text, and `toString` writes it. `fromMilliseconds` and
+  `toMilliseconds` convert to and from a duration in milliseconds. `toMilliseconds` refuses an
+  interval with a month part.
+- A `CamusInterval` parameter binds as its ISO-8601 text in a `String` parameter. `camus.interval`
+  binds a `CamusInterval` or ISO-8601 interval text. An array of `CamusInterval` infers no element
+  type, because the server has no interval elements. State `ColumnType.String` with `camus.array`.
+- The live suite has INTERVAL cases for REST, gRPC, and `queryStream`. Set
+  `CAMUS_LIVE_INTERVAL=true` to run them.
+
+### Changed
+
+- The default `channelPoolSize` is now 8 streams for each endpoint, not 2. The server runs at most
+  `grpc_batch_max_in_flight` (default 64) operations on each stream, and every client with the same
+  endpoints, credentials, and stream settings shares the streams. So 2 streams limited one process
+  to 128 running statements on a node. In a test with 256 workers on a 3-node cluster, 8 streams cut
+  the read p50 from 2.9 ms to 1.7 ms and raised the throughput by 3.8%. 32 streams gave no more.
+  `docs/transport.md` now tells when to increase the value.
+
 ## [0.14.0] — 2026-11-10
 
 ### Added

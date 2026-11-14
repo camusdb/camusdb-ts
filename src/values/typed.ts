@@ -9,6 +9,7 @@ import { ColumnType } from '../column-type.js';
 import type { ColumnValue } from '../column-value.js';
 import { CamusError } from '../errors.js';
 import { CamusErrorCode } from '../error-codes.js';
+import { CamusInterval } from '../interval.js';
 import { jsonbFromParameter } from './jsonb.js';
 import { dateToDayTicks, dateToTicks } from './ticks.js';
 import { isUuid, uuidToHalves } from './uuid.js';
@@ -48,8 +49,8 @@ function invalid(message: string): never {
  * The driver infers a column type from the JavaScript value, which is right for most parameters. A
  * helper here states the type instead, for the cases inference cannot reach: a `uuid` column (a
  * UUID is an ordinary string in JavaScript), an `id` column, a `float32` column, a `numeric`
- * column, a date-only column, a `jsonb` document that is not a plain object, and an empty array,
- * whose element type nothing can be read from.
+ * column, a date-only column, a `jsonb` document that is not a plain object, an interval in its
+ * ISO-8601 text, and an empty array, whose element type nothing can be read from.
  */
 export const camus = {
   /** An `id` column value: an ObjectId as its 24-character string. */
@@ -117,6 +118,26 @@ export const camus = {
    */
   jsonb(value: unknown): TypedParameter {
     return typed({ type: ColumnType.Jsonb, strValue: jsonbFromParameter(value) });
+  },
+
+  /**
+   * An `interval` value, as its ISO-8601 text in a `string` parameter.
+   *
+   * The server does not read text as an interval by itself, so the SQL must cast the parameter:
+   * `CAST(@p AS interval)`. A `CamusInterval` binds as its text. A `string` must be ISO-8601
+   * interval text, such as `P1DT2H`, and it is sent as it is. The server rounds the seconds to a
+   * microsecond. A `CamusInterval` also binds as interval text without this helper.
+   */
+  interval(value: CamusInterval | string): TypedParameter {
+    if (value instanceof CamusInterval) {
+      return typed({ type: ColumnType.String, strValue: value.toString() });
+    }
+
+    if (typeof value !== 'string' || CamusInterval.tryParse(value) === undefined) {
+      invalid(`'${String(value)}' is not an ISO-8601 interval, such as P1DT2H or PT0S.`);
+    }
+
+    return typed({ type: ColumnType.String, strValue: value.trim() });
   },
 
   /** A `bool` column value. */

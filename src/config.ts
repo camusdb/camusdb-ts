@@ -79,10 +79,18 @@ export type CamusQueryTextMode = (typeof CamusQueryTextMode)[keyof typeof CamusQ
 /** Tuning for the gRPC batch streams. The REST transport ignores all of it. */
 export interface GrpcBatchOptions {
   /**
-   * How many long-lived `BatchExecute` streams exist per endpoint. It is **not** a cap on in-flight
-   * transactions — many transactions hash onto the same streams and interleave — so the default of
-   * 2 suits most workloads. Raise it when many long-running streaming queries per endpoint would
-   * otherwise queue behind each other.
+   * How many long-lived `BatchExecute` streams exist per endpoint. Default 8.
+   *
+   * It is **not** a cap on in-flight transactions: many transactions hash onto the same streams and
+   * interleave. It does cap how many statements this process has running on a node, because the
+   * server runs at most `grpc_batch_max_in_flight` (default 64) operations per stream. Every client
+   * with the same endpoints, credentials, and stream settings shares these streams. On a 3-node
+   * cluster with 256 workers, 2 streams made each statement wait about 1 ms for a slot, and the read
+   * p50 was 2.9 ms. With 8 streams, the read p50 was 1.7 ms and the throughput was 3.8% higher. With
+   * 32 streams, the result was the same as with 8.
+   *
+   * Raise it when more than a few hundred callers in one process send statements at the same time,
+   * or when many long-running streaming queries per endpoint wait for each other.
    */
   readonly channelPoolSize: number;
 
@@ -118,7 +126,7 @@ export interface GrpcBatchOptions {
 }
 
 export const DEFAULT_BATCH_OPTIONS: GrpcBatchOptions = Object.freeze({
-  channelPoolSize: 2,
+  channelPoolSize: 8,
   coalescingThreshold: 10,
   coalescingDelayMs: 0,
   streamDrainTimeoutMs: 300_000,
@@ -178,7 +186,7 @@ export interface CamusClientOptions {
   /** Executions of the same SQL before it is prepared. Default 2. */
   readonly autoPrepareMinUsages?: number;
 
-  /** gRPC only: long-lived `BatchExecute` streams per endpoint. Default 2. */
+  /** gRPC only: long-lived `BatchExecute` streams per endpoint. Default 8. */
   readonly channelPoolSize?: number;
 
   /** gRPC only: operations one drain must produce before the pump stops waiting. Default 10. */

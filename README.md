@@ -53,7 +53,7 @@ The links are absolute because npm shows this file as the package page.
 | [Transport](https://github.com/camusdb/camusdb-ts/blob/main/docs/transport.md) | REST or gRPC |
 | [Learned routing](https://github.com/camusdb/camusdb-ts/blob/main/docs/learned-routing.md) | Send statements to the node that leads the data |
 | [Parameters](https://github.com/camusdb/camusdb-ts/blob/main/docs/parameters.md) | Bind values, and state their types |
-| [Data types](https://github.com/camusdb/camusdb-ts/blob/main/docs/data-types.md) | Column types, 64-bit integers, NUMERIC, JSONB, dates, vectors |
+| [Data types](https://github.com/camusdb/camusdb-ts/blob/main/docs/data-types.md) | Column types, 64-bit integers, NUMERIC, INTERVAL, JSONB, dates, vectors |
 | [Large values](https://github.com/camusdb/camusdb-ts/blob/main/docs/large-values.md) | Compression and storage outside the row |
 | [Reading data](https://github.com/camusdb/camusdb-ts/blob/main/docs/reading-data.md) | `query`, streaming, the query result cache |
 | [Writing data](https://github.com/camusdb/camusdb-ts/blob/main/docs/writing-data.md) | `execute`, `insert`, `RETURNING`, `ON CONFLICT`, `UPSERT` |

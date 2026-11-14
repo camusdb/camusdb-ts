@@ -100,7 +100,7 @@ describe('resolveConnectionString', () => {
     expect(config.backupTimeoutSeconds).toBe(300);
     expect(config.routingMode).toBe(CamusRoutingMode.Auto);
     expect(config.routingMaxHintAgeMs).toBe(5000);
-    expect(config.batch.channelPoolSize).toBe(2);
+    expect(config.batch.channelPoolSize).toBe(8);
     expect(config.decode.int64).toBe('auto');
   });
 
@@ -134,7 +134,7 @@ describe('resolveConnectionString', () => {
     );
 
     expect(config.timeoutSeconds).toBe(10);
-    expect(config.batch.channelPoolSize).toBe(2);
+    expect(config.batch.channelPoolSize).toBe(8);
     expect(config.protocol).toBe(CamusProtocol.Rest);
   });
 
